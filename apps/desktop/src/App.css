@@ -333,6 +333,37 @@ input:focus-visible {
   border-radius: 2px;
 }
 
+.ribbon-object-group {
+  align-items: center;
+  gap: 5px;
+}
+
+.object-select { width: 126px; }
+.object-wrap-select { width: 105px; }
+
+.object-size-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(74px, auto));
+  gap: 3px 6px;
+}
+
+.object-size-fields label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #4d5965;
+  font-size: 9px;
+}
+
+.object-size-fields input {
+  width: 52px;
+  height: 23px;
+  padding: 1px 3px;
+  border: 1px solid #c7ced5;
+  border-radius: 2px;
+  font-size: 10px;
+}
+
 .ribbon-insert-button {
   height: 28px;
   padding: 0 12px;
@@ -373,6 +404,24 @@ input:focus-visible {
   background: #fff;
   color: #27333e;
   font-size: 11px;
+}
+
+.search-case-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #4f5c69;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.search-case-option input { accent-color: var(--accent); }
+
+.header-footer-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0;
 }
 
 .search-count {
@@ -1579,7 +1628,9 @@ input:focus-visible {
 
   .search-panel { background: #2b333c; }
   .search-field,
-  .search-count { color: #c2ccd5; }
+  .search-count,
+  .search-case-option,
+  .object-size-fields label { color: #c2ccd5; }
   .search-field input { border-color: #46525e; background: #1d242b; color: #d9e1e8; }
 
   .editor-ribbon {
@@ -1603,6 +1654,7 @@ input:focus-visible {
   .ribbon-select,
   .ribbon-compact-field input,
   .ribbon-table-group input,
+  .object-size-fields input,
   .page-setup-field input,
   .page-setup-field select {
     border-color: #46525e;

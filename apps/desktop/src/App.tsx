@@ -23,11 +23,16 @@ import type {
   DocumentSession,
   DocumentInfo,
   CharacterFormat,
+  DocumentObject,
+  DocumentObjectTextWrap,
   DocumentStyle,
   ExportResult,
+  HeaderFooterFieldKind,
+  HeaderFooterScope,
   PageDefinition,
   ParagraphFormat,
   SearchMatch,
+  SearchOptions,
   TableCommand,
   TextPosition,
 } from "./document-engine";
@@ -243,6 +248,14 @@ function addSelection(
   }
 }
 
+function addObjectSelection(svg: string, object: DocumentObject | null, pageIndex: number) {
+  if (!object || object.pageIndex !== pageIndex) return svg;
+  const { x, y, width, height } = object.bounds;
+  const handleSize = 10;
+  const overlay = `<rect x="${x}" y="${y}" width="${width}" height="${height}" fill="none" stroke="#2468a2" stroke-width="1.5" stroke-dasharray="4 2" pointer-events="none"/><rect x="${x + width - handleSize / 2}" y="${y + height - handleSize / 2}" width="${handleSize}" height="${handleSize}" fill="#ffffff" stroke="#2468a2" stroke-width="1.5" pointer-events="none"/>`;
+  return svg.replace(/<\/svg>\s*$/i, `${overlay}</svg>`);
+}
+
 function placeImeInput(input: HTMLTextAreaElement, svg: SVGSVGElement, position: TextPosition) {
   const bounds = svg.getBoundingClientRect();
   const viewBox = svg.viewBox.baseVal;
@@ -296,10 +309,28 @@ type ParagraphFormatDraft = {
 
 type HeaderFooterDialogState = {
   kind: "header" | "footer";
+  scope: HeaderFooterScope;
   text: string;
+  exists: boolean;
+};
+
+type ObjectEditDraft = {
+  widthMm: string;
+  heightMm: string;
+  offsetXmm: string;
+  offsetYmm: string;
+  textWrap: DocumentObjectTextWrap;
+};
+
+type ObjectPointerDrag = {
+  object: DocumentObject;
+  startX: number;
+  startY: number;
+  resize: boolean;
 };
 
 type TableContextMenuPosition = { left: number; top: number };
+type ObjectContextMenuPosition = { left: number; top: number; objectId: string };
 
 const TABLE_CONTEXT_COMMANDS: ReadonlyArray<{ command: TableCommand; label: string }> = [
   { command: "insertRowAbove", label: "위에 행 삽입" },
@@ -313,11 +344,10 @@ const TABLE_CONTEXT_COMMANDS: ReadonlyArray<{ command: TableCommand; label: stri
   { command: "splitCell", label: "셀 나누기" },
 ];
 
-const HWP_UNITS_PER_MM = 72000 / 25.4;
 const PARAGRAPH_RAW_UNITS_PER_MM = 72 * 200 / 25.4;
 
 function pageSetupForm(page: PageDefinition): PageSetupForm {
-  const mm = (value: number) => Math.round(value / HWP_UNITS_PER_MM * 10) / 10;
+  const mm = (value: number) => Math.round(value * 10) / 10;
   return {
     widthMm: mm(page.width),
     heightMm: mm(page.height),
@@ -330,14 +360,13 @@ function pageSetupForm(page: PageDefinition): PageSetupForm {
 }
 
 function pageSetupUpdates(form: PageSetupForm) {
-  const hu = (value: number) => Math.round(value * HWP_UNITS_PER_MM);
   return {
-    width: hu(form.widthMm),
-    height: hu(form.heightMm),
-    marginLeft: hu(form.marginLeftMm),
-    marginRight: hu(form.marginRightMm),
-    marginTop: hu(form.marginTopMm),
-    marginBottom: hu(form.marginBottomMm),
+    width: form.widthMm,
+    height: form.heightMm,
+    marginLeft: form.marginLeftMm,
+    marginRight: form.marginRightMm,
+    marginTop: form.marginTopMm,
+    marginBottom: form.marginBottomMm,
     landscape: form.orientation === "landscape",
   };
 }
@@ -350,6 +379,7 @@ function DocumentPage({
   editMode,
   caret,
   selection,
+  selectedObject,
   showRulers,
   onPagePointerDown,
   onPagePointerMove,
@@ -363,6 +393,7 @@ function DocumentPage({
   editMode: boolean;
   caret: TextPosition | null;
   selection: EditorSelection | null;
+  selectedObject: DocumentObject | null;
   showRulers: boolean;
   onPagePointerDown: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
   onPagePointerMove: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
@@ -422,8 +453,8 @@ function DocumentPage({
   }, [pageIndex, svg]);
 
   const pageSvg = useMemo(
-    () => addCaret(addSelection(svg, session, selection, pageIndex), caret, pageIndex, editMode),
-    [svg, session, selection, caret, pageIndex, editMode],
+    () => addObjectSelection(addCaret(addSelection(svg, session, selection, pageIndex), caret, pageIndex, editMode), selectedObject, pageIndex),
+    [svg, session, selection, caret, selectedObject, pageIndex, editMode],
   );
 
   return (
@@ -498,6 +529,7 @@ function App() {
   const originalPrintTitle = useRef<string | null>(null);
   const imeInputGate = useRef(new ImeInputGate());
   const pointerSelection = useRef<EditorSelection | null>(null);
+  const objectPointerDrag = useRef<ObjectPointerDrag | null>(null);
   const [session, setSession] = useState<DocumentSession | null>(null);
   const [fileName, setFileName] = useState("");
   const [filePath, setFilePath] = useState("");
@@ -521,7 +553,10 @@ function App() {
   const [paragraphFormatDraft, setParagraphFormatDraft] = useState<ParagraphFormatDraft | null>(null);
   const [tableRows, setTableRows] = useState(2);
   const [tableColumns, setTableColumns] = useState(2);
+  const [selectedObjectId, setSelectedObjectId] = useState("");
+  const [objectEditDraft, setObjectEditDraft] = useState<ObjectEditDraft | null>(null);
   const [tableContextMenu, setTableContextMenu] = useState<TableContextMenuPosition | null>(null);
+  const [objectContextMenu, setObjectContextMenu] = useState<ObjectContextMenuPosition | null>(null);
   const [ribbonTab, setRibbonTab] = useState<RibbonTab>("편집");
   const [pageSetupDialog, setPageSetupDialog] = useState<PageSetupDialogState | null>(null);
   const [headerFooterDialog, setHeaderFooterDialog] = useState<HeaderFooterDialogState | null>(null);
@@ -539,6 +574,7 @@ function App() {
   const [replaceMode, setReplaceMode] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [replaceQuery, setReplaceQuery] = useState("");
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false);
   const [searchMatches, setSearchMatches] = useState<SearchMatch[]>([]);
   const [searchMatchIndex, setSearchMatchIndex] = useState(-1);
   const [renderVersion, setRenderVersion] = useState(0);
@@ -554,6 +590,36 @@ function App() {
       return [];
     }
   });
+
+  const documentObjects = useMemo(() => {
+    if (!session) return [];
+    try {
+      const pageIndex = Math.max(0, Math.min(currentPage - 1, session.pageCount - 1));
+      return session.listObjects(session.pageInfo(pageIndex).sectionIndex);
+    } catch {
+      return [];
+    }
+  }, [session, currentPage, renderVersion]);
+  const selectedObject = documentObjects.find((object) => object.id === selectedObjectId) ?? null;
+
+  useEffect(() => {
+    if (!selectedObject) {
+      setObjectEditDraft(null);
+      return;
+    }
+    setObjectEditDraft({
+      widthMm: String(Math.round(selectedObject.widthMm * 10) / 10),
+      heightMm: String(Math.round(selectedObject.heightMm * 10) / 10),
+      offsetXmm: String(Math.round(selectedObject.offsetXmm * 10) / 10),
+      offsetYmm: String(Math.round(selectedObject.offsetYmm * 10) / 10),
+      textWrap: selectedObject.textWrap,
+    });
+  }, [selectedObjectId, session, renderVersion]);
+
+  useEffect(() => {
+    setSelectedObjectId("");
+    objectPointerDrag.current = null;
+  }, [session]);
 
   const rememberRecent = useCallback((path: string, label: string) => {
     if (!path) return;
@@ -1055,30 +1121,57 @@ function App() {
     setPageInput(String(position.cursorRect.pageIndex + 1));
   };
 
-  const hitPositionFromPointer = (
+  const documentPointFromPointer = (
     pageIndex: number,
     event: Pick<PointerEvent<HTMLDivElement>, "clientX" | "clientY" | "currentTarget">,
   ) => {
-    if (!session) return null;
     const svg = event.currentTarget.querySelector("svg");
     if (!svg) return null;
     const rect = svg.getBoundingClientRect();
     const viewBox = svg.viewBox.baseVal;
     if (rect.width <= 0 || rect.height <= 0 || viewBox.width <= 0 || viewBox.height <= 0) return null;
-    const x = viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width;
-    const y = viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height;
-    return session.hitTest(pageIndex, x, y);
+    return {
+      pageIndex,
+      x: viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width,
+      y: viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height,
+    };
+  };
+
+  const hitPositionFromPointer = (
+    pageIndex: number,
+    event: Pick<PointerEvent<HTMLDivElement>, "clientX" | "clientY" | "currentTarget">,
+  ) => {
+    if (!session) return null;
+    const point = documentPointFromPointer(pageIndex, event);
+    return point ? session.hitTest(pageIndex, point.x, point.y) : null;
   };
 
   const handlePageContextMenu = (pageIndex: number, event: ReactMouseEvent<HTMLDivElement>) => {
     if (!session) return;
     try {
+      const point = documentPointFromPointer(pageIndex, event);
+      const object = point ? session.hitTestObject(pageIndex, point.x, point.y) : null;
+      if (object) {
+        event.preventDefault();
+        setSelectedObjectId(object.id);
+        setCurrentPage(pageIndex + 1);
+        setPageInput(String(pageIndex + 1));
+        setTableContextMenu(null);
+        setObjectContextMenu({
+          left: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
+          top: Math.max(8, Math.min(event.clientY, window.innerHeight - 120)),
+          objectId: object.id,
+        });
+        return;
+      }
       const position = hitPositionFromPointer(pageIndex, event);
       if (!position?.cellPath) {
         setTableContextMenu(null);
+        setObjectContextMenu(null);
         return;
       }
       event.preventDefault();
+      setObjectContextMenu(null);
       setCaretPosition(position);
       setSelection(null);
       setTableContextMenu({
@@ -1093,7 +1186,45 @@ function App() {
   const handlePagePointerDown = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
     if (!session) return;
     event.preventDefault();
+    setObjectContextMenu(null);
     try {
+      const point = documentPointFromPointer(pageIndex, event);
+      let resizeTarget: DocumentObject | null = null;
+      if (point) {
+        const svg = event.currentTarget.querySelector("svg");
+        const rect = svg?.getBoundingClientRect();
+        const viewBox = svg?.viewBox.baseVal;
+        const tolerance = rect && viewBox && rect.width > 0
+          ? Math.max(5, 10 * viewBox.width / rect.width)
+          : 10;
+        const sectionIndex = session.pageInfo(pageIndex).sectionIndex;
+        resizeTarget = session.listObjects(sectionIndex).find((candidate) => {
+          if (candidate.id !== selectedObjectId || candidate.pageIndex !== pageIndex) return false;
+          const bounds = candidate.bounds;
+          return point.x >= bounds.x + bounds.width - tolerance
+            && point.x <= bounds.x + bounds.width + tolerance
+            && point.y >= bounds.y + bounds.height - tolerance
+            && point.y <= bounds.y + bounds.height + tolerance;
+        }) ?? null;
+      }
+      const object = resizeTarget ?? (point ? session.hitTestObject(pageIndex, point.x, point.y) : null);
+      if (point && object) {
+        setSelectedObjectId(object.id);
+        setCurrentPage(pageIndex + 1);
+        setPageInput(String(pageIndex + 1));
+        setSelection(null);
+        pointerSelection.current = null;
+        objectPointerDrag.current = {
+          object,
+          startX: point.x,
+          startY: point.y,
+          resize: resizeTarget?.id === object.id,
+        };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        editInput.current?.focus();
+        return;
+      }
+      setSelectedObjectId("");
       const position = hitPositionFromPointer(pageIndex, event);
       if (!position) return;
       const next = { anchor: position, focus: position };
@@ -1110,6 +1241,7 @@ function App() {
   };
 
   const handlePagePointerMove = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
+    if (objectPointerDrag.current) return;
     const active = pointerSelection.current;
     if (!session || !active) return;
     try {
@@ -1125,7 +1257,24 @@ function App() {
     }
   };
 
-  const handlePagePointerUp = (_pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
+  const handlePagePointerUp = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
+    const drag = objectPointerDrag.current;
+    if (drag && session) {
+      objectPointerDrag.current = null;
+      try {
+        const point = documentPointFromPointer(pageIndex, event);
+        if (point) {
+          const dxMm = (point.x - drag.startX) * 25.4 / 96;
+          const dyMm = (point.y - drag.startY) * 25.4 / 96;
+          const updates = drag.resize
+            ? { widthMm: Math.max(1, drag.object.widthMm + dxMm), heightMm: Math.max(1, drag.object.heightMm + dyMm) }
+            : { offsetXmm: drag.object.offsetXmm + dxMm, offsetYmm: drag.object.offsetYmm + dyMm };
+          if (dxMm || dyMm) updateAfterEdit(session.updateObject(drag.object, updates));
+        }
+      } catch (cause) {
+        setMessage(cause instanceof Error ? cause.message : "문서 개체를 이동하거나 크기를 바꾸지 못했습니다.");
+      }
+    }
     pointerSelection.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -1380,14 +1529,58 @@ function App() {
     }
   };
 
+  const openHeaderFooterDialog = (kind: "header" | "footer") => {
+    if (!session || !caret || isRangeSelection(selection)) return;
+    try {
+      const scope: HeaderFooterScope = "bothPages";
+      const info = session.headerFooterInfo(caret, kind, scope);
+      setHeaderFooterDialog({ kind, scope, text: info.text, exists: info.exists });
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말 상태를 읽지 못했습니다.");
+    }
+  };
+
+  const changeHeaderFooterScope = (scope: HeaderFooterScope) => {
+    if (!session || !caret || !headerFooterDialog) return;
+    try {
+      const info = session.headerFooterInfo(caret, headerFooterDialog.kind, scope);
+      setHeaderFooterDialog((current) => current ? { ...current, scope, text: info.text, exists: info.exists } : current);
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말 적용 범위를 확인하지 못했습니다.");
+    }
+  };
+
   const insertHeaderFooter = () => {
     if (!session || !caret || !headerFooterDialog) return;
     try {
-      updateAfterEdit(session.insertHeaderFooterText(caret, headerFooterDialog.kind, headerFooterDialog.text));
+      updateAfterEdit(session.setHeaderFooterText(caret, headerFooterDialog.kind, headerFooterDialog.scope, headerFooterDialog.text));
       setHeaderFooterDialog(null);
       editInput.current?.focus();
     } catch (cause) {
-      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말을 삽입하지 못했습니다.");
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말을 저장하지 못했습니다.");
+    }
+  };
+
+  const insertHeaderFooterField = (field: HeaderFooterFieldKind) => {
+    if (!session || !caret || !headerFooterDialog) return;
+    try {
+      updateAfterEdit(session.insertHeaderFooterField(caret, headerFooterDialog.kind, headerFooterDialog.scope, field));
+      setHeaderFooterDialog(null);
+      setMessage("쪽 번호 필드를 넣었습니다. 편집하려면 머리말·꼬리말 대화상자를 다시 여세요.");
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말 필드를 넣지 못했습니다.");
+    }
+  };
+
+  const deleteHeaderFooter = () => {
+    if (!session || !caret || !headerFooterDialog) return;
+    try {
+      updateAfterEdit(session.deleteHeaderFooter(caret, headerFooterDialog.kind, headerFooterDialog.scope));
+      setHeaderFooterDialog(null);
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말을 삭제하지 못했습니다.");
     }
   };
 
@@ -1416,19 +1609,23 @@ function App() {
       bitmap = await createImageBitmap(file);
       const page = session.pageDefinition(caret.sectionIndex);
       const contentWidth = Math.max(1, page.width - page.marginLeft - page.marginRight);
-      const targetWidth = bitmap.width * 75;
-      const targetHeight = bitmap.height * 75;
+      const targetWidth = bitmap.width * 25.4 / 96;
+      const targetHeight = bitmap.height * 25.4 / 96;
       const scale = Math.min(1, contentWidth / targetWidth, (page.height * 0.7) / targetHeight);
       const format = extension === "jpeg" ? "jpg" : extension;
-      updateAfterEdit(session.insertPicture(
+      const previousObjectIds = new Set(session.listObjects(caret.sectionIndex).map((object) => object.id));
+      const position = session.insertPicture(
         caret,
         new Uint8Array(await file.arrayBuffer()),
         format,
         bitmap.width,
         bitmap.height,
-        Math.round(targetWidth * scale),
-        Math.round(targetHeight * scale),
-      ));
+        targetWidth * scale,
+        targetHeight * scale,
+      );
+      const insertedObject = session.listObjects(caret.sectionIndex).find((object) => !previousObjectIds.has(object.id));
+      setSelectedObjectId(insertedObject?.id ?? "");
+      updateAfterEdit(position);
       editInput.current?.focus();
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : "그림을 문서에 넣지 못했습니다.");
@@ -1445,6 +1642,52 @@ function App() {
       editInput.current?.focus();
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : "표를 삽입하지 못했습니다.");
+    }
+  };
+
+  const insertShape = (kind: "rectangle" | "textBox") => {
+    if (!session || !caret || isRangeSelection(selection)) return;
+    try {
+      const before = new Set(session.listObjects(caret.sectionIndex).map((object) => object.id));
+      const position = session.insertShape(caret, kind, 60, 30);
+      const created = session.listObjects(caret.sectionIndex).find((object) => !before.has(object.id));
+      setSelectedObjectId(created?.id ?? "");
+      updateAfterEdit(position);
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "도형을 삽입하지 못했습니다.");
+    }
+  };
+
+  const applySelectedObject = () => {
+    if (!session || !selectedObject || !objectEditDraft) return;
+    const values = [objectEditDraft.widthMm, objectEditDraft.heightMm, objectEditDraft.offsetXmm, objectEditDraft.offsetYmm].map(Number);
+    if (values.some((value) => !Number.isFinite(value)) || values[0] < 1 || values[1] < 1) {
+      setMessage("개체의 크기와 위치를 확인하세요. 크기는 1mm 이상이어야 합니다.");
+      return;
+    }
+    try {
+      updateAfterEdit(session.updateObject(selectedObject, {
+        widthMm: values[0],
+        heightMm: values[1],
+        offsetXmm: values[2],
+        offsetYmm: values[3],
+        textWrap: objectEditDraft.textWrap,
+      }));
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "개체 속성을 적용하지 못했습니다.");
+    }
+  };
+
+  const deleteSelectedObject = () => {
+    if (!session || !selectedObject) return;
+    try {
+      updateAfterEdit(session.deleteObject(selectedObject));
+      setSelectedObjectId("");
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "개체를 삭제하지 못했습니다.");
     }
   };
 
@@ -1494,7 +1737,8 @@ function App() {
       return;
     }
     try {
-      const matches = session.searchText(searchQuery, true);
+      const options: SearchOptions = { includeCells: true, caseSensitive: searchCaseSensitive };
+      const matches = session.searchText(searchQuery, options);
       setSearchMatches(matches);
       if (matches.length) showSearchMatch(matches, 0);
       else {
@@ -1535,7 +1779,7 @@ function App() {
   const replaceAllMatches = () => {
     if (!session || !searchQuery.trim()) return;
     try {
-      const result = session.replaceAllText(searchQuery, replaceQuery);
+      const result = session.replaceAllText(searchQuery, replaceQuery, { includeCells: true, caseSensitive: searchCaseSensitive });
       if (result.position) updateAfterEdit(result.position);
       setSearchMatches([]);
       setSearchMatchIndex(-1);
@@ -1598,9 +1842,33 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && objectContextMenu) {
+        event.preventDefault();
+        setObjectContextMenu(null);
+        editInput.current?.focus();
+        return;
+      }
       if (event.key === "Escape" && tableContextMenu) {
         event.preventDefault();
         setTableContextMenu(null);
+        editInput.current?.focus();
+        return;
+      }
+      if (event.key === "Escape" && formatDialogTab) {
+        event.preventDefault();
+        setFormatDialogTab(null);
+        editInput.current?.focus();
+        return;
+      }
+      if (event.key === "Escape" && headerFooterDialog) {
+        event.preventDefault();
+        setHeaderFooterDialog(null);
+        editInput.current?.focus();
+        return;
+      }
+      if (event.key === "Escape" && documentInfoDialog) {
+        event.preventDefault();
+        setDocumentInfoDialog(null);
         editInput.current?.focus();
         return;
       }
@@ -1677,7 +1945,7 @@ function App() {
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat, printPreviewOpen, tableContextMenu]);
+  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat, printPreviewOpen, tableContextMenu, objectContextMenu, formatDialogTab, headerFooterDialog, documentInfoDialog]);
 
   const characterProperties = useMemo(() => {
     if (!session || !caret) return {} as Record<string, unknown>;
@@ -1942,7 +2210,8 @@ function App() {
             }
           } else if (event.key === "Backspace" || event.key === "Delete") {
             event.preventDefault();
-            deleteText(event.key === "Backspace" ? "backward" : "forward");
+            if (event.key === "Delete" && selectedObject) deleteSelectedObject();
+            else deleteText(event.key === "Backspace" ? "backward" : "forward");
           } else if (event.key === "Enter") {
             event.preventDefault();
             if (session && caret) {
@@ -2072,8 +2341,44 @@ function App() {
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
               <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("rectangle")}>사각형</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("textBox")}>글상자</button>
               <span className="ribbon-group-label">그림</span>
             </div>
+            {documentObjects.length > 0 && <>
+              <span className="ribbon-divider" />
+              <div className="ribbon-group ribbon-object-group">
+                <label className="ribbon-control-label" htmlFor="document-object-select">개체 선택</label>
+                <select id="document-object-select" className="ribbon-select object-select" aria-label="문서 개체 선택" value={selectedObjectId} onChange={(event) => {
+                  const id = event.currentTarget.value;
+                  setSelectedObjectId(id);
+                  const object = documentObjects.find((candidate) => candidate.id === id);
+                  if (object) moveToPage(object.pageIndex + 1);
+                }}>
+                  <option value="">개체를 선택하세요</option>
+                  {documentObjects.map((object, index) => <option key={object.id} value={object.id}>{object.kind === "picture" ? "그림" : object.kind === "textBox" ? "글상자" : "사각형"} {index + 1}</option>)}
+                </select>
+                {selectedObject && objectEditDraft && <>
+                  <div className="object-size-fields">
+                    <label>너비 <input aria-label="개체 너비 mm" type="number" min="1" max="1000" step="0.1" value={objectEditDraft.widthMm} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, widthMm: event.currentTarget.value } : current)} /></label>
+                    <label>높이 <input aria-label="개체 높이 mm" type="number" min="1" max="1000" step="0.1" value={objectEditDraft.heightMm} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, heightMm: event.currentTarget.value } : current)} /></label>
+                    <label>X <input aria-label="개체 X 위치 mm" type="number" min="-500" max="1000" step="0.1" value={objectEditDraft.offsetXmm} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, offsetXmm: event.currentTarget.value } : current)} /></label>
+                    <label>Y <input aria-label="개체 Y 위치 mm" type="number" min="-500" max="1000" step="0.1" value={objectEditDraft.offsetYmm} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, offsetYmm: event.currentTarget.value } : current)} /></label>
+                  </div>
+                  <select className="ribbon-select object-wrap-select" aria-label="개체 글 배치" value={objectEditDraft.textWrap} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, textWrap: event.currentTarget.value as DocumentObjectTextWrap } : current)}>
+                    <option value="Square">자리 차지</option>
+                    <option value="TopAndBottom">위아래</option>
+                    <option value="Tight">밀착</option>
+                    <option value="Through">통과</option>
+                    <option value="BehindText">글 뒤</option>
+                    <option value="InFrontOfText">글 앞으로</option>
+                  </select>
+                  <button className="ribbon-button" type="button" onMouseDown={(event) => event.preventDefault()} onClick={applySelectedObject}>속성 적용</button>
+                  <button className="ribbon-button" type="button" onMouseDown={(event) => event.preventDefault()} onClick={deleteSelectedObject}>삭제</button>
+                </>}
+                <span className="ribbon-group-label">개체 편집</span>
+              </div>
+            </>}
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
               <label className="ribbon-control-label" htmlFor="special-character">문자표</label>
@@ -2173,8 +2478,8 @@ function App() {
             <div className="ribbon-group ribbon-inline-group">
               <button className="ribbon-insert-button" type="button" disabled={!session || !caret} title="쪽 나누기 (Ctrl+Enter)" onMouseDown={(event) => event.preventDefault()} onClick={insertPageBreak}>쪽 나누기</button>
               <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={insertPageNumber}>쪽 번호 넣기</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => setHeaderFooterDialog({ kind: "header", text: "" })}>머리말 입력</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => setHeaderFooterDialog({ kind: "footer", text: "" })}>꼬리말 입력</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("header")}>머리말</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("footer")}>꼬리말</button>
               <span className="ribbon-group-label">쪽 구성</span>
             </div>
           </>}
@@ -2184,6 +2489,7 @@ function App() {
       {searchOpen && session && <section className="search-panel" aria-label="문서 찾기 및 바꾸기">
         <label className="search-field"><span>찾을 내용</span><input ref={searchInput} aria-label="찾을 내용" value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); moveSearchMatch(event.shiftKey ? -1 : 1); } if (event.key === "Escape") setSearchOpen(false); }} /></label>
         {replaceMode && <label className="search-field"><span>바꿀 내용</span><input aria-label="바꿀 내용" value={replaceQuery} onChange={(event) => setReplaceQuery(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); if (event.key === "Enter") { event.preventDefault(); replaceCurrentMatch(); } }} /></label>}
+        <label className="search-case-option"><input type="checkbox" checked={searchCaseSensitive} onChange={(event) => { setSearchCaseSensitive(event.currentTarget.checked); setSearchMatches([]); setSearchMatchIndex(-1); setSelection(null); }} /> 대소문자 구분</label>
         <button className="ribbon-insert-button" type="button" onClick={searchDocument}>찾기</button>
         <button className="ribbon-button" type="button" disabled={!searchMatches.length} onClick={() => moveSearchMatch(-1)}>이전</button>
         <button className="ribbon-button" type="button" disabled={!searchMatches.length} onClick={() => moveSearchMatch(1)}>다음</button>
@@ -2214,6 +2520,22 @@ function App() {
                 onClick={() => runTableCommand(command)}
               >{label}</button>
             ))}
+          </div>
+        </div>
+      )}
+
+      {objectContextMenu && selectedObject && (
+        <div className="table-context-scrim" role="presentation" onMouseDown={() => setObjectContextMenu(null)}>
+          <div
+            className="table-context-menu"
+            role="menu"
+            aria-label="개체 편집 명령"
+            style={{ left: objectContextMenu.left, top: objectContextMenu.top }}
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); setObjectContextMenu(null); editInput.current?.focus(); } }}
+          >
+            <button autoFocus role="menuitem" type="button" onClick={() => { setObjectContextMenu(null); setRibbonTab("입력"); }}>개체 속성</button>
+            <button role="menuitem" type="button" onClick={() => { setObjectContextMenu(null); deleteSelectedObject(); }}>삭제</button>
           </div>
         </div>
       )}
@@ -2252,6 +2574,7 @@ function App() {
               editMode={editMode}
               caret={caret}
               selection={selection}
+              selectedObject={selectedObject}
               showRulers={showRulers}
               onPagePointerDown={handlePagePointerDown}
               onPagePointerMove={handlePagePointerMove}
@@ -2280,6 +2603,7 @@ function App() {
                 editMode={editMode}
                 caret={caret}
                 selection={selection}
+                selectedObject={selectedObject}
                 showRulers={showRulers}
                 onPagePointerDown={handlePagePointerDown}
                 onPagePointerMove={handlePagePointerMove}
@@ -2451,14 +2775,29 @@ function App() {
           <form className="confirm-dialog hyperlink-dialog" role="dialog" aria-modal="true" aria-labelledby="header-footer-title" onSubmit={(event) => { event.preventDefault(); insertHeaderFooter(); }}>
             <p className="eyebrow">쪽 구성</p>
             <h2 id="header-footer-title">{headerFooterDialog.kind === "header" ? "머리말 입력" : "꼬리말 입력"}</h2>
-            <p>현재 구역의 양쪽 페이지에 적용되며, 기존 내용이 있으면 뒤에 이어 붙입니다. 한 문단 텍스트를 입력하세요.</p>
+            <p>선택한 페이지 범위의 한 문단 텍스트를 편집합니다. 자동 필드가 포함된 기존 내용은 평문으로 덮어쓸 수 없습니다.</p>
+            <label className="page-setup-field">
+              <span>적용 범위</span>
+              <select value={headerFooterDialog.scope} onChange={(event) => changeHeaderFooterScope(event.currentTarget.value as HeaderFooterScope)}>
+                <option value="currentPage">현재 쪽에 적용되는 형식</option>
+                <option value="bothPages">양쪽 페이지</option>
+                <option value="evenPages">짝수 쪽</option>
+                <option value="oddPages">홀수 쪽</option>
+              </select>
+            </label>
             <label className="page-setup-field">
               <span>내용</span>
               <input autoFocus maxLength={1000} value={headerFooterDialog.text} onChange={(event) => setHeaderFooterDialog((current) => current ? { ...current, text: event.currentTarget.value } : current)} />
             </label>
+            <div className="header-footer-fields" aria-label="자동 필드">
+              <button className="secondary-button" type="button" onClick={() => insertHeaderFooterField("pageNumber")}>쪽 번호 넣기</button>
+              <button className="secondary-button" type="button" onClick={() => insertHeaderFooterField("totalPages")}>전체 쪽 수</button>
+              <button className="secondary-button" type="button" onClick={() => insertHeaderFooterField("fileName")}>파일 이름</button>
+            </div>
             <div className="dialog-actions">
+              {headerFooterDialog.exists && <button className="secondary-button" type="button" onClick={deleteHeaderFooter}>삭제</button>}
               <button className="secondary-button" type="button" onClick={() => { setHeaderFooterDialog(null); editInput.current?.focus(); }}>취소</button>
-              <button className="primary-button" type="submit" disabled={!headerFooterDialog.text.trim()}>삽입</button>
+              <button className="primary-button" type="submit" disabled={!headerFooterDialog.text.trim()}>적용</button>
             </div>
           </form>
         </div>

@@ -51,6 +51,7 @@ export interface ParagraphFormat {
 }
 
 export interface PageDefinition {
+  /** Physical page dimensions and margins in millimeters. */
   width: number;
   height: number;
   marginLeft: number;
@@ -117,6 +118,53 @@ export interface SearchMatch {
   matchedText: string;
 }
 
+export interface SearchOptions {
+  caseSensitive?: boolean;
+  includeCells?: boolean;
+}
+
+export type HeaderFooterScope = "currentPage" | "bothPages" | "evenPages" | "oddPages";
+export type HeaderFooterFieldKind = "pageNumber" | "totalPages" | "fileName";
+
+export interface HeaderFooterInfo {
+  sectionIndex: number;
+  applyTo: number;
+  exists: boolean;
+  text: string;
+}
+
+export type DocumentObjectKind = "picture" | "rectangle" | "textBox";
+export type DocumentObjectTextWrap = "Square" | "TopAndBottom" | "Tight" | "Through" | "BehindText" | "InFrontOfText";
+
+/** A stable, engine-owned handle to an editable object in the document model. */
+export interface DocumentObject {
+  id: string;
+  kind: DocumentObjectKind;
+  sectionIndex: number;
+  paragraphIndex: number;
+  controlIndex: number;
+  pageIndex: number;
+  bounds: SelectionRectangle;
+  zOrder: number;
+  widthMm: number;
+  heightMm: number;
+  offsetXmm: number;
+  offsetYmm: number;
+  textWrap: DocumentObjectTextWrap;
+  treatAsCharacter: boolean;
+  description: string;
+}
+
+export interface DocumentObjectUpdates {
+  widthMm?: number;
+  heightMm?: number;
+  offsetXmm?: number;
+  offsetYmm?: number;
+  textWrap?: DocumentObjectTextWrap;
+  treatAsCharacter?: boolean;
+  description?: string;
+}
+
 export type TableCommand =
   | "insertRowAbove"
   | "insertRowBelow"
@@ -164,15 +212,24 @@ export interface DocumentSession {
   pageDefinition(sectionIndex: number): PageDefinition;
   setPageDefinition(position: TextPosition, updates: Partial<PageDefinition>): TextPosition;
   insertHeaderFooterText(position: TextPosition, kind: HeaderFooterKind, text: string): TextPosition;
-  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, width: number, height: number): TextPosition;
+  headerFooterInfo(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope): HeaderFooterInfo;
+  setHeaderFooterText(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope, text: string): TextPosition;
+  deleteHeaderFooter(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope): TextPosition;
+  insertHeaderFooterField(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope, field: HeaderFooterFieldKind): TextPosition;
+  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, widthMm: number, heightMm: number): TextPosition;
+  insertShape(position: TextPosition, kind: "rectangle" | "textBox", widthMm: number, heightMm: number): TextPosition;
+  listObjects(sectionIndex: number): DocumentObject[];
+  hitTestObject(pageIndex: number, x: number, y: number): DocumentObject | null;
+  updateObject(object: DocumentObject, updates: DocumentObjectUpdates): TextPosition;
+  deleteObject(object: DocumentObject): TextPosition;
   setHyperlink(start: TextPosition, end: TextPosition, uri: string): TextPosition;
   insertAutoNumber(position: TextPosition, kind: "page" | "current" | "total"): TextPosition;
   insertFootnote(position: TextPosition, endnote?: boolean): TextPosition;
   deleteRange(start: TextPosition, end: TextPosition): TextPosition;
   replaceRange(start: TextPosition, end: TextPosition, text: string): TextPosition;
   selectedText(start: TextPosition, end: TextPosition): string;
-  searchText(query: string, includeCells?: boolean): SearchMatch[];
-  replaceAllText(query: string, replacement: string): { count: number; position: TextPosition | null };
+  searchText(query: string, options?: SearchOptions | boolean): SearchMatch[];
+  replaceAllText(query: string, replacement: string, options?: SearchOptions | boolean): { count: number; position: TextPosition | null };
   createTable(position: TextPosition, rows: number, columns: number): TextPosition;
   moveTableCell(position: TextPosition, delta: -1 | 1): TextPosition;
   editTable(position: TextPosition, command: TableCommand): TextPosition;

@@ -45,6 +45,48 @@ describe("RHWP document session", () => {
     }
   });
 
+  it("measures a late-page edit and keeps the earlier page SVG cached", async () => {
+    const document = HwpDocument.createEmpty();
+    let session: ReturnType<typeof wrapHwpDocument> | null = null;
+    try {
+      document.createBlankDocument();
+      document.insertText(0, 0, 0, ("Hanul 페이지 캐시 측정 문장입니다. 0123456789 가나다라마바사아자차카타파하\n").repeat(1400));
+      session = wrapHwpDocument(document);
+      const lastPage = session.pageCount - 1;
+      expect(lastPage).toBeGreaterThan(12);
+      const firstPageSvg = session.renderPage(0);
+      const lastPagePosition = session.hitTest(lastPage, 113, 132);
+      session.renderPage(lastPage);
+      const renderSpy = vi.spyOn(document, "renderPageSvg");
+
+      const editStartedAt = performance.now();
+      session.insertText(lastPagePosition, "edit");
+      const editAndReflowMs = performance.now() - editStartedAt;
+      const unchangedStartedAt = performance.now();
+      expect(session.renderPage(0)).toBe(firstPageSvg);
+      const unchangedPageMs = performance.now() - unchangedStartedAt;
+      const changedStartedAt = performance.now();
+      const changedPageSvg = session.renderPage(lastPage);
+      const changedPageSvgMs = performance.now() - changedStartedAt;
+
+      expect(session.searchText("edit", true)).toHaveLength(1);
+      expect(changedPageSvg).toContain(">e</text>");
+      expect(renderSpy).toHaveBeenCalledTimes(1);
+      console.info("HANUL_EDIT_PERF", JSON.stringify({
+        syntheticParagraphs: 1400,
+        pages: session.pageCount,
+        editAndReflowMs: Number(editAndReflowMs.toFixed(2)),
+        unchangedPageCacheLookupMs: Number(unchangedPageMs.toFixed(2)),
+        changedPageSvgRegenerationMs: Number(changedPageSvgMs.toFixed(2)),
+        regeneratedSvgCharacters: changedPageSvg.length,
+        untouchedPageSvgCharacters: firstPageSvg.length,
+      }));
+    } finally {
+      session?.dispose();
+      if (!session) document.free();
+    }
+  });
+
   it("edits Korean text, undoes paragraph changes, and round-trips HWP without reported loss", async () => {
     const session = await createNewHwpDocumentSession();
     const contains = (text: string) => session.searchText(text, false).length > 0;
@@ -414,6 +456,161 @@ describe("RHWP document session", () => {
     }
   });
 
+  it("supports case-sensitive search and replacement with save, undo and redo", async () => {
+    const session = await createNewHwpDocumentSession();
+    const reopened: ReturnType<typeof wrapHwpDocument>[] = [];
+    try {
+      const start = session.hitTest(0, 113, 132);
+      session.insertText(start, "Hanul hanul HANUL");
+      expect(session.searchText("Hanul", { caseSensitive: false })).toHaveLength(3);
+      expect(session.searchText("Hanul", { caseSensitive: true })).toHaveLength(1);
+
+      const result = session.replaceAllText("Hanul", "한울", { caseSensitive: true });
+      expect(result.count).toBe(1);
+      expect(session.searchText("Hanul", { caseSensitive: true })).toHaveLength(0);
+      expect(session.searchText("한울", { caseSensitive: true })).toHaveLength(1);
+      session.undo();
+      expect(session.searchText("Hanul", { caseSensitive: true })).toHaveLength(1);
+      session.redo();
+      expect(session.searchText("Hanul", { caseSensitive: true })).toHaveLength(0);
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
+        const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
+        reopened.push(reopenedSession);
+        expect(reopenedSession.searchText("한울", { caseSensitive: true })).toHaveLength(1);
+        expect(reopenedSession.searchText("hanul", { caseSensitive: true })).toHaveLength(1);
+      }
+    } finally {
+      reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
+  it("edits rectangles and text boxes through the engine adapter and preserves them in HWP/HWPX", async () => {
+    const session = await createNewHwpDocumentSession();
+    const reopened: ReturnType<typeof wrapHwpDocument>[] = [];
+    try {
+      const start = session.hitTest(0, 113, 132);
+      session.insertShape(start, "rectangle", 30, 15);
+      let objects = session.listObjects(0);
+      expect(objects).toHaveLength(1);
+      expect(objects[0]).toMatchObject({ kind: "rectangle", widthMm: 30, heightMm: 15 });
+      expect(objects[0]!.bounds.width).toBeCloseTo(30 * 96 / 25.4, 1);
+      const rectangle = objects[0]!;
+      session.updateObject(rectangle, {
+        widthMm: 45,
+        heightMm: 22,
+        offsetXmm: rectangle.offsetXmm + 12,
+        offsetYmm: rectangle.offsetYmm + 9,
+        textWrap: "TopAndBottom",
+      });
+      objects = session.listObjects(0);
+      expect(objects[0]!.widthMm).toBeCloseTo(45, 2);
+      expect(objects[0]!.heightMm).toBeCloseTo(22, 2);
+      expect(objects[0]!.textWrap).toBe("TopAndBottom");
+      session.undo();
+      expect(session.listObjects(0)[0]!.widthMm).toBeCloseTo(30, 2);
+      expect(session.listObjects(0)[0]!.heightMm).toBeCloseTo(15, 2);
+      session.redo();
+      expect(session.listObjects(0)[0]!.widthMm).toBeCloseTo(45, 2);
+      expect(session.listObjects(0)[0]!.heightMm).toBeCloseTo(22, 2);
+
+      session.insertShape(start, "textBox", 36, 18);
+      const textBox = session.listObjects(0).find((object) => object.kind === "textBox");
+      expect(textBox).toBeDefined();
+      const textPosition = session.hitTest(0, textBox!.bounds.x + 4, textBox!.bounds.y + 4);
+      expect(textPosition.cellPath?.length).toBeGreaterThan(0);
+      session.insertText(textPosition, "글상자 편집");
+      expect(session.searchText("글상자 편집", true)).toHaveLength(1);
+      session.undo();
+      expect(session.searchText("글상자 편집", true)).toHaveLength(0);
+      session.redo();
+
+      const selected = session.listObjects(0).find((object) => object.kind === "textBox")!;
+      session.deleteObject(selected);
+      expect(session.listObjects(0).some((object) => object.kind === "textBox")).toBe(false);
+      session.undo();
+      expect(session.listObjects(0).some((object) => object.kind === "textBox")).toBe(true);
+      session.redo();
+      expect(session.listObjects(0).some((object) => object.kind === "textBox")).toBe(false);
+      session.undo();
+      expect(session.searchText("글상자 편집", true)).toHaveLength(1);
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
+        const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
+        reopened.push(reopenedSession);
+        expect(reopenedSession.listObjects(0)).toHaveLength(2);
+        expect(reopenedSession.listObjects(0)[0]).toMatchObject({ kind: "rectangle" });
+        expect(reopenedSession.listObjects(0)[0]!.widthMm).toBeCloseTo(45, 2);
+        expect(reopenedSession.listObjects(0)[0]!.heightMm).toBeCloseTo(22, 2);
+        expect(reopenedSession.searchText("글상자 편집", true)).toHaveLength(1);
+      }
+    } finally {
+      reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
+  it("edits page-scoped headers and footers with page fields through HWP/HWPX round trips", async () => {
+    const session = await createNewHwpDocumentSession();
+    const reopened: ReturnType<typeof wrapHwpDocument>[] = [];
+    try {
+      const start = session.hitTest(0, 113, 132);
+      expect(session.headerFooterInfo(start, "header", "bothPages")).toMatchObject({ exists: false, applyTo: 0 });
+      expect(session.headerFooterInfo(start, "header", "currentPage")).toMatchObject({ sectionIndex: 0, applyTo: 0 });
+      expect(session.headerFooterInfo(start, "header", "evenPages").applyTo).toBe(1);
+      session.setHeaderFooterText(start, "header", "oddPages", "홀수 쪽 머리말");
+      expect(session.headerFooterInfo(start, "header", "oddPages")).toMatchObject({ exists: true, applyTo: 2, text: "홀수 쪽 머리말" });
+      session.setHeaderFooterText(start, "header", "oddPages", "수정한 홀수 쪽 머리말");
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toBe("수정한 홀수 쪽 머리말");
+      session.undo();
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toBe("홀수 쪽 머리말");
+      session.redo();
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
+        const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
+        reopened.push(reopenedSession);
+        expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).toBe("수정한 홀수 쪽 머리말");
+      }
+
+      session.insertHeaderFooterField(start, "header", "oddPages", "pageNumber");
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toContain("\u0015");
+      session.undo();
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toBe("수정한 홀수 쪽 머리말");
+      session.redo();
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report.outputFormat).toBe(format);
+        expect(saved.report.count).toBeGreaterThan(0);
+        expect(saved.report.losses).toContainEqual(expect.objectContaining({
+          code: "header-footer-field-roundtrip",
+          subject: "머리말 쪽 번호",
+        }));
+        const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
+        reopened.push(reopenedSession);
+        expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).toContain("수정한 홀수 쪽 머리말");
+        expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).not.toContain("\u0015");
+      }
+
+      session.deleteHeaderFooter(start, "header", "oddPages");
+      expect(session.headerFooterInfo(start, "header", "oddPages").exists).toBe(false);
+      session.undo();
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toContain("\u0015");
+      session.redo();
+      expect(session.headerFooterInfo(start, "header", "oddPages").exists).toBe(false);
+    } finally {
+      reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
   it("keeps a single replaceRange insertion available to undo and redo", async () => {
     const session = await createNewHwpDocumentSession();
     try {
@@ -537,16 +734,16 @@ describe("RHWP document session", () => {
       expect(Number(session.paragraphProperties(start).indent)).toBeCloseTo(0.7, 1);
 
       const originalPage = session.pageDefinition(0);
+      expect(originalPage.width).toBeCloseTo(210, 0);
+      expect(originalPage.height).toBeCloseTo(297, 0);
       const changedPage = session.setPageDefinition(start, {
-        marginLeft: originalPage.marginLeft + 1200,
-        marginRight: originalPage.marginRight + 1200,
+        marginLeft: originalPage.marginLeft + 4,
+        marginRight: originalPage.marginRight + 4,
         landscape: true,
       });
-      expect(session.pageDefinition(0)).toMatchObject({
-        marginLeft: originalPage.marginLeft + 1200,
-        marginRight: originalPage.marginRight + 1200,
-        landscape: true,
-      });
+      expect(session.pageDefinition(0).marginLeft).toBeCloseTo(originalPage.marginLeft + 4, 2);
+      expect(session.pageDefinition(0).marginRight).toBeCloseTo(originalPage.marginRight + 4, 2);
+      expect(session.pageDefinition(0).landscape).toBe(true);
       session.undo();
       expect(session.pageDefinition(0)).toEqual(originalPage);
       session.redo();
@@ -561,11 +758,9 @@ describe("RHWP document session", () => {
         expect(reopenedSession.paragraphProperties(start)).toMatchObject({ alignment: "center", lineSpacing: 180 });
         expect(Number(reopenedSession.paragraphProperties(start).marginLeft)).toBeCloseTo(3.8, 1);
         expect(Number(reopenedSession.paragraphProperties(start).indent)).toBeCloseTo(0.7, 1);
-        expect(reopenedSession.pageDefinition(0)).toMatchObject({
-          marginLeft: originalPage.marginLeft + 1200,
-          marginRight: originalPage.marginRight + 1200,
-          landscape: true,
-        });
+        expect(reopenedSession.pageDefinition(0).marginLeft).toBeCloseTo(originalPage.marginLeft + 4, 2);
+        expect(reopenedSession.pageDefinition(0).marginRight).toBeCloseTo(originalPage.marginRight + 4, 2);
+        expect(reopenedSession.pageDefinition(0).landscape).toBe(true);
       }
       expect(changedPage.sectionIndex).toBe(start.sectionIndex);
     } finally {
@@ -609,12 +804,28 @@ describe("RHWP document session", () => {
         atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII="),
         (character) => character.charCodeAt(0),
       );
-      session.insertPicture(picturePosition, png, "png", 1, 1, 7200, 7200);
+      session.insertPicture(picturePosition, png, "png", 1, 1, 25.4, 25.4);
       expect(session.renderPage(0)).toContain("<image");
       session.undo();
       expect(session.renderPage(0)).not.toContain("<image");
       session.redo();
       expect(session.renderPage(0)).toContain("<image");
+
+      const picture = session.listObjects(0).find((object) => object.kind === "picture");
+      expect(picture).toBeDefined();
+      session.updateObject(picture!, { widthMm: 38.1, heightMm: 19.05, offsetXmm: 1500 / (7200 / 25.4), offsetYmm: 900 / (7200 / 25.4), textWrap: "TopAndBottom" });
+      expect(session.listObjects(0)[0]).toMatchObject({ widthMm: 38.1, heightMm: 19.05, textWrap: "TopAndBottom" });
+      session.undo();
+      expect(session.listObjects(0)[0]).toMatchObject({ widthMm: 25.4, heightMm: 25.4 });
+      session.redo();
+      const resizedPicture = session.listObjects(0).find((object) => object.kind === "picture")!;
+      session.deleteObject(resizedPicture);
+      expect(session.listObjects(0)).toHaveLength(0);
+      session.undo();
+      expect(session.listObjects(0)).toHaveLength(1);
+      session.redo();
+      expect(session.listObjects(0)).toHaveLength(0);
+      session.undo();
 
       for (const format of ["hwp", "hwpx"] as const) {
         const saved = session.exportWithReport(format);
@@ -623,6 +834,7 @@ describe("RHWP document session", () => {
         reopened.push(reopenedSession);
         expect(reopenedSession.searchText("그림 앞", false)).toHaveLength(1);
         expect(reopenedSession.renderPage(0)).toContain("<image");
+        expect(reopenedSession.listObjects(0)).toMatchObject([expect.objectContaining({ kind: "picture", widthMm: 38.1, heightMm: 19.05 })]);
       }
     } finally {
       reopened.forEach((document) => document.dispose());

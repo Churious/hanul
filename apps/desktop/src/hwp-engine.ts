@@ -7,14 +7,21 @@ import type {
   CursorRectangle,
   DocumentEngine,
   DocumentInfo,
+  DocumentObject,
+  DocumentObjectKind,
+  DocumentObjectTextWrap,
+  DocumentObjectUpdates,
   DocumentSession,
   DocumentStyle,
   ExportResult,
+  HeaderFooterFieldKind,
   HeaderFooterKind,
+  HeaderFooterScope,
   PageDefinition,
   ParagraphFormat,
   RenderedPageInfo,
   SearchMatch,
+  SearchOptions,
   SelectionRectangle,
   TableCommand,
   TextPosition,
@@ -61,7 +68,7 @@ type EditOperation =
   | { kind: "char-format"; address: TextPosition; start: number; end: number; before: string; after: string }
   | { kind: "para-align"; address: TextPosition; before: string; after: string }
   | { kind: "table"; address: TextPosition; rows: number; columns: number; tableParaIndex: number; controlIndex: number }
-  | { kind: "snapshot"; beforeSnapshotId: number; afterSnapshotId: number; beforeAddress: TextPosition; afterAddress: TextPosition }
+  | { kind: "snapshot"; beforeSnapshotId: number; afterSnapshotId: number; beforeAddress: TextPosition; afterAddress: TextPosition; preserveCursorRect?: boolean }
   | { kind: "compound"; operations: EditOperation[] };
 
 interface RawSearchHit {
@@ -72,6 +79,50 @@ interface RawSearchHit {
   cellContext?: { parentPara: number; ctrlIdx: number; cellIdx: number; cellPara: number };
   cellPath?: CellPathSegment[];
   equationControl?: number;
+}
+
+interface RawDocumentObject {
+  para: number;
+  controlIndex: number;
+  kind: "picture" | "shape";
+}
+
+interface RawObjectCycle {
+  para: number;
+  controlIndex: number;
+  page: number;
+  z?: number;
+}
+
+interface RawEditableObjectProperties {
+  width?: number;
+  height?: number;
+  horzOffset?: number;
+  vertOffset?: number;
+  textWrap?: string;
+  treatAsChar?: boolean;
+  description?: string;
+}
+
+const OBJECT_TEXT_WRAPS: readonly DocumentObjectTextWrap[] = [
+  "Square", "TopAndBottom", "Tight", "Through", "BehindText", "InFrontOfText",
+];
+// RHWP geometry and page definitions use 1/7200-inch units. Keep the
+// conversion inside the engine adapter so the UI deals only in millimeters.
+const RHWP_OBJECT_UNITS_PER_MM = 7200 / 25.4;
+const RHWP_PAGE_UNITS_PER_MM = RHWP_OBJECT_UNITS_PER_MM;
+
+function rhwpUnitsToMillimeters(value: number) {
+  return Math.round(value / RHWP_OBJECT_UNITS_PER_MM * 1000) / 1000;
+}
+
+function normalizeSearchOptions(options?: SearchOptions | boolean): Required<SearchOptions> {
+  if (typeof options === "boolean") return { caseSensitive: false, includeCells: options };
+  return { caseSensitive: options?.caseSensitive ?? false, includeCells: options?.includeCells ?? true };
+}
+
+function objectTextWrap(value: string | undefined): DocumentObjectTextWrap {
+  return OBJECT_TEXT_WRAPS.find((wrap) => wrap === value) ?? "Square";
 }
 
 let initialization: Promise<void> | undefined;
@@ -209,8 +260,8 @@ class RhwpDocumentSession implements DocumentSession {
     }
 
     const hit = parseJson<RawHit>(this.document.hitTest(pageIndex, x, y), "문자 위치");
-    if (hit.isTextBox || hit.isField) {
-      throw new Error("글상자와 필드 내부 텍스트는 아직 편집할 수 없습니다.");
+    if (hit.isField || (hit.isTextBox && !hit.cellPath?.length)) {
+      throw new Error("필드 내부 텍스트를 편집할 수 없습니다.");
     }
     if (
       !Number.isInteger(hit.sectionIndex) ||
@@ -544,21 +595,47 @@ class RhwpDocumentSession implements DocumentSession {
   }
 
   pageDefinition(sectionIndex: number) {
-    return parseJson<PageDefinition>(this.document.getPageDef(sectionIndex), "용지 설정");
+    const raw = parseJson<PageDefinition>(this.document.getPageDef(sectionIndex), "용지 설정");
+    return {
+      ...raw,
+      width: rhwpUnitsToMillimeters(raw.width),
+      height: rhwpUnitsToMillimeters(raw.height),
+      marginLeft: rhwpUnitsToMillimeters(raw.marginLeft),
+      marginRight: rhwpUnitsToMillimeters(raw.marginRight),
+      marginTop: rhwpUnitsToMillimeters(raw.marginTop),
+      marginBottom: rhwpUnitsToMillimeters(raw.marginBottom),
+      marginHeader: rhwpUnitsToMillimeters(raw.marginHeader),
+      marginFooter: rhwpUnitsToMillimeters(raw.marginFooter),
+      marginGutter: rhwpUnitsToMillimeters(raw.marginGutter),
+    };
   }
 
   setPageDefinition(position: TextPosition, updates: Partial<PageDefinition>) {
     const current = this.pageDefinition(position.sectionIndex);
     const next = { ...current, ...updates };
-    const numeric = [next.width, next.height, next.marginLeft, next.marginRight, next.marginTop, next.marginBottom];
-    if (numeric.some((value) => !Number.isFinite(value) || value < 0) || next.width < 10000 || next.height < 10000) {
+    const physicalFields = ["width", "height", "marginLeft", "marginRight", "marginTop", "marginBottom", "marginHeader", "marginFooter", "marginGutter"] as const;
+    const numeric = physicalFields.map((field) => next[field]);
+    if (numeric.some((value) => !Number.isFinite(value) || value < 0) || next.width < 10 || next.height < 10) {
       throw new Error("용지 크기와 여백 값을 확인하세요.");
     }
     if (next.marginLeft + next.marginRight >= next.width || next.marginTop + next.marginBottom >= next.height) {
       throw new Error("여백이 용지 크기보다 작아야 합니다.");
     }
     return this.mutateWithSnapshot(position, "용지 설정", () => {
-      const raw = this.document.setPageDef(position.sectionIndex, JSON.stringify(next));
+      const toPageUnits = (value: number) => Math.round(value * RHWP_PAGE_UNITS_PER_MM);
+      const documentDefinition = {
+        ...next,
+        width: toPageUnits(next.width),
+        height: toPageUnits(next.height),
+        marginLeft: toPageUnits(next.marginLeft),
+        marginRight: toPageUnits(next.marginRight),
+        marginTop: toPageUnits(next.marginTop),
+        marginBottom: toPageUnits(next.marginBottom),
+        marginHeader: toPageUnits(next.marginHeader),
+        marginFooter: toPageUnits(next.marginFooter),
+        marginGutter: toPageUnits(next.marginGutter),
+      };
+      const raw = this.document.setPageDef(position.sectionIndex, JSON.stringify(documentDefinition));
       if (!parseJson<{ ok: boolean }>(raw, "용지 설정").ok) throw new Error("용지 설정을 바꾸지 못했습니다.");
     }, 0);
   }
@@ -567,23 +644,24 @@ class RhwpDocumentSession implements DocumentSession {
     if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 추가할 수 없습니다.");
     if (!text.trim()) throw new Error("머리말이나 꼬리말 내용을 입력하세요.");
     if (/[\r\n]/.test(text)) throw new Error("현재 머리말·꼬리말 삽입은 한 문단의 텍스트만 지원합니다.");
+    const target = this.headerFooterTarget(position, kind, "bothPages");
     const isHeader = kind === "header";
-    const applyTo = 0; // RHWP's section-wide "양 쪽" target.
+    const applyTo = target.applyTo;
     return this.mutateWithSnapshot(position, isHeader ? "머리말 삽입" : "꼬리말 삽입", () => {
       const current = parseJson<{ ok: boolean; exists: boolean }>(
-        this.document.getHeaderFooter(position.sectionIndex, isHeader, applyTo),
+        this.document.getHeaderFooter(target.sectionIndex, isHeader, applyTo),
         isHeader ? "머리말 조회" : "꼬리말 조회",
       );
       if (!current.ok) throw new Error("머리말·꼬리말 상태를 확인하지 못했습니다.");
       if (!current.exists) {
         const created = parseJson<{ ok: boolean }>(
-          this.document.createHeaderFooter(position.sectionIndex, isHeader, applyTo),
+          this.document.createHeaderFooter(target.sectionIndex, isHeader, applyTo),
           isHeader ? "머리말 생성" : "꼬리말 생성",
         );
         if (!created.ok) throw new Error("머리말·꼬리말을 만들지 못했습니다.");
       }
       const paragraph = parseJson<{ ok: boolean; paraCount: number; charCount: number }>(
-        this.document.getHeaderFooterParaInfo(position.sectionIndex, isHeader, applyTo, 0),
+        this.document.getHeaderFooterParaInfo(target.sectionIndex, isHeader, applyTo, 0),
         "머리말·꼬리말 문단 조회",
       );
       if (!paragraph.ok || paragraph.paraCount < 1 || !Number.isInteger(paragraph.charCount) || paragraph.charCount < 0) {
@@ -591,7 +669,7 @@ class RhwpDocumentSession implements DocumentSession {
       }
       const inserted = parseJson<{ ok: boolean }>(
         this.document.insertTextInHeaderFooter(
-          position.sectionIndex,
+          target.sectionIndex,
           isHeader,
           applyTo,
           0,
@@ -605,10 +683,144 @@ class RhwpDocumentSession implements DocumentSession {
     }, 0);
   }
 
-  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, width: number, height: number) {
-    if (!imageData.byteLength || !Number.isInteger(naturalWidthPx) || !Number.isInteger(naturalHeightPx) || naturalWidthPx < 1 || naturalHeightPx < 1 || width < 1 || height < 1) {
+  headerFooterInfo(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 편집할 수 없습니다.");
+    const target = this.headerFooterTarget(position, kind, scope);
+    const isHeader = kind === "header";
+    const headerFooter = parseJson<{ ok: boolean; exists: boolean }>(
+      this.document.getHeaderFooter(target.sectionIndex, isHeader, target.applyTo),
+      "머리말·꼬리말 조회",
+    );
+    if (!headerFooter.ok) throw new Error("머리말·꼬리말 상태를 확인하지 못했습니다.");
+    if (!headerFooter.exists) {
+      return { sectionIndex: target.sectionIndex, applyTo: target.applyTo, exists: false, text: "" };
+    }
+    const first = parseJson<{ ok: boolean; paraCount: number; charCount: number; text?: string }>(
+      this.document.getHeaderFooterParaInfo(target.sectionIndex, isHeader, target.applyTo, 0),
+      "머리말·꼬리말 문단 조회",
+    );
+    if (!first.ok || !Number.isInteger(first.paraCount) || first.paraCount < 1) {
+      throw new Error("머리말·꼬리말 문단을 읽지 못했습니다.");
+    }
+    const paragraphs = [first.text ?? ""];
+    for (let paragraphIndex = 1; paragraphIndex < first.paraCount; paragraphIndex += 1) {
+      const info = parseJson<{ ok: boolean; text?: string }>(
+        this.document.getHeaderFooterParaInfo(target.sectionIndex, isHeader, target.applyTo, paragraphIndex),
+        "머리말·꼬리말 문단 조회",
+      );
+      if (!info.ok) throw new Error("머리말·꼬리말 문단을 읽지 못했습니다.");
+      paragraphs.push(info.text ?? "");
+    }
+    return { sectionIndex: target.sectionIndex, applyTo: target.applyTo, exists: true, text: paragraphs.join("\n") };
+  }
+
+  setHeaderFooterText(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope, text: string) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 편집할 수 없습니다.");
+    if (/[\r\n]/.test(text)) throw new Error("머리말·꼬리말은 한 문단씩 편집할 수 있습니다.");
+    const info = this.headerFooterInfo(position, kind, scope);
+    if (!text.length) return this.deleteHeaderFooter(position, kind, scope);
+    const target = { sectionIndex: info.sectionIndex, applyTo: info.applyTo };
+    const isHeader = kind === "header";
+    return this.mutateWithSnapshot(position, isHeader ? "머리말 편집" : "꼬리말 편집", () => {
+      if (!info.exists) {
+        const created = parseJson<{ ok: boolean }>(
+          this.document.createHeaderFooter(target.sectionIndex, isHeader, target.applyTo),
+          "머리말·꼬리말 생성",
+        );
+        if (!created.ok) throw new Error("머리말·꼬리말을 만들지 못했습니다.");
+      } else {
+        const paragraph = parseJson<{ ok: boolean; paraCount: number; charCount: number; text?: string }>(
+          this.document.getHeaderFooterParaInfo(target.sectionIndex, isHeader, target.applyTo, 0),
+          "머리말·꼬리말 문단 조회",
+        );
+        if (!paragraph.ok || paragraph.paraCount !== 1 || !Number.isInteger(paragraph.charCount)) {
+          throw new Error("여러 문단으로 된 머리말·꼬리말은 현재 통째로 바꾸지 않습니다. 기존 내용을 보존하려면 먼저 문서에서 해당 문단을 정리하세요.");
+        }
+        if ((paragraph.text ?? "").includes("\u0015") || (paragraph.text ?? "").includes("\u0016") || (paragraph.text ?? "").includes("\u0017")) {
+          throw new Error("자동 필드가 들어 있는 머리말·꼬리말은 현재 평문 대화상자에서 덮어쓸 수 없습니다.");
+        }
+        const replaced = parseJson<{ ok: boolean }>(
+          this.document.replaceRangeInHeaderFooter(
+            target.sectionIndex, isHeader, target.applyTo, 0, 0, 0, paragraph.charCount, text,
+          ),
+          "머리말·꼬리말 바꾸기",
+        );
+        if (!replaced.ok) throw new Error("머리말·꼬리말을 바꾸지 못했습니다.");
+      }
+      if (!info.exists && text.length) {
+        const inserted = parseJson<{ ok: boolean }>(
+          this.document.insertTextInHeaderFooter(target.sectionIndex, isHeader, target.applyTo, 0, 0, text),
+          "머리말·꼬리말 입력",
+        );
+        if (!inserted.ok) throw new Error("머리말·꼬리말 내용을 입력하지 못했습니다.");
+      }
+      return position.charOffset;
+    }, 0);
+  }
+
+  deleteHeaderFooter(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 편집할 수 없습니다.");
+    const info = this.headerFooterInfo(position, kind, scope);
+    if (!info.exists) return position;
+    const isHeader = kind === "header";
+    return this.mutateWithSnapshot(position, isHeader ? "머리말 삭제" : "꼬리말 삭제", () => {
+      const deleted = parseJson<{ ok: boolean }>(
+        this.document.deleteHeaderFooter(info.sectionIndex, isHeader, info.applyTo),
+        "머리말·꼬리말 삭제",
+      );
+      if (!deleted.ok) throw new Error("머리말·꼬리말을 삭제하지 못했습니다.");
+      return position.charOffset;
+    }, 0);
+  }
+
+  insertHeaderFooterField(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope, field: HeaderFooterFieldKind) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 편집할 수 없습니다.");
+    const info = this.headerFooterInfo(position, kind, scope);
+    const isHeader = kind === "header";
+    const fieldType: Record<HeaderFooterFieldKind, number> = { pageNumber: 1, totalPages: 2, fileName: 3 };
+    return this.mutateWithSnapshot(position, isHeader ? "머리말 필드" : "꼬리말 필드", () => {
+      if (!info.exists) {
+        const created = parseJson<{ ok: boolean }>(
+          this.document.createHeaderFooter(info.sectionIndex, isHeader, info.applyTo),
+          "머리말·꼬리말 생성",
+        );
+        if (!created.ok) throw new Error("머리말·꼬리말을 만들지 못했습니다.");
+      }
+      const paragraph = parseJson<{ ok: boolean; charCount: number }>(
+        this.document.getHeaderFooterParaInfo(info.sectionIndex, isHeader, info.applyTo, 0),
+        "머리말·꼬리말 문단 조회",
+      );
+      if (!paragraph.ok || !Number.isInteger(paragraph.charCount)) throw new Error("머리말·꼬리말 문단에 필드를 넣지 못했습니다.");
+      const inserted = parseJson<{ ok: boolean }>(
+        this.document.insertFieldInHf(info.sectionIndex, isHeader, info.applyTo, 0, paragraph.charCount, fieldType[field]),
+        "머리말·꼬리말 필드 삽입",
+      );
+      if (!inserted.ok) throw new Error("머리말·꼬리말 필드를 넣지 못했습니다.");
+      return position.charOffset;
+    }, 0);
+  }
+
+  private headerFooterTarget(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope) {
+    if (scope === "currentPage") {
+      const result = parseJson<{ ok: boolean; sectionIndex: number; applyTo: number }>(
+        this.document.getHeaderFooterEditTarget(position.cursorRect.pageIndex, kind === "header"),
+        "현재 쪽 머리말·꼬리말 대상",
+      );
+      if (!result.ok || !Number.isInteger(result.sectionIndex) || !Number.isInteger(result.applyTo)) {
+        throw new Error("현재 쪽에 적용할 머리말·꼬리말 구역을 확인하지 못했습니다.");
+      }
+      return { sectionIndex: result.sectionIndex, applyTo: result.applyTo };
+    }
+    const applyTo = scope === "bothPages" ? 0 : scope === "evenPages" ? 1 : 2;
+    return { sectionIndex: position.sectionIndex, applyTo };
+  }
+
+  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, widthMm: number, heightMm: number) {
+    if (!imageData.byteLength || !Number.isInteger(naturalWidthPx) || !Number.isInteger(naturalHeightPx) || naturalWidthPx < 1 || naturalHeightPx < 1 || !Number.isFinite(widthMm) || !Number.isFinite(heightMm) || widthMm < 1 || heightMm < 1) {
       throw new Error("그림 데이터나 크기가 올바르지 않습니다.");
     }
+    const width = Math.round(widthMm * RHWP_OBJECT_UNITS_PER_MM);
+    const height = Math.round(heightMm * RHWP_OBJECT_UNITS_PER_MM);
     let logicalOffset = position.charOffset;
     return this.mutateWithSnapshot(position, "그림 삽입", () => {
       const raw = this.document.insertPictureEx(JSON.stringify({
@@ -628,6 +840,147 @@ class RhwpDocumentSession implements DocumentSession {
       if (Number.isInteger(result.logicalOffset)) logicalOffset = result.logicalOffset!;
       return logicalOffset;
     });
+  }
+
+  insertShape(position: TextPosition, kind: "rectangle" | "textBox", widthMm: number, heightMm: number) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에는 도형을 삽입할 수 없습니다.");
+    if (![widthMm, heightMm].every((value) => Number.isFinite(value) && value >= 1)) {
+      throw new Error("도형 너비와 높이는 1mm 이상이어야 합니다.");
+    }
+    const width = Math.round(widthMm * RHWP_OBJECT_UNITS_PER_MM);
+    const height = Math.round(heightMm * RHWP_OBJECT_UNITS_PER_MM);
+    return this.mutateWithSnapshot(position, kind === "textBox" ? "글상자 삽입" : "사각형 삽입", () => {
+      const raw = this.document.createShapeControl(JSON.stringify({
+        sectionIdx: position.sectionIndex,
+        paraIdx: position.paragraphIndex,
+        charOffset: position.charOffset,
+        width,
+        height,
+        horzOffset: Math.round(position.cursorRect.x * 75),
+        vertOffset: Math.round(position.cursorRect.y * 75),
+        treatAsChar: false,
+        textWrap: "Square",
+      }));
+      const created = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(raw, "도형 삽입");
+      if (!created.ok || !Number.isInteger(created.paraIdx) || !Number.isInteger(created.controlIdx)) {
+        throw new Error("도형을 문서에 삽입하지 못했습니다.");
+      }
+      if (kind === "textBox") {
+        const attached = parseJson<{ ok: boolean }>(
+          this.document.setTextBoxAt(created.paraIdx, created.controlIdx, true),
+          "글상자 연결",
+        );
+        if (!attached.ok) throw new Error("도형에 편집 가능한 글상자를 연결하지 못했습니다.");
+      }
+      return position.charOffset;
+    }, position.cursorRect.pageIndex, true);
+  }
+
+  listObjects(sectionIndex: number): DocumentObject[] {
+    if (!Number.isInteger(sectionIndex) || sectionIndex < 0 || sectionIndex >= this.document.getSectionCount()) {
+      throw new RangeError("개체를 조회할 구역 번호가 올바르지 않습니다.");
+    }
+    const objects = parseJson<RawDocumentObject[]>(this.document.getObjects(), "문서 개체 목록");
+    const cycles = parseJson<RawObjectCycle[]>(this.document.getObjectCycle(), "개체 쪽 위치");
+    return objects.flatMap((item) => {
+      if (!Number.isInteger(item.para) || !Number.isInteger(item.controlIndex) || (item.kind !== "picture" && item.kind !== "shape")) return [];
+      const cycle = cycles.find((candidate) => candidate.para === item.para && candidate.controlIndex === item.controlIndex);
+      const pageIndex = Number.isInteger(cycle?.page) ? cycle!.page : 0;
+      const pageSection = this.pageInfo(Math.max(0, Math.min(pageIndex, this.pageCount - 1))).sectionIndex;
+      if (pageSection !== sectionIndex) return [];
+      const rawProperties = item.kind === "picture"
+        ? this.document.getPictureProperties(sectionIndex, item.para, item.controlIndex)
+        : this.document.getShapeProperties(sectionIndex, item.para, item.controlIndex);
+      const props = parseJson<RawEditableObjectProperties>(rawProperties, "문서 개체 속성");
+      if (!Number.isFinite(props.width) || !Number.isFinite(props.height)) return [];
+      let bounds = {
+        pageIndex,
+        x: (Number.isFinite(props.horzOffset) ? props.horzOffset! : 0) / 75,
+        y: (Number.isFinite(props.vertOffset) ? props.vertOffset! : 0) / 75,
+        width: props.width! / 75,
+        height: props.height! / 75,
+      };
+      if (item.kind === "shape") {
+        try {
+          const exact = parseJson<{ pageIndex: number; x: number; y: number; width: number; height: number }>(
+            this.document.getShapeBBox(sectionIndex, item.para, item.controlIndex),
+            "도형 위치",
+          );
+          if ([exact.pageIndex, exact.x, exact.y, exact.width, exact.height].every(Number.isFinite)) bounds = exact;
+        } catch {
+          // Shape properties still provide an editable, approximate page bound.
+        }
+      }
+      const hasTextBox = item.kind === "shape" && this.document.getTextBoxControlIndex(sectionIndex, item.para) === item.controlIndex;
+      const kind: DocumentObjectKind = item.kind === "picture" ? "picture" : hasTextBox ? "textBox" : "rectangle";
+      return [{
+        id: `${sectionIndex}:${item.para}:${item.controlIndex}:${kind}`,
+        kind,
+        sectionIndex,
+        paragraphIndex: item.para,
+        controlIndex: item.controlIndex,
+        pageIndex,
+        bounds,
+        zOrder: Number.isFinite(cycle?.z) ? cycle!.z! : 0,
+        widthMm: rhwpUnitsToMillimeters(props.width!),
+        heightMm: rhwpUnitsToMillimeters(props.height!),
+        offsetXmm: rhwpUnitsToMillimeters(Number.isFinite(props.horzOffset) ? props.horzOffset! : 0),
+        offsetYmm: rhwpUnitsToMillimeters(Number.isFinite(props.vertOffset) ? props.vertOffset! : 0),
+        textWrap: objectTextWrap(props.textWrap),
+        treatAsCharacter: props.treatAsChar ?? false,
+        description: props.description ?? "",
+      }];
+    });
+  }
+
+  hitTestObject(pageIndex: number, x: number, y: number) {
+    const sectionIndex = this.pageInfo(pageIndex).sectionIndex;
+    const candidates = this.listObjects(sectionIndex)
+      .filter((object) => object.pageIndex === pageIndex && x >= object.bounds.x && y >= object.bounds.y
+        && x <= object.bounds.x + object.bounds.width && y <= object.bounds.y + object.bounds.height)
+      .sort((left, right) => right.zOrder - left.zOrder);
+    return candidates[0] ?? null;
+  }
+
+  updateObject(object: DocumentObject, updates: DocumentObjectUpdates) {
+    const current = this.listObjects(object.sectionIndex).find((candidate) => candidate.id === object.id);
+    if (!current) throw new Error("편집할 개체가 문서에 없습니다.");
+    const next = { ...current, ...updates };
+    if (![next.widthMm, next.heightMm].every((value) => Number.isFinite(value) && value >= 1)) {
+      throw new Error("개체의 너비와 높이는 1mm 이상이어야 합니다.");
+    }
+    if (![next.offsetXmm, next.offsetYmm].every(Number.isFinite)) throw new Error("개체 위치 값을 확인하세요.");
+    if (!OBJECT_TEXT_WRAPS.includes(next.textWrap)) throw new Error("지원하지 않는 글 배치 방식입니다.");
+    const address = this.objectAddress(current);
+    return this.mutateWithSnapshot(address, current.kind === "picture" ? "그림 속성" : "도형 속성", () => {
+      const properties = {
+        width: Math.round(next.widthMm * RHWP_OBJECT_UNITS_PER_MM),
+        height: Math.round(next.heightMm * RHWP_OBJECT_UNITS_PER_MM),
+        horzOffset: Math.round(next.offsetXmm * RHWP_OBJECT_UNITS_PER_MM),
+        vertOffset: Math.round(next.offsetYmm * RHWP_OBJECT_UNITS_PER_MM),
+        textWrap: next.textWrap,
+        treatAsChar: next.treatAsCharacter,
+        description: next.description,
+      };
+      const raw = current.kind === "picture"
+        ? this.document.setPictureProperties(current.sectionIndex, current.paragraphIndex, current.controlIndex, JSON.stringify(properties))
+        : this.document.setShapeProperties(current.sectionIndex, current.paragraphIndex, current.controlIndex, JSON.stringify(properties));
+      if (!parseJson<{ ok: boolean }>(raw, "문서 개체 속성 변경").ok) throw new Error("개체 속성을 바꾸지 못했습니다.");
+      return address.charOffset;
+    }, current.pageIndex, true);
+  }
+
+  deleteObject(object: DocumentObject) {
+    const current = this.listObjects(object.sectionIndex).find((candidate) => candidate.id === object.id);
+    if (!current) throw new Error("삭제할 개체가 문서에 없습니다.");
+    const address = this.objectAddress(current);
+    return this.mutateWithSnapshot(address, current.kind === "picture" ? "그림 삭제" : "도형 삭제", () => {
+      const raw = current.kind === "picture"
+        ? this.document.deletePictureControl(current.sectionIndex, current.paragraphIndex, current.controlIndex)
+        : this.document.deleteShapeControl(current.sectionIndex, current.paragraphIndex, current.controlIndex);
+      if (!parseJson<{ ok: boolean }>(raw, "문서 개체 삭제").ok) throw new Error("개체를 삭제하지 못했습니다.");
+      return address.charOffset;
+    }, current.pageIndex, true);
   }
 
   setHyperlink(start: TextPosition, end: TextPosition, uri: string) {
@@ -728,10 +1081,14 @@ class RhwpDocumentSession implements DocumentSession {
     return position;
   }
 
-  searchText(query: string, includeCells = true): SearchMatch[] {
+  searchText(query: string, options?: SearchOptions | boolean): SearchMatch[] {
     const needle = query.trim();
     if (!needle) return [];
-    const hits = parseJson<RawSearchHit[]>(this.document.searchAllText(needle, false, includeCells), "문서 검색");
+    const normalized = normalizeSearchOptions(options);
+    const hits = parseJson<RawSearchHit[]>(
+      this.document.searchAllText(needle, normalized.caseSensitive, normalized.includeCells),
+      "문서 검색",
+    );
     return hits.flatMap((hit) => {
       if (hit.equationControl !== undefined || hit.length < 1) return [];
       const cellPath = hit.cellPath?.map((segment) => ({ ...segment })) ?? (hit.cellContext
@@ -749,10 +1106,10 @@ class RhwpDocumentSession implements DocumentSession {
     });
   }
 
-  replaceAllText(query: string, replacement: string) {
+  replaceAllText(query: string, replacement: string, options?: SearchOptions | boolean) {
     if (!query.trim()) throw new Error("찾을 내용을 입력하세요.");
     if (/[\r\n]/.test(replacement)) throw new Error("바꾸기 내용에는 문단 나눔을 넣을 수 없습니다.");
-    const matches = this.searchText(query, true);
+    const matches = this.searchText(query, options);
     if (!matches.length) return { count: 0, position: null };
     const historyStart = this.undoStack.length;
     let position: TextPosition | null = null;
@@ -960,9 +1317,76 @@ class RhwpDocumentSession implements DocumentSession {
       ) {
         throw new Error("내용 손실 보고서가 올바르지 않아 저장을 중단했습니다.");
       }
-      return { bytes: result.takeBytes(), report };
+      const bytes = result.takeBytes();
+      const headerFieldLosses = this.checkHeaderFooterFieldRoundTrip(bytes, outputFormat);
+      const losses = [...report.losses, ...headerFieldLosses];
+      return { bytes, report: { ...report, count: losses.length, losses } };
     } finally {
       result.free();
+    }
+  }
+
+  private checkHeaderFooterFieldRoundTrip(bytes: Uint8Array, outputFormat: "hwp" | "hwpx") {
+    const fields: Array<{ sectionIndex: number; isHeader: boolean; applyTo: number; marker: string }> = [];
+    for (let sectionIndex = 0; sectionIndex < this.document.getSectionCount(); sectionIndex += 1) {
+      for (const isHeader of [true, false]) {
+        for (const applyTo of [0, 1, 2]) {
+          const exists = parseJson<{ ok: boolean; exists: boolean }>(
+            this.document.getHeaderFooter(sectionIndex, isHeader, applyTo),
+            "머리말·꼬리말 저장 검증",
+          );
+          if (!exists.ok || !exists.exists) continue;
+          const first = parseJson<{ ok: boolean; paraCount: number; text?: string }>(
+            this.document.getHeaderFooterParaInfo(sectionIndex, isHeader, applyTo, 0),
+            "머리말·꼬리말 필드 저장 검증",
+          );
+          if (!first.ok || !Number.isInteger(first.paraCount)) continue;
+          for (let paragraphIndex = 0; paragraphIndex < first.paraCount; paragraphIndex += 1) {
+            const paragraph = paragraphIndex === 0 ? first : parseJson<{ ok: boolean; text?: string }>(
+              this.document.getHeaderFooterParaInfo(sectionIndex, isHeader, applyTo, paragraphIndex),
+              "머리말·꼬리말 필드 저장 검증",
+            );
+            if (!paragraph.ok) continue;
+            for (const marker of ["\u0015", "\u0016", "\u0017"]) {
+              if ((paragraph.text ?? "").includes(marker)) fields.push({ sectionIndex, isHeader, applyTo, marker });
+            }
+          }
+        }
+      }
+    }
+    if (!fields.length) return [];
+
+    let reopened: HwpDocument | undefined;
+    try {
+      reopened = new HwpDocument(bytes);
+      return fields.flatMap((field) => {
+        const headerFooter = parseJson<{ ok: boolean; exists: boolean }>(
+          reopened!.getHeaderFooter(field.sectionIndex, field.isHeader, field.applyTo),
+          "머리말·꼬리말 재열기 검증",
+        );
+        const first = headerFooter.exists ? parseJson<{ ok: boolean; paraCount: number; text?: string }>(
+          reopened!.getHeaderFooterParaInfo(field.sectionIndex, field.isHeader, field.applyTo, 0),
+          "머리말·꼬리말 재열기 검증",
+        ) : { ok: false, paraCount: 0, text: "" };
+        const preserved = first.ok && (first.text ?? "").includes(field.marker);
+        if (preserved) return [];
+        const markerName = field.marker === "\u0015" ? "쪽 번호" : field.marker === "\u0016" ? "전체 쪽 수" : "파일 이름";
+        return [{
+          code: "header-footer-field-roundtrip",
+          subject: `${field.isHeader ? "머리말" : "꼬리말"} ${markerName}`,
+          reason: `${outputFormat.toUpperCase()} 재열기 후 자동 필드가 같은 필드로 복원되지 않습니다.`,
+          message: `${field.sectionIndex + 1}구역의 ${field.applyTo === 0 ? "양쪽" : field.applyTo === 1 ? "짝수 쪽" : "홀수 쪽"} ${field.isHeader ? "머리말" : "꼬리말"}에 있는 ${markerName} 필드가 저장 후 보존되는지 확인할 수 없습니다.`,
+        }];
+      });
+    } catch {
+      return fields.map((field) => ({
+        code: "header-footer-field-roundtrip-unverified",
+        subject: `${field.isHeader ? "머리말" : "꼬리말"} 자동 필드`,
+        reason: `${outputFormat.toUpperCase()} 재열기 검증을 수행하지 못했습니다.`,
+        message: "자동 필드가 저장 후 보존되는지 확인하지 못했습니다.",
+      }));
+    } finally {
+      reopened?.free();
     }
   }
 
@@ -978,13 +1402,16 @@ class RhwpDocumentSession implements DocumentSession {
     label: string,
     mutate: () => number | void,
     invalidateFromPage = address.cursorRect.pageIndex,
+    retainAddress = false,
   ) {
     const beforeSnapshotId = this.document.saveSnapshot();
     let afterSnapshotId: number | undefined;
     try {
       const nextOffset = mutate();
       this.invalidatePages(invalidateFromPage);
-      const afterAddress = this.positionAtAddress(address, typeof nextOffset === "number" ? nextOffset : address.charOffset);
+      const afterAddress = retainAddress
+        ? { ...address }
+        : this.positionAtAddress(address, typeof nextOffset === "number" ? nextOffset : address.charOffset);
       afterSnapshotId = this.document.saveSnapshot();
       this.undoStack.push({
         kind: "snapshot",
@@ -992,6 +1419,7 @@ class RhwpDocumentSession implements DocumentSession {
         afterSnapshotId,
         beforeAddress: { ...address },
         afterAddress: { ...afterAddress },
+        ...(retainAddress ? { preserveCursorRect: true } : {}),
       });
       this.clearRedo();
       this.trimSnapshotHistory();
@@ -1087,7 +1515,7 @@ class RhwpDocumentSession implements DocumentSession {
         const result = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(operation.beforeSnapshotId), "문서 실행 취소");
         if (!result.ok) throw new Error("표 편집을 되돌리지 못했습니다.");
         this.invalidatePages(0);
-        return this.positionAtAddress(operation.beforeAddress, operation.beforeAddress.charOffset);
+        return operation.preserveCursorRect ? { ...operation.beforeAddress } : this.positionAtAddress(operation.beforeAddress, operation.beforeAddress.charOffset);
       }
       case "compound": {
         let position: TextPosition | null = null;
@@ -1152,7 +1580,7 @@ class RhwpDocumentSession implements DocumentSession {
         const result = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(operation.afterSnapshotId), "문서 다시 실행");
         if (!result.ok) throw new Error("표 편집을 다시 실행하지 못했습니다.");
         this.invalidatePages(0);
-        return this.positionAtAddress(operation.afterAddress, operation.afterAddress.charOffset);
+        return operation.preserveCursorRect ? { ...operation.afterAddress } : this.positionAtAddress(operation.afterAddress, operation.afterAddress.charOffset);
       }
       case "compound": {
         let position: TextPosition | null = null;
@@ -1347,6 +1775,26 @@ class RhwpDocumentSession implements DocumentSession {
         : 0), 0);
     while (snapshotCount() > 45 && this.undoStack.length) {
       this.discardOperationSnapshots(this.undoStack.shift()!);
+    }
+  }
+
+  private objectAddress(object: DocumentObject): TextPosition {
+    try {
+      return this.positionAt(object.sectionIndex, object.paragraphIndex, 0);
+    } catch {
+      // RHWP may place an anchored object in an otherwise empty paragraph with no caret stop.
+      // Keep a stable, page-local anchor so snapshot undo/redo can still return to the object.
+      return {
+        sectionIndex: object.sectionIndex,
+        paragraphIndex: object.paragraphIndex,
+        charOffset: 0,
+        cursorRect: {
+          pageIndex: object.pageIndex,
+          x: object.bounds.x,
+          y: object.bounds.y,
+          height: 14,
+        },
+      };
     }
   }
 
