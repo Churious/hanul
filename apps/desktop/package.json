@@ -9,6 +9,7 @@
     "test": "vitest run",
     "benchmark:open": "node --expose-gc scripts/benchmark-open.mjs",
     "benchmark:render": "node scripts/rendering-benchmark.mjs",
+    "benchmark:editor-engine": "node scripts/benchmark-editor-engine.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

@@ -183,8 +183,12 @@ export type HeaderFooterKind = "header" | "footer";
  * layout, mutation, undo/redo and serialization; the UI never sees engine internals.
  */
 export interface DocumentSession {
+  /** Stable identifier for capability-aware UI; omitted by legacy adapters. */
+  readonly engineId?: string;
   readonly pageCount: number;
   readonly sourceFormat: string;
+  /** Page-local render invalidation counter; absent on legacy engines. */
+  renderRevision?(pageIndex: number): number;
   documentInfo(): DocumentInfo;
   pageInfo(pageIndex: number): RenderedPageInfo;
   renderPage(pageIndex: number): string;

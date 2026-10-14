@@ -26,6 +26,7 @@ import type {
   TableCommand,
   TextPosition,
 } from "./document-engine";
+import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextParagraph, type PlainTextSerializer } from "./text-document-engine";
 
 export type {
   CellPathSegment,
@@ -137,6 +138,23 @@ function now() {
 
 function reportEnginePerformance(details: Record<string, string | number | boolean>) {
   if (import.meta.env.DEV) console.info("[Hanul performance] RHWP", details);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function unsupportedDifferenceKeys(actual: Record<string, unknown>, baseline: Record<string, unknown>, supported: ReadonlySet<string>): string[] {
+  const keys = new Set([...Object.keys(actual), ...Object.keys(baseline)]);
+  return [...keys].filter((key) => !supported.has(key) && stableJson(actual[key]) !== stableJson(baseline[key]));
+}
+
+function hasOnlySupportedDifferences(actual: Record<string, unknown>, baseline: Record<string, unknown>, supported: ReadonlySet<string>): boolean {
+  return unsupportedDifferenceKeys(actual, baseline, supported).length === 0;
 }
 
 function parseJson<T>(value: string, label: string): T {
@@ -2011,6 +2029,12 @@ export async function loadHwpDocument(bytes: Uint8Array): Promise<DocumentSessio
 
 export async function createNewHwpDocumentSession(): Promise<DocumentSession> {
   await initializeEngine();
+  return createInitializedBlankHwpDocumentSession();
+}
+
+/** Create a fresh RHWP-backed blank document after WASM initialization has completed. */
+export function createInitializedBlankHwpDocumentSession(): DocumentSession {
+  if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
   const document = HwpDocument.createEmpty();
   try {
     const created = parseJson<{ version?: string; sectionCount?: number }>(
@@ -2031,6 +2055,312 @@ export async function createNewHwpDocumentSession(): Promise<DocumentSession> {
   }
   return new RhwpDocumentSession(document);
 }
+
+/** Batch serializer used only for text-engine documents created by Hanul. */
+export function serializePlainTextWithRhwp(
+  paragraphs: readonly PlainTextParagraph[],
+  format: "hwp" | "hwpx",
+  pageDefinition: PageDefinition,
+): ExportResult {
+  if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
+  const document = HwpDocument.createEmpty();
+  try {
+    const created = parseJson<{ version?: string; sectionCount?: number }>(document.createBlankDocument(), "새 HWP 문서 생성");
+    if (!created.version || !created.sectionCount) throw new Error("새 문서 직렬화 기반을 만들지 못했습니다.");
+    const rawPageDefinition = {
+      ...pageDefinition,
+      width: Math.round(pageDefinition.width * RHWP_PAGE_UNITS_PER_MM),
+      height: Math.round(pageDefinition.height * RHWP_PAGE_UNITS_PER_MM),
+      marginLeft: Math.round(pageDefinition.marginLeft * RHWP_PAGE_UNITS_PER_MM),
+      marginRight: Math.round(pageDefinition.marginRight * RHWP_PAGE_UNITS_PER_MM),
+      marginTop: Math.round(pageDefinition.marginTop * RHWP_PAGE_UNITS_PER_MM),
+      marginBottom: Math.round(pageDefinition.marginBottom * RHWP_PAGE_UNITS_PER_MM),
+      marginHeader: Math.round(pageDefinition.marginHeader * RHWP_PAGE_UNITS_PER_MM),
+      marginFooter: Math.round(pageDefinition.marginFooter * RHWP_PAGE_UNITS_PER_MM),
+      marginGutter: Math.round(pageDefinition.marginGutter * RHWP_PAGE_UNITS_PER_MM),
+    };
+    if (!parseJson<{ ok: boolean }>(document.setPageDef(0, JSON.stringify(rawPageDefinition)), "용지 설정 저장").ok) {
+      throw new Error("문서의 용지 설정을 저장하지 못했습니다.");
+    }
+    document.beginBatch();
+    const targetParagraphs: number[] = [];
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      let targetParagraphIndex = index;
+      if (index > 0) {
+        const previous = paragraphs[index - 1];
+        const previousParagraphIndex = targetParagraphs[index - 1];
+        const splitResult = paragraph.pageBreakBefore
+          ? parseJson<{ ok: boolean; paraIdx?: number }>(document.insertPageBreak(0, previousParagraphIndex, previous.text.length), "쪽 나누기")
+          : parseJson<{ ok: boolean; paraIdx?: number }>(document.splitParagraph(0, previousParagraphIndex, previous.text.length), "문단 분리");
+        if (!splitResult.ok || splitResult.paraIdx === undefined) throw new Error(`${index + 1}번째 문단을 만들지 못했습니다.`);
+        targetParagraphIndex = splitResult.paraIdx;
+      } else if (paragraph.pageBreakBefore) {
+        const pageBreak = parseJson<{ ok: boolean; paraIdx?: number }>(document.insertPageBreak(0, 0, 0), "첫 쪽 나누기");
+        if (!pageBreak.ok || pageBreak.paraIdx === undefined) throw new Error("첫 문단의 쪽 나누기를 저장하지 못했습니다.");
+        targetParagraphIndex = pageBreak.paraIdx;
+      }
+      targetParagraphs[index] = targetParagraphIndex;
+      if (paragraph.text) {
+        const inserted = parseJson<{ ok: boolean }>(document.insertText(0, targetParagraphIndex, 0, paragraph.text), "문단 입력");
+        if (!inserted.ok) throw new Error(`${index + 1}번째 문단 텍스트를 저장하지 못했습니다.`);
+      }
+      if (Object.keys(paragraph.paragraphFormat).length) {
+        const format = { ...paragraph.paragraphFormat };
+        for (const key of ["marginLeft", "marginRight", "indent"] as const) {
+          if (typeof format[key] === "number") format[key] = Math.round(format[key]! * 150);
+        }
+        const applied = parseJson<{ ok: boolean }>(document.applyParaFormat(0, targetParagraphIndex, JSON.stringify(format)), "문단 서식");
+        if (!applied.ok) throw new Error(`${index + 1}번째 문단 서식을 저장하지 못했습니다.`);
+      }
+      for (const run of paragraph.characterFormats) {
+        if (run.end <= run.start) continue;
+        const formatValue: Record<string, unknown> = { ...run.format };
+        const family = typeof formatValue.fontFamily === "string" ? formatValue.fontFamily : "";
+        delete formatValue.fontFamily;
+        if (family) formatValue.fontIds = Array.from({ length: 7 }, (_, language) => document.findOrCreateFontIdForLang(language, family));
+        const applied = parseJson<{ ok: boolean }>(document.applyCharFormat(0, targetParagraphIndex, run.start, run.end, JSON.stringify(formatValue)), "글자 서식");
+        if (!applied.ok) throw new Error(`${index + 1}번째 문단의 글자 서식을 저장하지 못했습니다.`);
+      }
+    }
+    document.endBatch();
+    const exported = format === "hwp" ? document.exportHwpWithReport() : document.exportHwpxWithReport();
+    try {
+      const report = parseJson<ContentLossReport>(exported.contentLoss(), "내용 손실 보고서");
+      if (
+        !Number.isInteger(report.schemaVersion) ||
+        report.schemaVersion < 1 ||
+        report.outputFormat !== format ||
+        !Number.isInteger(report.count) ||
+        report.count < 0 ||
+        !Array.isArray(report.losses) ||
+        report.count !== report.losses.length
+      ) {
+        throw new Error("내용 손실 보고서가 올바르지 않아 저장을 중단했습니다.");
+      }
+      return { bytes: exported.takeBytes(), report };
+    } finally {
+      exported.free();
+    }
+  } finally {
+    document.free();
+  }
+}
+
+const SUPPORTED_TEXT_CHAR_PROPERTIES = new Set([
+  "fontFamily", "fontFamilies", "fontSize", "bold", "italic", "underline", "strikethrough", "charShapeId",
+]);
+const SUPPORTED_TEXT_PARA_PROPERTIES = new Set([
+  "alignment", "marginLeft", "marginRight", "indent", "pageBreakBefore", "paraShapeId",
+]);
+const SUPPORTED_TEXT_PAGE_PROPERTIES = new Set([
+  "width", "height", "marginLeft", "marginRight", "marginTop", "marginBottom",
+  "marginHeader", "marginFooter", "marginGutter", "landscape", "binding",
+]);
+
+interface PlainTextImportDefaults {
+  paragraph: Record<string, unknown>;
+  character: Record<string, unknown>;
+  page: Record<string, unknown>;
+  section: Record<string, unknown>;
+  columns: Record<string, unknown>;
+  styles: unknown;
+  styleAt: Record<string, unknown>;
+}
+
+let plainTextImportDefaults: PlainTextImportDefaults | undefined;
+
+function getPlainTextImportDefaults(): PlainTextImportDefaults {
+  if (plainTextImportDefaults) return plainTextImportDefaults;
+  const blank = HwpDocument.createEmpty();
+  try {
+    const created = parseJson<{ version?: string }>(blank.createBlankDocument(), "새 문서 호환성 기준");
+    if (!created.version) throw new Error("새 문서 호환성 기준을 만들지 못했습니다.");
+    plainTextImportDefaults = {
+      paragraph: parseJson(blank.getParaPropertiesAt(0, 0), "기본 문단 서식"),
+      character: parseJson(blank.getCharPropertiesAt(0, 0, 0), "기본 글자 서식"),
+      page: parseJson(blank.getPageDef(0), "기본 용지 설정"),
+      section: parseJson(blank.getSectionDef(0), "기본 구역 설정"),
+      columns: parseJson(blank.getColumnDef(0), "기본 단 설정"),
+      styles: parseJson(blank.getStyleList(), "기본 스타일 목록"),
+      styleAt: parseJson(blank.getStyleAt(0, 0), "기본 문단 스타일"),
+    };
+    return plainTextImportDefaults;
+  } finally {
+    blank.free();
+  }
+}
+
+/**
+ * Copy only a positively identified simple-text subset out of RHWP. Any control,
+ * style, field, section, or format we cannot represent keeps the document on the
+ * RHWP session so opening it never silently flattens unsupported content.
+ */
+function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocument | null {
+  const reject = (reason: string) => {
+    reportEnginePerformance({ phase: "text-import-rejected", reason });
+    return null;
+  };
+  try {
+    const format = document.getSourceFormat().toLowerCase();
+    if (format !== "hwp" && format !== "hwpx") return reject("unsupported file format");
+    if (document.getSectionCount() !== 1) return reject("multiple sections");
+
+    const info = parseJson<Record<string, unknown>>(document.getDocumentInfo(), "문서 정보");
+    if (info.encrypted === true || info.hwp3Variant === true) return reject("encrypted or HWP 3 document");
+    const defaults = getPlainTextImportDefaults();
+    const section = parseJson<Record<string, unknown>>(document.getSectionDef(0), "구역 설정");
+    if (stableJson(section) !== stableJson(defaults.section)) return reject("non-default section properties");
+    const columns = parseJson<Record<string, unknown>>(document.getColumnDef(0), "단 설정");
+    if (stableJson(columns) !== stableJson(defaults.columns)) return reject("column settings are not supported yet");
+    const styles = parseJson<unknown>(document.getStyleList(), "스타일 목록");
+    if (stableJson(styles) !== stableJson(defaults.styles)) return reject("custom document styles");
+
+    const controls = parseJson<Array<{ ctrlId?: string }>>(document.getControls(), "문서 컨트롤");
+    if (controls.length !== 2 || controls.filter((item) => item.ctrlId === "secd").length !== 1
+      || controls.filter((item) => item.ctrlId === "cold").length !== 1) return reject("unsupported document controls");
+    if (parseJson<unknown[]>(document.getFieldList(), "필드 목록").length !== 0
+      || parseJson<unknown[]>(document.getBookmarks(), "책갈피 목록").length !== 0) return reject("fields or bookmarks");
+    for (const isHeader of [true, false]) {
+      for (const applyTo of [0, 1, 2]) {
+        const headerFooter = parseJson<{ exists?: boolean }>(document.getHeaderFooter(0, isHeader, applyTo), "머리말·꼬리말");
+        if (headerFooter.exists) return reject("headers or footers");
+      }
+    }
+
+    const rawPage = parseJson<PageDefinition>(document.getPageDef(0), "용지 설정");
+    if (!hasOnlySupportedDifferences(rawPage as unknown as Record<string, unknown>, defaults.page, SUPPORTED_TEXT_PAGE_PROPERTIES)) return reject("unsupported page properties");
+    const pageDefinition: PageDefinition = {
+      ...rawPage,
+      width: rhwpUnitsToMillimeters(rawPage.width),
+      height: rhwpUnitsToMillimeters(rawPage.height),
+      marginLeft: rhwpUnitsToMillimeters(rawPage.marginLeft),
+      marginRight: rhwpUnitsToMillimeters(rawPage.marginRight),
+      marginTop: rhwpUnitsToMillimeters(rawPage.marginTop),
+      marginBottom: rhwpUnitsToMillimeters(rawPage.marginBottom),
+      marginHeader: rhwpUnitsToMillimeters(rawPage.marginHeader),
+      marginFooter: rhwpUnitsToMillimeters(rawPage.marginFooter),
+      marginGutter: rhwpUnitsToMillimeters(rawPage.marginGutter),
+    };
+
+    const paragraphs: ImportedPlainTextDocument["paragraphs"][number][] = [];
+    let previousLastPage = 0;
+    const paragraphCount = document.getParagraphCount(0);
+    if (paragraphCount < 1) return reject("empty paragraph list");
+    for (let paragraphIndex = 0; paragraphIndex < paragraphCount; paragraphIndex += 1) {
+      const length = document.getParagraphLength(0, paragraphIndex);
+      const text = document.getTextRange(0, paragraphIndex, 0, length);
+      if (text.length !== length || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(text)) return reject("paragraph contains unsupported control characters");
+
+      const paraProperties = parseJson<Record<string, unknown>>(document.getParaPropertiesAt(0, paragraphIndex), "문단 서식");
+      const checkableParaProperties = { ...paraProperties };
+      // HWPX exporters commonly write meaningless pattern defaults even when
+      // the paragraph has no fill. The independent model has no paragraph fill;
+      // ignore those dormant values only when fillType explicitly says `none`.
+      if (paraProperties.fillType === "none") {
+        checkableParaProperties.patternColor = defaults.paragraph.patternColor;
+        checkableParaProperties.patternType = defaults.paragraph.patternType;
+      }
+      const unsupportedParagraphProperties = unsupportedDifferenceKeys(checkableParaProperties, defaults.paragraph, SUPPORTED_TEXT_PARA_PROPERTIES);
+      if (unsupportedParagraphProperties.length) return reject(`paragraph ${paragraphIndex + 1} has unsupported paragraph formatting: ${unsupportedParagraphProperties.map((key) => `${key}=${stableJson(paraProperties[key])} (default ${stableJson(defaults.paragraph[key])})`).join(", ")}`);
+      const styleAt = parseJson<Record<string, unknown>>(document.getStyleAt(0, paragraphIndex), "문단 스타일");
+      if (stableJson(styleAt) !== stableJson(defaults.styleAt)) return reject(`paragraph ${paragraphIndex + 1} uses a non-default style`);
+
+      const paragraphFormat: ParagraphFormat = {};
+      const alignment = paraProperties.alignment;
+      if (alignment !== "left" && alignment !== "center" && alignment !== "right" && alignment !== "justify") {
+        return reject(`paragraph ${paragraphIndex + 1} has an unsupported alignment`);
+      }
+      // The Hanul model defaults to left alignment; HWP's normal paragraph
+      // default is justified, so record that value even when it matches RHWP's
+      // blank-document baseline.
+      paragraphFormat.alignment = alignment;
+      for (const key of ["marginLeft", "marginRight", "indent"] as const) {
+        const value = paraProperties[key];
+        if (value !== undefined && stableJson(value) !== stableJson(defaults.paragraph[key])) {
+          if (typeof value === "number" && Number.isFinite(value)) paragraphFormat[key] = value;
+          else return reject(`paragraph ${paragraphIndex + 1} has an unsupported paragraph value`);
+        }
+      }
+      if (typeof paraProperties.pageBreakBefore !== "boolean") return reject(`paragraph ${paragraphIndex + 1} has an unknown page-break flag`);
+      const startRect = parseJson<CursorRectangle>(document.getCursorRect(0, paragraphIndex, 0), "문단 위치");
+      const pageBreakBefore = paraProperties.pageBreakBefore === true || (paragraphIndex > 0 && startRect.pageIndex > previousLastPage);
+
+      const characterFormats: PlainTextParagraph["characterFormats"] = [];
+      if (length > 0) {
+        const runs = parseJson<Array<{ startOffset: number; endOffset: number }>>(document.getCharShapeRuns(0, paragraphIndex, 0, length), "글자 서식 구간");
+        let nextOffset = 0;
+        for (const run of runs) {
+          if (!Number.isInteger(run.startOffset) || !Number.isInteger(run.endOffset) || run.startOffset !== nextOffset
+            || run.endOffset <= run.startOffset || run.endOffset > length) return reject(`paragraph ${paragraphIndex + 1} has incomplete character runs`);
+          const properties = parseJson<Record<string, unknown>>(document.getCharPropertiesAt(0, paragraphIndex, run.startOffset), "글자 서식");
+          const checkableCharacterProperties = { ...properties };
+          if (properties.fillType === "none") {
+            checkableCharacterProperties.patternColor = defaults.character.patternColor;
+            checkableCharacterProperties.patternType = defaults.character.patternType;
+          }
+          const unsupportedCharacterProperties = unsupportedDifferenceKeys(checkableCharacterProperties, defaults.character, SUPPORTED_TEXT_CHAR_PROPERTIES);
+          if (unsupportedCharacterProperties.length) return reject(`paragraph ${paragraphIndex + 1} has unsupported character formatting: ${unsupportedCharacterProperties.map((key) => `${key}=${stableJson(properties[key])} (default ${stableJson(defaults.character[key])})`).join(", ")}`);
+          const family = properties.fontFamily;
+          const families = properties.fontFamilies;
+          if (typeof family !== "string" || !Array.isArray(families) || !families.every((item) => item === family)) return reject(`paragraph ${paragraphIndex + 1} uses language-specific fonts`);
+          const characterFormat: CharacterFormat = {};
+          const textModelDefaults: Record<keyof CharacterFormat, unknown> = {
+            fontFamily: "함초롬바탕", fontSize: 1200, bold: false, italic: false, underline: false, strikethrough: false,
+          };
+          for (const key of ["fontFamily", "fontSize", "bold", "italic", "underline", "strikethrough"] as const) {
+            const value = properties[key];
+            if (value === undefined || stableJson(value) === stableJson(textModelDefaults[key])) continue;
+            if (key === "fontFamily" && typeof value === "string") characterFormat.fontFamily = value;
+            else if (key === "fontSize" && typeof value === "number" && Number.isFinite(value)) characterFormat.fontSize = value;
+            else if ((key === "bold" || key === "italic" || key === "underline" || key === "strikethrough") && typeof value === "boolean") characterFormat[key] = value;
+            else return reject(`paragraph ${paragraphIndex + 1} has an unsupported character property`);
+          }
+          if (Object.keys(characterFormat).length) characterFormats.push({ start: run.startOffset, end: run.endOffset, format: characterFormat });
+          nextOffset = run.endOffset;
+        }
+        if (nextOffset !== length) return reject(`paragraph ${paragraphIndex + 1} character run coverage is incomplete`);
+      }
+      paragraphs.push({ text, pageBreakBefore, paragraphFormat, characterFormats });
+
+      const lastOffset = length > 0 ? length - 1 : 0;
+      previousLastPage = parseJson<CursorRectangle>(document.getCursorRect(0, paragraphIndex, lastOffset), "문단 끝 위치").pageIndex;
+    }
+    return { paragraphs, pageDefinition, sourceFormat: format };
+  } catch (cause) {
+    // A failed or unknown structure is left on the RHWP path; the format adapter
+    // remains responsible for presenting any actual parse error to the user.
+    reportEnginePerformance({ phase: "text-import-rejected", reason: cause instanceof Error ? cause.message : String(cause) });
+    return null;
+  }
+}
+
+const hanulTextSerializer: PlainTextSerializer = {
+  serialize: serializePlainTextWithRhwp,
+};
+
+export const hanulDocumentEngine: DocumentEngine = Object.freeze({
+  id: "hanul",
+  async open(bytes: Uint8Array): Promise<DocumentSession> {
+    await initializeEngine();
+    const document = new HwpDocument(bytes);
+    const imported = extractPlainTextImport(document);
+    if (!imported) return new RhwpDocumentSession(document);
+    document.free();
+    const session = new HanulTextDocumentSession(
+      hanulTextSerializer,
+      imported.paragraphs,
+      imported.pageDefinition,
+      imported.sourceFormat,
+    );
+    reportEnginePerformance({ phase: "open-hanul-text-import", format: imported.sourceFormat, paragraphs: imported.paragraphs.length, pageCount: session.pageCount });
+    return session;
+  },
+  async createBlank(): Promise<DocumentSession> {
+    await initializeEngine();
+    return new HanulTextDocumentSession(hanulTextSerializer);
+  },
+});
 
 export const rhwpDocumentEngine: DocumentEngine = Object.freeze({
   id: "rhwp",

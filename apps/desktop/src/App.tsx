@@ -21,7 +21,7 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ImeInputGate } from "./ime-input";
 import { previewObjectDrag } from "./object-drag";
 import { LatestFrame } from "./pointer-frame";
-import { rhwpDocumentEngine } from "./hwp-engine";
+import { hanulDocumentEngine } from "./hwp-engine";
 import type {
   DocumentSession,
   DocumentInfo,
@@ -359,6 +359,7 @@ function DocumentPage({
   renderVersion,
   editMode,
   caret,
+  imePreedit,
   selectionRectsByPage,
   selectedObject,
   objectPreviewElementRef,
@@ -375,6 +376,7 @@ function DocumentPage({
   renderVersion: number;
   editMode: boolean;
   caret: TextPosition | null;
+  imePreedit: string;
   selectionRectsByPage: ReadonlyMap<number, SelectionRectangle[]>;
   selectedObject: DocumentObject | null;
   objectPreviewElementRef: MutableRefObject<SVGRectElement | null>;
@@ -390,8 +392,32 @@ function DocumentPage({
   const pendingSvgCommitStartedAt = useRef<number | null>(null);
   const pageInfo = useMemo(() => session.pageInfo(pageIndex), [session, pageIndex, renderVersion]);
   const selectionRects = selectionRectsByPage.get(pageIndex) ?? [];
+  const isHanulTextPage = session.engineId === "hanul-text";
+  const pageRenderRevision = session.renderRevision?.(pageIndex) ?? renderVersion;
+  const hanulPageRender = useMemo(() => {
+    if (!isHanulTextPage) return null;
+    try {
+      const measure = shouldMeasureInitialPage(session, pageIndex);
+      const renderStartedAt = performance.now();
+      const rendered = session.renderPage(pageIndex);
+      const renderMs = performance.now() - renderStartedAt;
+      const sanitizeStartedAt = performance.now();
+      const safeSvg = sanitizeRenderedSvg(DOMPurify, rendered);
+      const sanitizeMs = performance.now() - sanitizeStartedAt;
+      if (measure) {
+        reportAppPerformance("first-page-svg", { page: pageIndex + 1, sourceSvgCharacters: rendered.length, renderMs: Number(renderMs.toFixed(1)), sanitizeMs: Number(sanitizeMs.toFixed(1)) });
+        pendingSvgCommitStartedAt.current = performance.now();
+      }
+      return { svg: safeSvg, error: "" };
+    } catch (cause) {
+      return { svg: "", error: cause instanceof Error ? cause.message : "페이지를 그리지 못했습니다." };
+    }
+  }, [session, pageIndex, pageRenderRevision, isHanulTextPage]);
+  const displaySvg = isHanulTextPage ? hanulPageRender?.svg ?? "" : svg;
+  const displayError = isHanulTextPage ? hanulPageRender?.error ?? "" : error;
 
   useEffect(() => {
+    if (isHanulTextPage) return;
     let active = true;
     setSvg("");
     setError("");
@@ -425,29 +451,30 @@ function DocumentPage({
     return () => {
       active = false;
     };
-  }, [session, pageIndex, renderVersion]);
+  }, [session, pageIndex, renderVersion, isHanulTextPage]);
 
   useLayoutEffect(() => {
     const startedAt = pendingSvgCommitStartedAt.current;
-    if (svg && startedAt !== null) {
+    if (displaySvg && startedAt !== null) {
       reportAppPerformance("first-page-react-commit", {
         page: pageIndex + 1,
         durationMs: Number((performance.now() - startedAt).toFixed(1)),
       });
       pendingSvgCommitStartedAt.current = null;
     }
-  }, [pageIndex, svg]);
+  }, [pageIndex, displaySvg]);
 
   const pageSvgViewBox = useMemo(() => {
-    const match = svg.match(/\bviewBox=["']([^"']+)["']/i);
+    const match = displaySvg.match(/\bviewBox=["']([^"']+)["']/i);
     const values = match?.[1].trim().split(/[\s,]+/).map(Number);
     return values?.length === 4 && values.every(Number.isFinite)
       ? values.join(" ")
       : `0 0 ${pageInfo.width} ${pageInfo.height}`;
-  }, [svg, pageInfo.width, pageInfo.height]);
+  }, [displaySvg, pageInfo.width, pageInfo.height]);
   const cursorOnPage = editMode && caret?.cursorRect.pageIndex === pageIndex ? caret.cursorRect : null;
+  const imePreeditOnPage = imePreedit && cursorOnPage ? imePreedit : "";
   const selectedObjectOnPage = selectedObject?.pageIndex === pageIndex ? selectedObject : null;
-  const hasOverlay = selectionRects.length > 0 || cursorOnPage !== null || selectedObjectOnPage !== null;
+  const hasOverlay = selectionRects.length > 0 || cursorOnPage !== null || selectedObjectOnPage !== null || Boolean(imePreeditOnPage);
 
   return (
     <div className="page-slot" style={{ "--zoom": String(zoom), "--page-width": `${pageInfo.width}px`, "--page-height": `${pageInfo.height}px` } as CSSProperties}>
@@ -465,13 +492,13 @@ function DocumentPage({
         data-page-index={pageIndex}
         style={{ "--zoom": String(zoom), "--page-width": `${pageInfo.width}px`, "--page-height": `${pageInfo.height}px` } as CSSProperties}
       >
-        {error ? (
+        {displayError ? (
           <div className="page-error">
             <Icon name="file" size={24} />
             <strong>이 페이지를 표시할 수 없습니다</strong>
-            <span>{error}</span>
+            <span>{displayError}</span>
           </div>
-        ) : svg ? (
+        ) : displaySvg ? (
           <div
             className={`page-svg${editMode ? " can-edit" : ""}`}
             onPointerDown={(event) => onPagePointerDown(pageIndex, event)}
@@ -480,7 +507,7 @@ function DocumentPage({
             onPointerCancel={onPagePointerCancel}
             onContextMenu={(event) => onPageContextMenu(pageIndex, event)}
           >
-            <div className="page-render-layer" dangerouslySetInnerHTML={{ __html: svg }} />
+            <div className="page-render-layer" dangerouslySetInnerHTML={{ __html: displaySvg }} />
             {hasOverlay && <svg className="page-overlays" aria-hidden="true" viewBox={pageSvgViewBox}>
               {selectionRects.map((rect, index) => <rect
                 key={`selection-${index}`}
@@ -500,6 +527,15 @@ function DocumentPage({
                 stroke="#315f86"
                 strokeWidth={Math.max(1, pageInfo.width / 794)}
               />}
+              {imePreeditOnPage && cursorOnPage && <text
+                className="ime-preedit"
+                x={cursorOnPage.x}
+                y={cursorOnPage.y + 16}
+                fontFamily="함초롬바탕, sans-serif"
+                fontSize="16"
+                fill="#161616"
+                textDecoration="underline"
+              >{imePreeditOnPage}</text>}
               {selectedObjectOnPage && (() => {
                 const bounds = selectedObjectOnPage.bounds;
                 const handleSize = 10;
@@ -588,6 +624,7 @@ function App() {
     element.setAttribute("fill-opacity", "0");
   };
   const [session, setSession] = useState<DocumentSession | null>(null);
+  const isHanulTextEngine = session?.engineId === "hanul-text";
   const [fileName, setFileName] = useState("");
   const [filePath, setFilePath] = useState("");
   const [fileFormat, setFileFormat] = useState<"hwp" | "hwpx" | "">("");
@@ -603,6 +640,7 @@ function App() {
   const editMode = Boolean(session);
   const [dirty, setDirty] = useState(false);
   const [caret, setCaret] = useState<TextPosition | null>(null);
+  const [imePreedit, setImePreedit] = useState("");
   const [selection, setSelection] = useState<EditorSelection | null>(null);
   const [pendingCharacterFormat, setPendingCharacterFormat] = useState<CharacterFormat>({});
   const [formatDialogTab, setFormatDialogTab] = useState<FormatDialogTab | null>(null);
@@ -831,7 +869,7 @@ function App() {
       if (pending.createNew) {
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
         setLoadingStatus("새 문서의 쪽을 구성하는 중…");
-        nextSession = await rhwpDocumentEngine.createBlank();
+        nextSession = await hanulDocumentEngine.createBlank();
       } else {
         const readStartedAt = performance.now();
         bytes = pending.file
@@ -849,7 +887,10 @@ function App() {
         // RHWP's public WASM constructor is synchronous; yield a paint first so
         // this plain status is visible during parsing and initial pagination.
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
-        nextSession = await rhwpDocumentEngine.open(bytes);
+        // The engine adapter moves only positively recognized simple-text
+        // documents into Hanul's incremental model. Complex content remains in
+        // the RHWP compatibility session without UI-specific engine branching.
+        nextSession = await hanulDocumentEngine.open(bytes);
       }
       let initialCaret: TextPosition | null = null;
       const hitTestStartedAt = performance.now();
@@ -874,6 +915,7 @@ function App() {
       setFileSize(pending.createNew ? 0 : bytes.byteLength);
       setDirty(false);
       setCaret(initialCaret);
+      setImePreedit("");
       setSelection(null);
       setPendingCharacterFormat({});
       pointerSelection.current = null;
@@ -2283,14 +2325,17 @@ function App() {
         tabIndex={session ? 0 : -1}
         onCompositionStart={(event) => {
           imeInputGate.current.startComposition();
+          setImePreedit("");
           traceImeEvent("compositionstart", event.nativeEvent, event.currentTarget.value.length);
         }}
         onCompositionUpdate={(event) => {
           imeInputGate.current.updateComposition(event.data);
+          setImePreedit(event.data);
           traceImeEvent("compositionupdate", event.nativeEvent, event.currentTarget.value.length);
         }}
         onCompositionEnd={(event) => {
           const committedText = imeInputGate.current.finishComposition(event.data || event.currentTarget.value);
+          setImePreedit("");
           traceImeEvent(`compositionend commit=${committedText?.length ?? 0}`, event.nativeEvent, event.currentTarget.value.length);
           if (committedText) insertText(committedText);
           event.currentTarget.value = "";
@@ -2309,6 +2354,7 @@ function App() {
             nativeEvent.inputType === "insertCompositionText"
           ) {
               imeInputGate.current.updateComposition(nativeEvent.data || event.currentTarget.value);
+            setImePreedit(nativeEvent.data || event.currentTarget.value);
             traceImeEvent("preedit-input", nativeEvent, event.currentTarget.value.length);
             return;
           }
@@ -2325,7 +2371,7 @@ function App() {
           const nativeEvent = event.nativeEvent;
           imeInputGate.current.noteKeydown(event.key);
           traceImeEvent("keydown", nativeEvent, event.currentTarget.value.length);
-            if (event.key === "Escape") imeInputGate.current.cancelComposition();
+            if (event.key === "Escape") { imeInputGate.current.cancelComposition(); setImePreedit(""); }
           if (!imeInputGate.current.shouldHandleKey(nativeEvent.isComposing, nativeEvent.keyCode, event.key)) {
             traceImeEvent("keydown-composing", nativeEvent, event.currentTarget.value.length);
             return;
@@ -2496,7 +2542,7 @@ function App() {
               <span className="ribbon-group-title">표</span>
               <label>행 <input aria-label="표 행 수" type="number" min={1} max={30} value={tableRows} onChange={(event) => setTableRows(Math.max(1, Math.min(30, Number(event.currentTarget.value))))} /></label>
               <label>열 <input aria-label="표 열 수" type="number" min={1} max={20} value={tableColumns} onChange={(event) => setTableColumns(Math.max(1, Math.min(20, Number(event.currentTarget.value))))} /></label>
-              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={insertTable}>표 삽입</button>
+              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 표 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={insertTable}>표 삽입</button>
               {caret?.cellPath && <>
                 <span className="ribbon-divider" />
                 <button className="ribbon-button" type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runTableCommand("insertRowAbove")}>위 행</button>
@@ -2513,9 +2559,9 @@ function App() {
             </div>
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
-              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("rectangle")}>사각형</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("textBox")}>글상자</button>
+              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 그림 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 도형 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("rectangle")}>사각형</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 도형 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("textBox")}>글상자</button>
               <span className="ribbon-group-label">그림</span>
             </div>
             {documentObjects.length > 0 && <>
@@ -2563,9 +2609,9 @@ function App() {
             </div>
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
-              <button className="ribbon-insert-button" type="button" disabled={!isRangeSelection(selection)} title={isRangeSelection(selection) ? undefined : "먼저 한 문단 안의 글자를 선택하세요."} onMouseDown={(event) => event.preventDefault()} onClick={openHyperlinkDialog}>하이퍼링크</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertNote(false)}>각주</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertNote(true)}>미주</button>
+              <button className="ribbon-insert-button" type="button" disabled={!isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "하이퍼링크는 아직 구현되지 않았습니다." : isRangeSelection(selection) ? undefined : "먼저 한 문단 안의 글자를 선택하세요."} onMouseDown={(event) => event.preventDefault()} onClick={openHyperlinkDialog}>하이퍼링크</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "각주는 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertNote(false)}>각주</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "미주는 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertNote(true)}>미주</button>
               <span className="ribbon-group-label">링크 및 주석</span>
             </div>
           </>}
@@ -2617,7 +2663,7 @@ function App() {
                 ))}
               </div>
               <label className="ribbon-control-label" htmlFor="line-spacing">줄 간격</label>
-              <select id="line-spacing" className="ribbon-select compact-select" value={String(Number(paragraphProperties.lineSpacing ?? 160))} disabled={!session || !caret} onChange={(event) => applyParagraphFormat({ lineSpacing: Number(event.currentTarget.value), lineSpacingType: "Percent" })}>
+              <select id="line-spacing" className="ribbon-select compact-select" value={String(Number(paragraphProperties.lineSpacing ?? 160))} disabled={!session || !caret || isHanulTextEngine} title={isHanulTextEngine ? "줄 간격 조판은 아직 구현되지 않았습니다." : undefined} onChange={(event) => applyParagraphFormat({ lineSpacing: Number(event.currentTarget.value), lineSpacingType: "Percent" })}>
                 {[...new Set([100, 120, 150, 160, 180, 200, Number(paragraphProperties.lineSpacing ?? 160)])].sort((a, b) => a - b).map((spacing) => <option key={spacing} value={spacing}>{spacing}%</option>)}
               </select>
               <label className="ribbon-compact-field" title="문단 왼쪽 여백 (mm)">
@@ -2628,7 +2674,7 @@ function App() {
                 <span>첫 줄</span>
                 <input type="number" step="0.5" value={Math.round(Number(paragraphProperties.indent ?? 0) * 25.4 / 96 * 10) / 10} disabled={!session || !caret} onChange={(event) => applyParagraphFormat({ indent: Math.round(Number(event.currentTarget.value) * PARAGRAPH_RAW_UNITS_PER_MM) })} />
               </label>
-              <button className="ribbon-button" type="button" disabled={!session || !caret} onMouseDown={(event) => event.preventDefault()} onClick={() => openFormatDialog("paragraph")}>문단 모양…</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isHanulTextEngine} title={isHanulTextEngine ? "고급 문단 모양은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => openFormatDialog("paragraph")}>문단 모양…</button>
               <span className="ribbon-group-label">문단 모양</span>
             </div>
             <span className="ribbon-divider" />
@@ -2650,9 +2696,9 @@ function App() {
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
               <button className="ribbon-insert-button" type="button" disabled={!session || !caret} title="쪽 나누기 (Ctrl+Enter)" onMouseDown={(event) => event.preventDefault()} onClick={insertPageBreak}>쪽 나누기</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={insertPageNumber}>쪽 번호 넣기</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("header")}>머리말</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("footer")}>꼬리말</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진은 현재 본문 텍스트만 지원합니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={insertPageNumber}>쪽 번호 넣기</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진은 현재 본문 텍스트만 지원합니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("header")}>머리말</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진은 현재 본문 텍스트만 지원합니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => openHeaderFooterDialog("footer")}>꼬리말</button>
               <span className="ribbon-group-label">쪽 구성</span>
             </div>
           </>}
@@ -2719,7 +2765,7 @@ function App() {
           <span className="document-tab-name" title={fileName || "새 문서"}>
             {fileName || "새 문서"}
           </span>
-          {fileName && <span className="format-chip">{fileFormat || session?.sourceFormat}</span>}
+          {fileName && <span className="format-chip">{isHanulTextEngine ? `${fileFormat || "HWP"} · Hanul 엔진` : fileFormat || session?.sourceFormat}</span>}
         </div>
         <div className="document-tools">
           <span className="tool-label">보기</span>
@@ -2746,6 +2792,7 @@ function App() {
               renderVersion={renderVersion}
               editMode={editMode}
               caret={caret}
+              imePreedit={imePreedit}
               selectionRectsByPage={selectionRectsByPage}
               selectedObject={selectedObject}
               objectPreviewElementRef={objectPreviewElement}
@@ -2777,6 +2824,7 @@ function App() {
                 renderVersion={renderVersion}
                 editMode={editMode}
                 caret={caret}
+                imePreedit={imePreedit}
                 selectionRectsByPage={selectionRectsByPage}
                 selectedObject={selectedObject}
                 objectPreviewElementRef={objectPreviewElement}
