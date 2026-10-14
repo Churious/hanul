@@ -1,0 +1,131 @@
+.file-menu-root {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+}
+
+.file-menu-trigger {
+  min-width: 46px;
+  color: #536157;
+}
+
+.file-menu-trigger.active {
+  color: #fff;
+  background: var(--green);
+}
+
+.file-menu-trigger.active::after {
+  display: none;
+}
+
+.file-menu-panel,
+.file-menu-submenu {
+  position: absolute;
+  z-index: 30;
+  width: max-content;
+  min-width: 288px;
+  max-width: min(440px, calc(100vw - 16px));
+  padding: 5px 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid #d9ded9;
+  border-radius: 3px;
+  background: #fff;
+  box-shadow: 0 5px 16px rgb(26 40 30 / 16%), 0 1px 3px rgb(26 40 30 / 10%);
+}
+
+.file-menu-panel {
+  top: calc(100% + 1px);
+  left: 0;
+  max-height: calc(100vh - 125px);
+}
+
+.file-menu-panel ul,
+.file-menu-submenu ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-menu-entry {
+  position: relative;
+}
+
+.file-menu-item {
+  display: flex;
+  width: 100%;
+  min-height: 29px;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 11px 4px 9px;
+  border: 0;
+  background: transparent;
+  color: #29332c;
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.file-menu-item:hover:not(:disabled),
+.file-menu-item:focus-visible:not(:disabled) {
+  background: #edf4ee;
+}
+
+.file-menu-item:disabled {
+  color: #929a93;
+  cursor: default;
+}
+
+.file-menu-icon {
+  display: inline-flex;
+  width: 17px;
+  height: 18px;
+  flex: 0 0 17px;
+  align-items: center;
+  justify-content: center;
+  color: #718276;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.file-menu-item:disabled .file-menu-icon {
+  color: #aeb5af;
+}
+
+.file-menu-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-menu-item kbd {
+  margin-left: 25px;
+  color: #7e887f;
+  font: inherit;
+  font-size: 10px;
+}
+
+.file-menu-arrow {
+  margin-left: 22px;
+  color: #8a938b;
+  font-size: 17px;
+  line-height: 12px;
+}
+
+.file-menu-separator {
+  height: 1px;
+  margin: 4px 9px;
+  background: #e6eae6;
+}
+
+.file-menu-submenu {
+  position: fixed;
+  min-width: 220px;
+  max-height: calc(100vh - 16px);
+}
+
+@media (max-height: 720px) {
+  .file-menu-panel { max-height: calc(100vh - 125px); }
+}

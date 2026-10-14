@@ -1,0 +1,59 @@
+# Node / Vite
+node_modules/
+dist/
+.vite/
+coverage/
+playwright-report/
+test-results/
+
+# Rust / Tauri
+target/
+**/target/
+apps/desktop/src-tauri/gen/
+
+# Native binaries and distributable build packages
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.msi
+*.msix
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+
+# Local reverse-engineering project databases and generated analysis output
+.ghidra/
+**/.ghidra/
+**/ghidra-projects/
+**/ghidra_projects/
+**/*.rep/
+**/*.gpr
+**/*.sla
+**/rea-output/
+**/analysis-output/
+
+# Editor and OS
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.log
+core
+core.*
+
+# Local document samples and private material
+*.hwp
+*.hwpx
+*.hml
+*.pdf
+!.github/**/*.pdf
+
+# Private local document corpora and scratch exports
+/private-documents/
+/local-samples/
+/test-documents/
+/scratch-documents/
+
