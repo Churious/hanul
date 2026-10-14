@@ -7,6 +7,7 @@ import {
   useState,
   type CSSProperties,
   type ChangeEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent,
   type ReactNode,
 } from "react";
@@ -17,20 +18,19 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ImeInputGate } from "./ime-input";
-import {
-  createNewHwpDocumentSession,
-  loadHwpDocument,
-  type DocumentSession,
-  type DocumentInfo,
-  type CharacterFormat,
-  type DocumentStyle,
-  type ExportResult,
-  type PageDefinition,
-  type ParagraphFormat,
-  type SearchMatch,
-  type TableCommand,
-  type TextPosition,
-} from "./hwp-engine";
+import { rhwpDocumentEngine } from "./hwp-engine";
+import type {
+  DocumentSession,
+  DocumentInfo,
+  CharacterFormat,
+  DocumentStyle,
+  ExportResult,
+  PageDefinition,
+  ParagraphFormat,
+  SearchMatch,
+  TableCommand,
+  TextPosition,
+} from "./document-engine";
 import {
   clampZoom,
   formatFileSize,
@@ -272,6 +272,47 @@ type PageSetupDialogState = {
   form: PageSetupForm;
 };
 
+type FormatDialogTab = "character" | "paragraph";
+
+type CharacterFormatDraft = {
+  fontFamily: string;
+  fontSizePt: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strikethrough: boolean;
+};
+
+type ParagraphFormatDraft = {
+  alignment: NonNullable<ParagraphFormat["alignment"]>;
+  lineSpacing: number;
+  lineSpacingType: NonNullable<ParagraphFormat["lineSpacingType"]>;
+  marginLeftMm: number;
+  marginRightMm: number;
+  indentMm: number;
+  spacingBeforeMm: number;
+  spacingAfterMm: number;
+};
+
+type HeaderFooterDialogState = {
+  kind: "header" | "footer";
+  text: string;
+};
+
+type TableContextMenuPosition = { left: number; top: number };
+
+const TABLE_CONTEXT_COMMANDS: ReadonlyArray<{ command: TableCommand; label: string }> = [
+  { command: "insertRowAbove", label: "위에 행 삽입" },
+  { command: "insertRowBelow", label: "아래에 행 삽입" },
+  { command: "insertColumnLeft", label: "왼쪽에 열 삽입" },
+  { command: "insertColumnRight", label: "오른쪽에 열 삽입" },
+  { command: "deleteRow", label: "행 삭제" },
+  { command: "deleteColumn", label: "열 삭제" },
+  { command: "mergeRight", label: "오른쪽 셀과 병합" },
+  { command: "mergeDown", label: "아래 셀과 병합" },
+  { command: "splitCell", label: "셀 나누기" },
+];
+
 const HWP_UNITS_PER_MM = 72000 / 25.4;
 const PARAGRAPH_RAW_UNITS_PER_MM = 72 * 200 / 25.4;
 
@@ -313,6 +354,7 @@ function DocumentPage({
   onPagePointerDown,
   onPagePointerMove,
   onPagePointerUp,
+  onPageContextMenu,
 }: {
   session: DocumentSession;
   pageIndex: number;
@@ -325,6 +367,7 @@ function DocumentPage({
   onPagePointerDown: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
   onPagePointerMove: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
   onPagePointerUp: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
+  onPageContextMenu: (pageIndex: number, event: ReactMouseEvent<HTMLDivElement>) => void;
 }) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
@@ -411,6 +454,7 @@ function DocumentPage({
             onPointerDown={(event) => onPagePointerDown(pageIndex, event)}
             onPointerMove={(event) => onPagePointerMove(pageIndex, event)}
             onPointerUp={(event) => onPagePointerUp(pageIndex, event)}
+            onContextMenu={(event) => onPageContextMenu(pageIndex, event)}
             dangerouslySetInnerHTML={{ __html: pageSvg }}
           />
         ) : (
@@ -472,10 +516,15 @@ function App() {
   const [caret, setCaret] = useState<TextPosition | null>(null);
   const [selection, setSelection] = useState<EditorSelection | null>(null);
   const [pendingCharacterFormat, setPendingCharacterFormat] = useState<CharacterFormat>({});
+  const [formatDialogTab, setFormatDialogTab] = useState<FormatDialogTab | null>(null);
+  const [characterFormatDraft, setCharacterFormatDraft] = useState<CharacterFormatDraft | null>(null);
+  const [paragraphFormatDraft, setParagraphFormatDraft] = useState<ParagraphFormatDraft | null>(null);
   const [tableRows, setTableRows] = useState(2);
   const [tableColumns, setTableColumns] = useState(2);
+  const [tableContextMenu, setTableContextMenu] = useState<TableContextMenuPosition | null>(null);
   const [ribbonTab, setRibbonTab] = useState<RibbonTab>("편집");
   const [pageSetupDialog, setPageSetupDialog] = useState<PageSetupDialogState | null>(null);
+  const [headerFooterDialog, setHeaderFooterDialog] = useState<HeaderFooterDialogState | null>(null);
   const [documentInfoDialog, setDocumentInfoDialog] = useState<DocumentInfoDialogState | null>(null);
   const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
   const [printRequest, setPrintRequest] = useState<PrintRequest | null>(null);
@@ -644,7 +693,7 @@ function App() {
       if (pending.createNew) {
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
         setLoadingStatus("새 문서의 쪽을 구성하는 중…");
-        nextSession = await createNewHwpDocumentSession();
+        nextSession = await rhwpDocumentEngine.createBlank();
       } else {
         const readStartedAt = performance.now();
         bytes = pending.file
@@ -662,7 +711,7 @@ function App() {
         // RHWP's public WASM constructor is synchronous; yield a paint first so
         // this plain status is visible during parsing and initial pagination.
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
-        nextSession = await loadHwpDocument(bytes);
+        nextSession = await rhwpDocumentEngine.open(bytes);
       }
       let initialCaret: TextPosition | null = null;
       const hitTestStartedAt = performance.now();
@@ -1006,7 +1055,10 @@ function App() {
     setPageInput(String(position.cursorRect.pageIndex + 1));
   };
 
-  const hitPositionFromPointer = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
+  const hitPositionFromPointer = (
+    pageIndex: number,
+    event: Pick<PointerEvent<HTMLDivElement>, "clientX" | "clientY" | "currentTarget">,
+  ) => {
     if (!session) return null;
     const svg = event.currentTarget.querySelector("svg");
     if (!svg) return null;
@@ -1016,6 +1068,26 @@ function App() {
     const x = viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width;
     const y = viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height;
     return session.hitTest(pageIndex, x, y);
+  };
+
+  const handlePageContextMenu = (pageIndex: number, event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!session) return;
+    try {
+      const position = hitPositionFromPointer(pageIndex, event);
+      if (!position?.cellPath) {
+        setTableContextMenu(null);
+        return;
+      }
+      event.preventDefault();
+      setCaretPosition(position);
+      setSelection(null);
+      setTableContextMenu({
+        left: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
+        top: Math.max(8, Math.min(event.clientY, window.innerHeight - 350)),
+      });
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "표 위치를 확인하지 못했습니다.");
+    }
   };
 
   const handlePagePointerDown = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
@@ -1308,6 +1380,17 @@ function App() {
     }
   };
 
+  const insertHeaderFooter = () => {
+    if (!session || !caret || !headerFooterDialog) return;
+    try {
+      updateAfterEdit(session.insertHeaderFooterText(caret, headerFooterDialog.kind, headerFooterDialog.text));
+      setHeaderFooterDialog(null);
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "머리말·꼬리말을 삽입하지 못했습니다.");
+    }
+  };
+
   const insertNote = (endnote: boolean) => {
     if (!session || !caret || isRangeSelection(selection)) return;
     try {
@@ -1380,6 +1463,7 @@ function App() {
 
   const runTableCommand = (command: TableCommand) => {
     if (!session || !caret?.cellPath) return;
+    setTableContextMenu(null);
     try {
       updateAfterEdit(session.editTable(caret, command));
       editInput.current?.focus();
@@ -1514,6 +1598,12 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && tableContextMenu) {
+        event.preventDefault();
+        setTableContextMenu(null);
+        editInput.current?.focus();
+        return;
+      }
       if (event.key === "Escape" && printPreviewOpen) {
         event.preventDefault();
         setPrintPreviewOpen(false);
@@ -1587,7 +1677,7 @@ function App() {
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat, printPreviewOpen]);
+  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat, printPreviewOpen, tableContextMenu]);
 
   const characterProperties = useMemo(() => {
     if (!session || !caret) return {} as Record<string, unknown>;
@@ -1606,6 +1696,84 @@ function App() {
       return {} as Record<string, unknown>;
     }
   }, [session, caret, renderVersion]);
+
+  const openFormatDialog = (tab: FormatDialogTab) => {
+    if (!session || !caret) return;
+    const number = (value: unknown, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const pixelsToMillimeters = (value: unknown) => Math.round(number(value) * 25.4 / 96 * 10) / 10;
+    const currentCharacter = characterProperties;
+    const currentParagraph = paragraphProperties;
+    setCharacterFormatDraft({
+      fontFamily: String(currentCharacter.fontFamily ?? "함초롬바탕"),
+      fontSizePt: Math.round(number(currentCharacter.fontSize, 1000) / 100 * 10) / 10,
+      bold: Boolean(currentCharacter.bold),
+      italic: Boolean(currentCharacter.italic),
+      underline: Boolean(currentCharacter.underline),
+      strikethrough: Boolean(currentCharacter.strikethrough),
+    });
+    const spacingType = currentParagraph.lineSpacingType;
+    setParagraphFormatDraft({
+      alignment: ["left", "center", "right", "justify"].includes(String(currentParagraph.alignment))
+        ? currentParagraph.alignment as ParagraphFormatDraft["alignment"]
+        : "justify",
+      lineSpacing: number(currentParagraph.lineSpacing, 160),
+      lineSpacingType: ["Percent", "Fixed", "AtLeast"].includes(String(spacingType))
+        ? spacingType as ParagraphFormatDraft["lineSpacingType"]
+        : "Percent",
+      marginLeftMm: pixelsToMillimeters(currentParagraph.marginLeft),
+      marginRightMm: pixelsToMillimeters(currentParagraph.marginRight),
+      indentMm: pixelsToMillimeters(currentParagraph.indent),
+      spacingBeforeMm: pixelsToMillimeters(currentParagraph.spacingBefore),
+      spacingAfterMm: pixelsToMillimeters(currentParagraph.spacingAfter),
+    });
+    setFormatDialogTab(tab);
+  };
+
+  const commitFormatDialog = () => {
+    if (formatDialogTab === "character" && characterFormatDraft) {
+      if (!characterFormatDraft.fontFamily.trim() || !Number.isFinite(characterFormatDraft.fontSizePt) || characterFormatDraft.fontSizePt < 1 || characterFormatDraft.fontSizePt > 500) {
+        setMessage("글꼴과 1pt에서 500pt 사이의 글자 크기를 확인하세요.");
+        return;
+      }
+      applyCharacterFormat({
+        fontFamily: characterFormatDraft.fontFamily,
+        fontSize: Math.round(characterFormatDraft.fontSizePt * 100),
+        bold: characterFormatDraft.bold,
+        italic: characterFormatDraft.italic,
+        underline: characterFormatDraft.underline,
+        strikethrough: characterFormatDraft.strikethrough,
+      });
+    } else if (formatDialogTab === "paragraph" && paragraphFormatDraft) {
+      const paragraphValues = [
+        paragraphFormatDraft.lineSpacing,
+        paragraphFormatDraft.marginLeftMm,
+        paragraphFormatDraft.marginRightMm,
+        paragraphFormatDraft.indentMm,
+        paragraphFormatDraft.spacingBeforeMm,
+        paragraphFormatDraft.spacingAfterMm,
+      ];
+      if (paragraphValues.some((value) => !Number.isFinite(value)) || paragraphFormatDraft.lineSpacing < 10 || paragraphFormatDraft.lineSpacing > 1000) {
+        setMessage("문단 서식의 숫자 값을 확인하세요. 줄 간격은 10에서 1000 사이여야 합니다.");
+        return;
+      }
+      const toRaw = (millimeters: number) => Math.round(millimeters * PARAGRAPH_RAW_UNITS_PER_MM);
+      applyParagraphFormat({
+        alignment: paragraphFormatDraft.alignment,
+        lineSpacing: paragraphFormatDraft.lineSpacing,
+        lineSpacingType: paragraphFormatDraft.lineSpacingType,
+        marginLeft: toRaw(paragraphFormatDraft.marginLeftMm),
+        marginRight: toRaw(paragraphFormatDraft.marginRightMm),
+        indent: toRaw(paragraphFormatDraft.indentMm),
+        spacingBefore: toRaw(paragraphFormatDraft.spacingBeforeMm),
+        spacingAfter: toRaw(paragraphFormatDraft.spacingAfterMm),
+      });
+    }
+    setFormatDialogTab(null);
+    editInput.current?.focus();
+  };
 
   const documentStyles = useMemo(() => {
     if (!session) return [] as DocumentStyle[];
@@ -1960,6 +2128,7 @@ function App() {
                 <button className="ribbon-format-button italic" type="button" aria-label="기울임" aria-pressed={Boolean(characterProperties.italic)} title="기울임 (Ctrl I)" disabled={!session} onMouseDown={(event) => event.preventDefault()} onClick={() => toggleCharacterFormat("italic")}><em>I</em></button>
                 <button className="ribbon-format-button underline" type="button" aria-label="밑줄" aria-pressed={Boolean(characterProperties.underline)} title="밑줄" disabled={!session} onMouseDown={(event) => event.preventDefault()} onClick={() => toggleCharacterFormat("underline")}><span>U</span></button>
               </div>
+              <button className="ribbon-button" type="button" disabled={!session || !caret} onMouseDown={(event) => event.preventDefault()} onClick={() => openFormatDialog("character")}>글자 모양…</button>
               <span className="ribbon-group-label">글자 모양</span>
             </div>
             <span className="ribbon-divider" />
@@ -1981,6 +2150,7 @@ function App() {
                 <span>첫 줄</span>
                 <input type="number" step="0.5" value={Math.round(Number(paragraphProperties.indent ?? 0) * 25.4 / 96 * 10) / 10} disabled={!session || !caret} onChange={(event) => applyParagraphFormat({ indent: Math.round(Number(event.currentTarget.value) * PARAGRAPH_RAW_UNITS_PER_MM) })} />
               </label>
+              <button className="ribbon-button" type="button" disabled={!session || !caret} onMouseDown={(event) => event.preventDefault()} onClick={() => openFormatDialog("paragraph")}>문단 모양…</button>
               <span className="ribbon-group-label">문단 모양</span>
             </div>
             <span className="ribbon-divider" />
@@ -2003,6 +2173,8 @@ function App() {
             <div className="ribbon-group ribbon-inline-group">
               <button className="ribbon-insert-button" type="button" disabled={!session || !caret} title="쪽 나누기 (Ctrl+Enter)" onMouseDown={(event) => event.preventDefault()} onClick={insertPageBreak}>쪽 나누기</button>
               <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={insertPageNumber}>쪽 번호 넣기</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => setHeaderFooterDialog({ kind: "header", text: "" })}>머리말 입력</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={() => setHeaderFooterDialog({ kind: "footer", text: "" })}>꼬리말 입력</button>
               <span className="ribbon-group-label">쪽 구성</span>
             </div>
           </>}
@@ -2022,6 +2194,29 @@ function App() {
         <span className="search-count">{searchMatches.length ? `${searchMatchIndex + 1} / ${searchMatches.length}` : "검색어를 입력하세요"}</span>
         <button className="icon-button" type="button" aria-label="찾기 닫기" onClick={() => setSearchOpen(false)}>×</button>
       </section>}
+
+      {tableContextMenu && caret?.cellPath && (
+        <div className="table-context-scrim" role="presentation" onMouseDown={() => setTableContextMenu(null)}>
+          <div
+            className="table-context-menu"
+            role="menu"
+            aria-label="표 셀 편집 명령"
+            style={{ left: tableContextMenu.left, top: tableContextMenu.top }}
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); setTableContextMenu(null); editInput.current?.focus(); } }}
+          >
+            {TABLE_CONTEXT_COMMANDS.map(({ command, label }, index) => (
+              <button
+                key={command}
+                autoFocus={index === 0}
+                role="menuitem"
+                type="button"
+                onClick={() => runTableCommand(command)}
+              >{label}</button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <section className="document-bar" aria-label="문서 작업 영역">
         <div className="document-tab">
@@ -2061,6 +2256,7 @@ function App() {
               onPagePointerDown={handlePagePointerDown}
               onPagePointerMove={handlePagePointerMove}
               onPagePointerUp={handlePagePointerUp}
+              onPageContextMenu={handlePageContextMenu}
             />
           </div>
         ) : (
@@ -2088,6 +2284,7 @@ function App() {
                 onPagePointerDown={handlePagePointerDown}
                 onPagePointerMove={handlePagePointerMove}
                 onPagePointerUp={handlePagePointerUp}
+                onPageContextMenu={handlePageContextMenu}
               />
             )}
           />
@@ -2185,6 +2382,85 @@ function App() {
               <button className="primary-button" type="button" autoFocus onClick={() => setDocumentInfoDialog(null)}>닫기</button>
             </div>
           </section>
+        </div>
+      )}
+
+      {formatDialogTab && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setFormatDialogTab(null); }}>
+          <section className="confirm-dialog format-dialog" role="dialog" aria-modal="true" aria-labelledby="format-dialog-title">
+            <p className="eyebrow">서식</p>
+            <h2 id="format-dialog-title">{formatDialogTab === "character" ? "글자 모양" : "문단 모양"}</h2>
+            <div className="format-dialog-tabs" role="tablist" aria-label="서식 종류">
+              <button type="button" role="tab" aria-selected={formatDialogTab === "character"} onClick={() => setFormatDialogTab("character")}>글자</button>
+              <button type="button" role="tab" aria-selected={formatDialogTab === "paragraph"} onClick={() => setFormatDialogTab("paragraph")}>문단</button>
+            </div>
+            {formatDialogTab === "character" && characterFormatDraft && (
+              <div className="format-dialog-grid">
+                <label className="page-setup-field format-wide-field">
+                  <span>글꼴</span>
+                  <select value={characterFormatDraft.fontFamily} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, fontFamily: event.currentTarget.value } : current)}>
+                    {["함초롬바탕", "함초롬돋움", "맑은 고딕", "바탕", "굴림", "Arial"].map((font) => <option key={font} value={font}>{font}</option>)}
+                  </select>
+                </label>
+                <label className="page-setup-field">
+                  <span>크기 (pt)</span>
+                  <input type="number" min="1" max="500" step="0.1" value={characterFormatDraft.fontSizePt} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, fontSizePt: Number(event.currentTarget.value) } : current)} />
+                </label>
+                <label className="format-check-field"><input type="checkbox" checked={characterFormatDraft.bold} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, bold: event.currentTarget.checked } : current)} /> 굵게</label>
+                <label className="format-check-field"><input type="checkbox" checked={characterFormatDraft.italic} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, italic: event.currentTarget.checked } : current)} /> 기울임</label>
+                <label className="format-check-field"><input type="checkbox" checked={characterFormatDraft.underline} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, underline: event.currentTarget.checked } : current)} /> 밑줄</label>
+                <label className="format-check-field"><input type="checkbox" checked={characterFormatDraft.strikethrough} onChange={(event) => setCharacterFormatDraft((current) => current ? { ...current, strikethrough: event.currentTarget.checked } : current)} /> 취소선</label>
+              </div>
+            )}
+            {formatDialogTab === "paragraph" && paragraphFormatDraft && (
+              <div className="format-dialog-grid">
+                <label className="page-setup-field">
+                  <span>정렬</span>
+                  <select value={paragraphFormatDraft.alignment} onChange={(event) => setParagraphFormatDraft((current) => current ? { ...current, alignment: event.currentTarget.value as ParagraphFormatDraft["alignment"] } : current)}>
+                    <option value="left">왼쪽</option><option value="center">가운데</option><option value="right">오른쪽</option><option value="justify">양쪽</option>
+                  </select>
+                </label>
+                <label className="page-setup-field">
+                  <span>줄 간격 종류</span>
+                  <select value={paragraphFormatDraft.lineSpacingType} onChange={(event) => setParagraphFormatDraft((current) => current ? { ...current, lineSpacingType: event.currentTarget.value as ParagraphFormatDraft["lineSpacingType"] } : current)}>
+                    <option value="Percent">글자에 비례</option><option value="Fixed">고정값</option><option value="AtLeast">최소값</option>
+                  </select>
+                </label>
+                <label className="page-setup-field">
+                  <span>줄 간격 값</span>
+                  <input type="number" min="10" max="1000" step="1" value={paragraphFormatDraft.lineSpacing} onChange={(event) => setParagraphFormatDraft((current) => current ? { ...current, lineSpacing: Number(event.currentTarget.value) } : current)} />
+                </label>
+                {([["marginLeftMm", "왼쪽 여백"], ["marginRightMm", "오른쪽 여백"], ["indentMm", "첫 줄 들여쓰기"], ["spacingBeforeMm", "문단 위 간격"], ["spacingAfterMm", "문단 아래 간격"]] as const).map(([key, label]) => (
+                  <label className="page-setup-field" key={key}>
+                    <span>{label} (mm)</span>
+                    <input type="number" min="-100" max="1000" step="0.1" value={paragraphFormatDraft[key]} onChange={(event) => setParagraphFormatDraft((current) => current ? { ...current, [key]: Number(event.currentTarget.value) } : current)} />
+                  </label>
+                ))}
+              </div>
+            )}
+            <div className="dialog-actions">
+              <button className="secondary-button" type="button" onClick={() => { setFormatDialogTab(null); editInput.current?.focus(); }}>취소</button>
+              <button className="primary-button" type="button" onClick={commitFormatDialog}>적용</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {headerFooterDialog && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setHeaderFooterDialog(null); }}>
+          <form className="confirm-dialog hyperlink-dialog" role="dialog" aria-modal="true" aria-labelledby="header-footer-title" onSubmit={(event) => { event.preventDefault(); insertHeaderFooter(); }}>
+            <p className="eyebrow">쪽 구성</p>
+            <h2 id="header-footer-title">{headerFooterDialog.kind === "header" ? "머리말 입력" : "꼬리말 입력"}</h2>
+            <p>현재 구역의 양쪽 페이지에 적용되며, 기존 내용이 있으면 뒤에 이어 붙입니다. 한 문단 텍스트를 입력하세요.</p>
+            <label className="page-setup-field">
+              <span>내용</span>
+              <input autoFocus maxLength={1000} value={headerFooterDialog.text} onChange={(event) => setHeaderFooterDialog((current) => current ? { ...current, text: event.currentTarget.value } : current)} />
+            </label>
+            <div className="dialog-actions">
+              <button className="secondary-button" type="button" onClick={() => { setHeaderFooterDialog(null); editInput.current?.focus(); }}>취소</button>
+              <button className="primary-button" type="submit" disabled={!headerFooterDialog.text.trim()}>삽입</button>
+            </div>
+          </form>
         </div>
       )}
 

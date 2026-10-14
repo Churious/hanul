@@ -1,183 +1,49 @@
 import init, { HwpDocument, type DocumentExport } from "@rhwp/core";
 import wasmUrl from "@rhwp/core/rhwp_bg.wasm?url";
+import type {
+  CellPathSegment,
+  CharacterFormat,
+  ContentLossReport,
+  CursorRectangle,
+  DocumentEngine,
+  DocumentInfo,
+  DocumentSession,
+  DocumentStyle,
+  ExportResult,
+  HeaderFooterKind,
+  PageDefinition,
+  ParagraphFormat,
+  RenderedPageInfo,
+  SearchMatch,
+  SelectionRectangle,
+  TableCommand,
+  TextPosition,
+} from "./document-engine";
+
+export type {
+  CellPathSegment,
+  CharacterFormat,
+  ContentLossItem,
+  ContentLossReport,
+  CursorRectangle,
+  DocumentEngine,
+  DocumentInfo,
+  DocumentSession,
+  DocumentStyle,
+  ExportResult,
+  HeaderFooterKind,
+  PageDefinition,
+  ParagraphFormat,
+  RenderedPageInfo,
+  SearchMatch,
+  SelectionRectangle,
+  TableCommand,
+  TextPosition,
+} from "./document-engine";
 
 type RhwpGlobals = typeof globalThis & {
   measureTextWidth?: (font: string, text: string) => number;
 };
-
-export interface CursorRectangle {
-  pageIndex: number;
-  x: number;
-  y: number;
-  height: number;
-}
-
-export interface TextPosition {
-  sectionIndex: number;
-  /** 본문 문단 번호, 또는 표 셀 문단 번호 */
-  paragraphIndex: number;
-  charOffset: number;
-  cursorRect: CursorRectangle;
-  parentParagraphIndex?: number;
-  cellPath?: CellPathSegment[];
-}
-
-export interface CellPathSegment {
-  controlIndex: number;
-  cellIndex: number;
-  cellParaIndex: number;
-}
-
-export interface SelectionRectangle {
-  pageIndex: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface CharacterFormat {
-  fontFamily?: string;
-  fontSize?: number;
-  bold?: boolean;
-  italic?: boolean;
-  underline?: boolean;
-  strikethrough?: boolean;
-}
-
-export interface ParagraphFormat {
-  alignment?: "left" | "center" | "right" | "justify";
-  lineSpacing?: number;
-  lineSpacingType?: "Percent" | "Fixed" | "AtLeast";
-  marginLeft?: number;
-  marginRight?: number;
-  indent?: number;
-  spacingBefore?: number;
-  spacingAfter?: number;
-}
-
-export interface PageDefinition {
-  width: number;
-  height: number;
-  marginLeft: number;
-  marginRight: number;
-  marginTop: number;
-  marginBottom: number;
-  marginHeader: number;
-  marginFooter: number;
-  marginGutter: number;
-  landscape: boolean;
-  binding: number;
-}
-
-export interface DocumentInfo {
-  version?: string;
-  sectionCount?: number;
-  pageCount?: number;
-  encrypted?: boolean;
-  hwp3Variant?: boolean;
-  fontsUsed?: string[];
-  fontSubstitutions?: unknown[];
-}
-
-export interface RenderedPageInfo {
-  pageIndex: number;
-  pageNumber: number;
-  width: number;
-  height: number;
-  sectionIndex: number;
-}
-
-export interface DocumentStyle {
-  id: number;
-  name: string;
-  englishName?: string;
-  type?: string;
-  paraShapeId?: number;
-  charShapeId?: number;
-}
-
-export interface ContentLossItem {
-  code?: string;
-  subject?: string;
-  reason?: string;
-  message?: string;
-  [key: string]: unknown;
-}
-
-export interface ContentLossReport {
-  schemaVersion: number;
-  outputFormat: "hwp" | "hwpx";
-  count: number;
-  losses: ContentLossItem[];
-}
-
-export interface ExportResult {
-  bytes: Uint8Array;
-  report: ContentLossReport;
-}
-
-export interface SearchMatch {
-  start: TextPosition;
-  end: TextPosition;
-  matchedText: string;
-}
-
-export type TableCommand =
-  | "insertRowAbove"
-  | "insertRowBelow"
-  | "insertColumnLeft"
-  | "insertColumnRight"
-  | "deleteRow"
-  | "deleteColumn"
-  | "mergeRight"
-  | "mergeDown"
-  | "splitCell";
-
-export interface DocumentSession {
-  readonly pageCount: number;
-  readonly sourceFormat: string;
-  documentInfo(): DocumentInfo;
-  pageInfo(pageIndex: number): RenderedPageInfo;
-  renderPage(pageIndex: number): string;
-  hitTest(pageIndex: number, x: number, y: number): TextPosition;
-  moveCaret(position: TextPosition, delta: -1 | 1): TextPosition;
-  moveCaretVertical(position: TextPosition, delta: -1 | 1): TextPosition;
-  moveCaretToParagraphEdge(position: TextPosition, edge: "start" | "end"): TextPosition;
-  insertText(position: TextPosition, text: string): TextPosition;
-  deleteText(position: TextPosition, direction: "backward" | "forward"): TextPosition;
-  splitParagraph(position: TextPosition): TextPosition;
-  insertPageBreak(position: TextPosition): TextPosition;
-  undo(): TextPosition | null;
-  redo(): TextPosition | null;
-  readonly canUndo: boolean;
-  readonly canRedo: boolean;
-  selectionRectangles(start: TextPosition, end: TextPosition): SelectionRectangle[];
-  characterProperties(position: TextPosition): Record<string, unknown>;
-  clearTypingFormat(): void;
-  applyCharacterFormat(start: TextPosition, end: TextPosition, format: CharacterFormat): TextPosition;
-  paragraphProperties(position: TextPosition): Record<string, unknown>;
-  applyParagraphFormat(position: TextPosition, format: ParagraphFormat): TextPosition;
-  applyParagraphAlignment(position: TextPosition, alignment: "left" | "center" | "right" | "justify"): TextPosition;
-  styleList(): DocumentStyle[];
-  applyStyle(position: TextPosition, styleId: number): TextPosition;
-  pageDefinition(sectionIndex: number): PageDefinition;
-  setPageDefinition(position: TextPosition, updates: Partial<PageDefinition>): TextPosition;
-  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, width: number, height: number): TextPosition;
-  setHyperlink(start: TextPosition, end: TextPosition, uri: string): TextPosition;
-  insertAutoNumber(position: TextPosition, kind: "page" | "current" | "total"): TextPosition;
-  insertFootnote(position: TextPosition, endnote?: boolean): TextPosition;
-  deleteRange(start: TextPosition, end: TextPosition): TextPosition;
-  replaceRange(start: TextPosition, end: TextPosition, text: string): TextPosition;
-  selectedText(start: TextPosition, end: TextPosition): string;
-  searchText(query: string, includeCells?: boolean): SearchMatch[];
-  replaceAllText(query: string, replacement: string): { count: number; position: TextPosition | null };
-  createTable(position: TextPosition, rows: number, columns: number): TextPosition;
-  moveTableCell(position: TextPosition, delta: -1 | 1): TextPosition;
-  editTable(position: TextPosition, command: TableCommand): TextPosition;
-  exportWithReport(format?: "hwp" | "hwpx"): ExportResult;
-  dispose(): void;
-}
 
 interface RawHit extends Omit<TextPosition, "cursorRect"> {
   cursorRect?: CursorRectangle;
@@ -443,7 +309,7 @@ class RhwpDocumentSession implements DocumentSession {
       charRuns,
     });
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(address.cursorRect.pageIndex);
     return this.positionAtAddress(address, result.charOffset);
   }
 
@@ -455,7 +321,7 @@ class RhwpDocumentSession implements DocumentSession {
       address: { ...position },
     });
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(position.cursorRect.pageIndex);
     return this.positionAtAddress(this.addressAtParagraph(position, result.paraIdx), result.charOffset);
   }
 
@@ -472,7 +338,7 @@ class RhwpDocumentSession implements DocumentSession {
       if (!result.ok || !Number.isInteger(result.paraIdx) || !Number.isInteger(result.charOffset)) {
         throw new Error("쪽 나누기를 삽입하지 못했습니다.");
       }
-      this.invalidatePages();
+      this.invalidatePages(position.cursorRect.pageIndex);
       const afterAddress = this.positionAt(position.sectionIndex, result.paraIdx, result.charOffset);
       const afterSnapshotId = this.document.saveSnapshot();
       this.undoStack.push({
@@ -488,7 +354,7 @@ class RhwpDocumentSession implements DocumentSession {
     } catch (cause) {
       const restored = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(beforeSnapshotId), "쪽 나누기 복구");
       if (!restored.ok) throw new Error("쪽 나누기 삽입에 실패했고 원본 문서 복구에도 실패했습니다.");
-      this.invalidatePages();
+      this.invalidatePages(position.cursorRect.pageIndex);
       throw cause;
     }
   }
@@ -592,7 +458,7 @@ class RhwpDocumentSession implements DocumentSession {
     if (!operations.length) return this.positionAtAddress(last, last.charOffset);
     this.undoStack.push(operations.length === 1 ? operations[0] : { kind: "compound", operations });
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(segments[0]?.address.cursorRect.pageIndex ?? 0);
     return this.positionAtAddress(last, last.charOffset);
   }
 
@@ -694,7 +560,49 @@ class RhwpDocumentSession implements DocumentSession {
     return this.mutateWithSnapshot(position, "용지 설정", () => {
       const raw = this.document.setPageDef(position.sectionIndex, JSON.stringify(next));
       if (!parseJson<{ ok: boolean }>(raw, "용지 설정").ok) throw new Error("용지 설정을 바꾸지 못했습니다.");
-    });
+    }, 0);
+  }
+
+  insertHeaderFooterText(position: TextPosition, kind: HeaderFooterKind, text: string) {
+    if (this.isCellPosition(position)) throw new Error("표 셀 안에서는 머리말이나 꼬리말을 추가할 수 없습니다.");
+    if (!text.trim()) throw new Error("머리말이나 꼬리말 내용을 입력하세요.");
+    if (/[\r\n]/.test(text)) throw new Error("현재 머리말·꼬리말 삽입은 한 문단의 텍스트만 지원합니다.");
+    const isHeader = kind === "header";
+    const applyTo = 0; // RHWP's section-wide "양 쪽" target.
+    return this.mutateWithSnapshot(position, isHeader ? "머리말 삽입" : "꼬리말 삽입", () => {
+      const current = parseJson<{ ok: boolean; exists: boolean }>(
+        this.document.getHeaderFooter(position.sectionIndex, isHeader, applyTo),
+        isHeader ? "머리말 조회" : "꼬리말 조회",
+      );
+      if (!current.ok) throw new Error("머리말·꼬리말 상태를 확인하지 못했습니다.");
+      if (!current.exists) {
+        const created = parseJson<{ ok: boolean }>(
+          this.document.createHeaderFooter(position.sectionIndex, isHeader, applyTo),
+          isHeader ? "머리말 생성" : "꼬리말 생성",
+        );
+        if (!created.ok) throw new Error("머리말·꼬리말을 만들지 못했습니다.");
+      }
+      const paragraph = parseJson<{ ok: boolean; paraCount: number; charCount: number }>(
+        this.document.getHeaderFooterParaInfo(position.sectionIndex, isHeader, applyTo, 0),
+        "머리말·꼬리말 문단 조회",
+      );
+      if (!paragraph.ok || paragraph.paraCount < 1 || !Number.isInteger(paragraph.charCount) || paragraph.charCount < 0) {
+        throw new Error("머리말·꼬리말 문단을 편집할 수 없습니다.");
+      }
+      const inserted = parseJson<{ ok: boolean }>(
+        this.document.insertTextInHeaderFooter(
+          position.sectionIndex,
+          isHeader,
+          applyTo,
+          0,
+          paragraph.charCount,
+          text,
+        ),
+        "머리말·꼬리말 삽입",
+      );
+      if (!inserted.ok) throw new Error("머리말·꼬리말 내용을 삽입하지 못했습니다.");
+      return position.charOffset;
+    }, 0);
   }
 
   insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, width: number, height: number) {
@@ -798,7 +706,7 @@ class RhwpDocumentSession implements DocumentSession {
     if (!result.ok) throw new Error("선택한 내용을 삭제하지 못했습니다.");
     this.undoStack.push({ kind: "delete", address, text, charRuns });
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(address.cursorRect.pageIndex);
     return this.positionAtAddress(address, result.charOffset);
   }
 
@@ -875,7 +783,7 @@ class RhwpDocumentSession implements DocumentSession {
     if (operations.length > 1) this.undoStack.push({ kind: "compound", operations });
     else if (operations.length === 1) this.undoStack.push(operations[0]);
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(Math.min(...matches.map((match) => match.start.cursorRect.pageIndex)));
     return { count: matches.length, position };
   }
 
@@ -899,7 +807,7 @@ class RhwpDocumentSession implements DocumentSession {
     };
     this.undoStack.push(operation);
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(position.cursorRect.pageIndex);
     return this.positionAt(
       position.sectionIndex,
       0,
@@ -1017,12 +925,12 @@ class RhwpDocumentSession implements DocumentSession {
         afterAddress,
       });
       this.trimSnapshotHistory();
-      this.invalidatePages();
+      this.invalidatePages(position.cursorRect.pageIndex);
       return afterAddress;
     } catch (cause) {
       this.document.restoreSnapshot(beforeSnapshotId);
       this.document.discardSnapshot(beforeSnapshotId);
-      this.invalidatePages();
+      this.invalidatePages(position.cursorRect.pageIndex);
       throw cause;
     }
   }
@@ -1069,12 +977,13 @@ class RhwpDocumentSession implements DocumentSession {
     address: TextPosition,
     label: string,
     mutate: () => number | void,
+    invalidateFromPage = address.cursorRect.pageIndex,
   ) {
     const beforeSnapshotId = this.document.saveSnapshot();
     let afterSnapshotId: number | undefined;
     try {
       const nextOffset = mutate();
-      this.invalidatePages();
+      this.invalidatePages(invalidateFromPage);
       const afterAddress = this.positionAtAddress(address, typeof nextOffset === "number" ? nextOffset : address.charOffset);
       afterSnapshotId = this.document.saveSnapshot();
       this.undoStack.push({
@@ -1091,7 +1000,7 @@ class RhwpDocumentSession implements DocumentSession {
       const restored = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(beforeSnapshotId), `${label} 복구`);
       this.document.discardSnapshot(beforeSnapshotId);
       if (afterSnapshotId !== undefined) this.document.discardSnapshot(afterSnapshotId);
-      this.invalidatePages();
+      this.invalidatePages(invalidateFromPage);
       if (!restored.ok) throw new Error(`${label}에 실패했고 원본 문서 복구에도 실패했습니다.`);
       throw cause;
     }
@@ -1120,7 +1029,7 @@ class RhwpDocumentSession implements DocumentSession {
     if (Object.keys(format).length) {
       this.applyCharacterFormatRaw(position, position.charOffset, nextOffset, format);
     }
-    this.invalidatePages();
+    this.invalidatePages(position.cursorRect.pageIndex);
     return this.positionAtAddress(position, nextOffset);
   }
 
@@ -1130,13 +1039,13 @@ class RhwpDocumentSession implements DocumentSession {
         const length = Array.from(operation.text).length;
         const result = this.deleteTextRange(operation.address, operation.address.charOffset, operation.address.charOffset + length);
         if (!result.ok) throw new Error("입력 내용을 되돌리지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, result.charOffset);
       }
       case "delete": {
         const position = this.applyInsert(operation.address, operation.text);
         if (operation.charRuns) this.setCharRuns(operation.address, operation.address.charOffset, operation.address.charOffset + Array.from(operation.text).length, operation.charRuns);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return position;
       }
       case "split": {
@@ -1144,25 +1053,25 @@ class RhwpDocumentSession implements DocumentSession {
         const result = this.mergeAt(nextParagraph);
         if (!result.ok) throw new Error("문단 나누기를 되돌리지 못했습니다.");
         operation.removedParaMeta = result.removedParaMeta === undefined ? undefined : JSON.stringify(result.removedParaMeta);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, result.charOffset);
       }
       case "merge": {
         const previous = this.addressAtParagraph(operation.address, operation.address.paragraphIndex - 1);
         const result = this.splitAt(previous, operation.charOffset, operation.removedParaMeta);
         if (!result.ok) throw new Error("문단 병합을 되돌리지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return operation.caretAfterUndo === "start"
           ? this.positionAtAddress(this.addressAtParagraph(previous, result.paraIdx), 0)
           : this.positionAtAddress(previous, operation.charOffset);
       }
       case "char-format":
         this.setCharRuns(operation.address, operation.start, operation.end, operation.before);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, operation.end);
       case "para-align":
         this.applyAlignmentRaw(operation.address, operation.before);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, operation.address.charOffset);
       case "table": {
         const result = parseJson<{ ok: boolean }>(this.document.deleteTableControl(
@@ -1171,13 +1080,13 @@ class RhwpDocumentSession implements DocumentSession {
           operation.controlIndex,
         ), "표 실행 취소");
         if (!result.ok) throw new Error("표 삽입을 되돌리지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, operation.address.charOffset);
       }
       case "snapshot": {
         const result = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(operation.beforeSnapshotId), "문서 실행 취소");
         if (!result.ok) throw new Error("표 편집을 되돌리지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(0);
         return this.positionAtAddress(operation.beforeAddress, operation.beforeAddress.charOffset);
       }
       case "compound": {
@@ -1194,29 +1103,29 @@ class RhwpDocumentSession implements DocumentSession {
       case "delete": {
         const result = this.deleteTextRange(operation.address, operation.address.charOffset, operation.address.charOffset + Array.from(operation.text).length);
         if (!result.ok) throw new Error("삭제를 다시 실행하지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, result.charOffset);
       }
       case "split": {
         const result = this.splitAt(operation.address, operation.address.charOffset, operation.removedParaMeta);
         if (!result.ok) throw new Error("문단 나누기를 다시 실행하지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(this.addressAtParagraph(operation.address, result.paraIdx), result.charOffset);
       }
       case "merge": {
         const result = this.mergeAt(operation.address);
         if (!result.ok) throw new Error("문단 병합을 다시 실행하지 못했습니다.");
         operation.removedParaMeta = result.removedParaMeta === undefined ? undefined : JSON.stringify(result.removedParaMeta);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(this.addressAtParagraph(operation.address, result.paraIdx), result.charOffset);
       }
       case "char-format":
         this.setCharRuns(operation.address, operation.start, operation.end, operation.after);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, operation.end);
       case "para-align":
         this.applyAlignmentRaw(operation.address, operation.after);
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAtAddress(operation.address, operation.address.charOffset);
       case "table": {
         const result = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(this.document.createTable(
@@ -1229,7 +1138,7 @@ class RhwpDocumentSession implements DocumentSession {
         if (!result.ok) throw new Error("표를 다시 만들지 못했습니다.");
         operation.tableParaIndex = result.paraIdx;
         operation.controlIndex = result.controlIdx;
-        this.invalidatePages();
+        this.invalidatePages(operation.address.cursorRect.pageIndex);
         return this.positionAt(
           operation.address.sectionIndex,
           0,
@@ -1242,7 +1151,7 @@ class RhwpDocumentSession implements DocumentSession {
       case "snapshot": {
         const result = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(operation.afterSnapshotId), "문서 다시 실행");
         if (!result.ok) throw new Error("표 편집을 다시 실행하지 못했습니다.");
-        this.invalidatePages();
+        this.invalidatePages(0);
         return this.positionAtAddress(operation.afterAddress, operation.afterAddress.charOffset);
       }
       case "compound": {
@@ -1264,7 +1173,7 @@ class RhwpDocumentSession implements DocumentSession {
       removedParaMeta: result.removedParaMeta === undefined ? undefined : JSON.stringify(result.removedParaMeta),
     });
     this.clearRedo();
-    this.invalidatePages();
+    this.invalidatePages(position.cursorRect.pageIndex);
     return this.positionAtAddress(this.addressAtParagraph(position, result.paraIdx), result.charOffset);
   }
 
@@ -1547,7 +1456,7 @@ class RhwpDocumentSession implements DocumentSession {
       });
       this.clearRedo();
       this.trimSnapshotHistory();
-      this.invalidatePages();
+      this.invalidatePages(first.cursorRect.pageIndex);
       return position;
     } catch (cause) {
       const restored = parseJson<{ ok: boolean }>(this.document.restoreSnapshot(beforeSnapshotId), "선택 범위 삭제 복구");
@@ -1600,8 +1509,11 @@ class RhwpDocumentSession implements DocumentSession {
     };
   }
 
-  private invalidatePages() {
-    this.renderedPages.clear();
+  private invalidatePages(fromPageIndex = 0) {
+    const firstStalePage = Math.max(0, fromPageIndex);
+    for (const pageIndex of this.renderedPages.keys()) {
+      if (pageIndex >= firstStalePage) this.renderedPages.delete(pageIndex);
+    }
   }
 }
 
@@ -1651,6 +1563,12 @@ export async function createNewHwpDocumentSession(): Promise<DocumentSession> {
   }
   return new RhwpDocumentSession(document);
 }
+
+export const rhwpDocumentEngine: DocumentEngine = Object.freeze({
+  id: "rhwp",
+  open: loadHwpDocument,
+  createBlank: createNewHwpDocumentSession,
+});
 
 export function wrapHwpDocument(document: HwpDocument): DocumentSession {
   return new RhwpDocumentSession(document);

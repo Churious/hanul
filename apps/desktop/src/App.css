@@ -1185,6 +1185,84 @@ input:focus-visible {
   gap: 12px;
 }
 
+.format-dialog {
+  display: grid;
+  width: min(600px, 100%);
+  gap: 14px;
+}
+
+.format-dialog-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--line);
+}
+
+.format-dialog-tabs button {
+  min-width: 72px;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.format-dialog-tabs button[aria-selected="true"] {
+  border-bottom-color: var(--accent);
+  color: var(--ink);
+}
+
+.format-dialog-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 10px 14px;
+}
+
+.format-wide-field { grid-column: 1 / -1; }
+
+.format-check-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.table-context-scrim {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+}
+
+.table-context-menu {
+  position: fixed;
+  display: grid;
+  width: 220px;
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: 0 5px 18px rgb(17 26 36 / 18%);
+}
+
+.table-context-menu button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.table-context-menu button:hover,
+.table-context-menu button:focus-visible {
+  outline: 0;
+  background: var(--hover);
+}
+
 .page-setup-dialog > p:not(.eyebrow) {
   margin: -4px 0 2px;
 }
