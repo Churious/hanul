@@ -7,6 +7,7 @@ import {
   wrapHwpDocument,
   type TableCommand,
 } from "./hwp-engine";
+import type { DocumentObject, TextPosition } from "./document-engine";
 
 beforeAll(async () => {
   const wasm = new Uint8Array(
@@ -19,6 +20,87 @@ beforeAll(async () => {
 });
 
 describe("RHWP document session", () => {
+  it("records edit command costs on a synthetic 35-page document", async () => {
+    const fixture = HwpDocument.createEmpty();
+    let fixtureBytes: Uint8Array<ArrayBufferLike> = new Uint8Array();
+    let fixturePages = 0;
+    try {
+      fixture.createBlankDocument();
+      fixture.insertText(0, 0, 0, ("Hanul 편집 지연 계측용 문단입니다. 0123456789 가나다라마바사아자차카타파하\n").repeat(1400));
+      fixturePages = fixture.pageCount();
+      const exportedFixture = fixture.exportHwpWithReport();
+      try {
+        fixtureBytes = exportedFixture.takeBytes();
+      } finally {
+        exportedFixture.free();
+      }
+    } finally {
+      fixture.free();
+    }
+
+    const measurements: Array<Record<string, number | string>> = [];
+    const measure = async (
+      name: string,
+      prepare: (session: ReturnType<typeof wrapHwpDocument>) => TextPosition,
+      edit: (session: ReturnType<typeof wrapHwpDocument>, position: TextPosition) => void,
+    ) => {
+      const document = new HwpDocument(fixtureBytes);
+      const session = wrapHwpDocument(document);
+      const position = prepare(session);
+      const snapshotTimes: number[] = [];
+      const originalSaveSnapshot = document.saveSnapshot.bind(document);
+      const saveSnapshotSpy = vi.spyOn(document, "saveSnapshot").mockImplementation(() => {
+        const startedAt = performance.now();
+        const id = originalSaveSnapshot();
+        snapshotTimes.push(performance.now() - startedAt);
+        return id;
+      });
+      try {
+        const runtime = globalThis as typeof globalThis & { process?: { memoryUsage: () => { rss: number } } };
+        const rssBeforeBytes = runtime.process?.memoryUsage().rss ?? 0;
+        const startedAt = performance.now();
+        edit(session, position);
+        const editMs = performance.now() - startedAt;
+        const rssAfterBytes = runtime.process?.memoryUsage().rss ?? 0;
+        measurements.push({
+          operation: name,
+          editMs: Number(editMs.toFixed(2)),
+          snapshotCount: snapshotTimes.length,
+          snapshotMs: Number(snapshotTimes.reduce((sum, value) => sum + value, 0).toFixed(2)),
+          rssBeforeBytes,
+          rssAfterBytes,
+        });
+      } finally {
+        saveSnapshotSpy.mockRestore();
+        session.dispose();
+      }
+    };
+
+    await measure("single-character-model-insert", (session) => session.hitTest(session.pageCount - 1, 113, 132),
+      (session, position) => { session.insertText(position, "가"); });
+    await measure("paragraph-format", (session) => session.hitTest(session.pageCount - 1, 113, 132),
+      (session, position) => { session.applyParagraphAlignment(position, "center"); });
+    await measure("table-row-insert", (session) => session.createTable(
+      session.hitTest(session.pageCount - 1, 113, 132), 2, 2,
+    ), (session, position) => { session.editTable(position, "insertRowBelow"); });
+    let movingObject: DocumentObject | null = null;
+    await measure("object-move-update", (session) => {
+      const position = session.hitTest(session.pageCount - 1, 113, 132);
+      session.insertShape(position, "rectangle", 25, 15);
+      const objects = session.listObjects(position.sectionIndex);
+      movingObject = objects[objects.length - 1] ?? null;
+      return position;
+    }, (session) => {
+      if (!movingObject) throw new Error("Object fixture was not inserted");
+      session.updateObject(movingObject, { offsetXmm: movingObject.offsetXmm + 1 });
+    });
+    console.info("HANUL_EDIT_COMMAND_PERF", JSON.stringify({
+      syntheticParagraphs: 1400,
+      pages: fixturePages,
+      measurements,
+    }));
+  });
+
   it("keeps only the twelve most recently used rendered pages", () => {
     const document = HwpDocument.createEmpty();
     document.createBlankDocument();
@@ -584,19 +666,35 @@ describe("RHWP document session", () => {
       session.undo();
       expect(session.headerFooterInfo(start, "header", "oddPages").text).toBe("수정한 홀수 쪽 머리말");
       session.redo();
+      session.insertHeaderFooterField(start, "header", "oddPages", "totalPages");
+      session.insertHeaderFooterField(start, "header", "oddPages", "fileName");
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toContain("\u0016");
+      expect(session.headerFooterInfo(start, "header", "oddPages").text).toContain("\u0017");
 
       for (const format of ["hwp", "hwpx"] as const) {
         const saved = session.exportWithReport(format);
         expect(saved.report.outputFormat).toBe(format);
-        expect(saved.report.count).toBeGreaterThan(0);
+        expect(saved.report.count).toBeGreaterThanOrEqual(3);
         expect(saved.report.losses).toContainEqual(expect.objectContaining({
           code: "header-footer-field-roundtrip",
           subject: "머리말 쪽 번호",
+          reason: expect.stringContaining("U+0015"),
+          message: expect.stringContaining("1번째 문단"),
+        }));
+        expect(saved.report.losses).toContainEqual(expect.objectContaining({
+          code: "header-footer-field-roundtrip",
+          subject: "머리말 전체 쪽 수",
+        }));
+        expect(saved.report.losses).toContainEqual(expect.objectContaining({
+          code: "header-footer-field-roundtrip",
+          subject: "머리말 파일 이름",
         }));
         const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
         reopened.push(reopenedSession);
         expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).toContain("수정한 홀수 쪽 머리말");
         expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).not.toContain("\u0015");
+        expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).not.toContain("\u0016");
+        expect(reopenedSession.headerFooterInfo(start, "header", "oddPages").text).not.toContain("\u0017");
       }
 
       session.deleteHeaderFooter(start, "header", "oddPages");

@@ -1327,7 +1327,8 @@ class RhwpDocumentSession implements DocumentSession {
   }
 
   private checkHeaderFooterFieldRoundTrip(bytes: Uint8Array, outputFormat: "hwp" | "hwpx") {
-    const fields: Array<{ sectionIndex: number; isHeader: boolean; applyTo: number; marker: string }> = [];
+    const fields: Array<{ sectionIndex: number; isHeader: boolean; applyTo: number; paragraphIndex: number; marker: string }> = [];
+    const inspectionFailures: Array<{ sectionIndex: number; isHeader: boolean; applyTo: number; paragraphIndex?: number }> = [];
     for (let sectionIndex = 0; sectionIndex < this.document.getSectionCount(); sectionIndex += 1) {
       for (const isHeader of [true, false]) {
         for (const applyTo of [0, 1, 2]) {
@@ -1335,56 +1336,75 @@ class RhwpDocumentSession implements DocumentSession {
             this.document.getHeaderFooter(sectionIndex, isHeader, applyTo),
             "머리말·꼬리말 저장 검증",
           );
-          if (!exists.ok || !exists.exists) continue;
+          if (!exists.ok) {
+            inspectionFailures.push({ sectionIndex, isHeader, applyTo });
+            continue;
+          }
+          if (!exists.exists) continue;
           const first = parseJson<{ ok: boolean; paraCount: number; text?: string }>(
             this.document.getHeaderFooterParaInfo(sectionIndex, isHeader, applyTo, 0),
             "머리말·꼬리말 필드 저장 검증",
           );
-          if (!first.ok || !Number.isInteger(first.paraCount)) continue;
+          if (!first.ok || !Number.isInteger(first.paraCount) || first.paraCount < 1) {
+            inspectionFailures.push({ sectionIndex, isHeader, applyTo, paragraphIndex: 0 });
+            continue;
+          }
           for (let paragraphIndex = 0; paragraphIndex < first.paraCount; paragraphIndex += 1) {
             const paragraph = paragraphIndex === 0 ? first : parseJson<{ ok: boolean; text?: string }>(
               this.document.getHeaderFooterParaInfo(sectionIndex, isHeader, applyTo, paragraphIndex),
               "머리말·꼬리말 필드 저장 검증",
             );
-            if (!paragraph.ok) continue;
+            if (!paragraph.ok) {
+              inspectionFailures.push({ sectionIndex, isHeader, applyTo, paragraphIndex });
+              continue;
+            }
             for (const marker of ["\u0015", "\u0016", "\u0017"]) {
-              if ((paragraph.text ?? "").includes(marker)) fields.push({ sectionIndex, isHeader, applyTo, marker });
+              if ((paragraph.text ?? "").includes(marker)) fields.push({ sectionIndex, isHeader, applyTo, paragraphIndex, marker });
             }
           }
         }
       }
     }
-    if (!fields.length) return [];
+    const location = (item: { sectionIndex: number; isHeader: boolean; applyTo: number; paragraphIndex?: number }) =>
+      `${item.sectionIndex + 1}구역 ${item.applyTo === 0 ? "양쪽" : item.applyTo === 1 ? "짝수 쪽" : "홀수 쪽"} ${item.isHeader ? "머리말" : "꼬리말"}`
+      + (item.paragraphIndex === undefined ? "" : ` ${item.paragraphIndex + 1}번째 문단`);
+    const unknownLosses = inspectionFailures.map((item) => ({
+      code: "header-footer-field-unverified",
+      subject: `${item.isHeader ? "머리말" : "꼬리말"} 자동 필드 보존 여부`,
+      reason: `${outputFormat.toUpperCase()} 저장 전에 머리말·꼬리말 구조를 검사하지 못했습니다.`,
+      message: `${location(item)} 내용을 확인하지 못해 자동 필드 보존 여부를 보장할 수 없습니다.`,
+    }));
+    if (!fields.length) return unknownLosses;
 
     let reopened: HwpDocument | undefined;
     try {
       reopened = new HwpDocument(bytes);
-      return fields.flatMap((field) => {
+      return [...unknownLosses, ...fields.flatMap((field) => {
         const headerFooter = parseJson<{ ok: boolean; exists: boolean }>(
           reopened!.getHeaderFooter(field.sectionIndex, field.isHeader, field.applyTo),
           "머리말·꼬리말 재열기 검증",
         );
-        const first = headerFooter.exists ? parseJson<{ ok: boolean; paraCount: number; text?: string }>(
-          reopened!.getHeaderFooterParaInfo(field.sectionIndex, field.isHeader, field.applyTo, 0),
+        const paragraph = headerFooter.ok && headerFooter.exists ? parseJson<{ ok: boolean; text?: string }>(
+          reopened!.getHeaderFooterParaInfo(field.sectionIndex, field.isHeader, field.applyTo, field.paragraphIndex),
           "머리말·꼬리말 재열기 검증",
-        ) : { ok: false, paraCount: 0, text: "" };
-        const preserved = first.ok && (first.text ?? "").includes(field.marker);
+        ) : { ok: false, text: "" };
+        const preserved = paragraph.ok && (paragraph.text ?? "").includes(field.marker);
         if (preserved) return [];
         const markerName = field.marker === "\u0015" ? "쪽 번호" : field.marker === "\u0016" ? "전체 쪽 수" : "파일 이름";
         return [{
           code: "header-footer-field-roundtrip",
           subject: `${field.isHeader ? "머리말" : "꼬리말"} ${markerName}`,
-          reason: `${outputFormat.toUpperCase()} 재열기 후 자동 필드가 같은 필드로 복원되지 않습니다.`,
-          message: `${field.sectionIndex + 1}구역의 ${field.applyTo === 0 ? "양쪽" : field.applyTo === 1 ? "짝수 쪽" : "홀수 쪽"} ${field.isHeader ? "머리말" : "꼬리말"}에 있는 ${markerName} 필드가 저장 후 보존되는지 확인할 수 없습니다.`,
+          reason: `현재 RHWP 직렬화는 머리말·꼬리말의 U+${field.marker.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()} 필드 마커를 같은 필드 레코드로 복원하지 않습니다.`,
+          message: `${location(field)}의 ${markerName} 필드가 ${outputFormat.toUpperCase()} 재열기 후 보존되지 않았습니다. 저장을 계속하면 이 필드 구조가 손실됩니다.`,
         }];
-      });
+      })];
     } catch {
-      return fields.map((field) => ({
+      return [...unknownLosses, ...fields.map((field) => ({
         code: "header-footer-field-roundtrip-unverified",
         subject: `${field.isHeader ? "머리말" : "꼬리말"} 자동 필드`,
         reason: `${outputFormat.toUpperCase()} 재열기 검증을 수행하지 못했습니다.`,
-        message: "자동 필드가 저장 후 보존되는지 확인하지 못했습니다.",
-      }));
+        message: `${location(field)}의 자동 필드가 저장 후 보존되는지 확인하지 못했습니다.`,
+      }))];
     } finally {
       reopened?.free();
     }
