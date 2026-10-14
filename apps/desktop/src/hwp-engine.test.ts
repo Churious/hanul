@@ -101,6 +101,59 @@ describe("RHWP document session", () => {
     }));
   });
 
+  it("records single-character layout cost on a synthetic 100-page document", async () => {
+    const fixture = HwpDocument.createEmpty();
+    let fixtureBytes: Uint8Array<ArrayBufferLike> = new Uint8Array();
+    let fixturePages = 0;
+    try {
+      fixture.createBlankDocument();
+      fixture.insertText(0, 0, 0, ("Hanul 100쪽 편집 지연 계측용 문단입니다. 0123456789 가나다라마바사아자차카타파하\n").repeat(4000));
+      fixturePages = fixture.pageCount();
+      const exportedFixture = fixture.exportHwpWithReport();
+      try {
+        fixtureBytes = exportedFixture.takeBytes();
+      } finally {
+        exportedFixture.free();
+      }
+    } finally {
+      fixture.free();
+    }
+
+    expect(fixturePages).toBeGreaterThanOrEqual(90);
+    expect(fixturePages).toBeLessThanOrEqual(110);
+    const document = new HwpDocument(fixtureBytes);
+    const session = wrapHwpDocument(document);
+    try {
+      const position = session.hitTest(session.pageCount - 1, 113, 132);
+      const startedAt = performance.now();
+      session.insertText(position, "가");
+      const editMs = performance.now() - startedAt;
+      const batchDocument = new HwpDocument(fixtureBytes);
+      const batchSession = wrapHwpDocument(batchDocument);
+      try {
+        const batchPosition = batchSession.hitTest(batchSession.pageCount - 1, 113, 132);
+        batchDocument.beginBatch();
+        const batchEditStartedAt = performance.now();
+        batchSession.insertText(batchPosition, "가");
+        const batchEditMs = performance.now() - batchEditStartedAt;
+        const finalizeStartedAt = performance.now();
+        batchDocument.endBatch();
+        const finalizeMs = performance.now() - finalizeStartedAt;
+        console.info("HANUL_LARGE_DOCUMENT_EDIT_PERF", JSON.stringify({
+          syntheticParagraphs: 4000,
+          pages: fixturePages,
+          normalInsertMs: Number(editMs.toFixed(2)),
+          batchedInsertMs: Number(batchEditMs.toFixed(2)),
+          synchronousBatchFinalizeMs: Number(finalizeMs.toFixed(2)),
+        }));
+      } finally {
+        batchSession.dispose();
+      }
+    } finally {
+      session.dispose();
+    }
+  }, 60_000);
+
   it("keeps only the twelve most recently used rendered pages", () => {
     const document = HwpDocument.createEmpty();
     document.createBlankDocument();

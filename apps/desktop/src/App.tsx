@@ -7,6 +7,7 @@ import {
   useState,
   type CSSProperties,
   type ChangeEvent,
+  type MutableRefObject,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent,
   type ReactNode,
@@ -18,6 +19,8 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ImeInputGate } from "./ime-input";
+import { previewObjectDrag } from "./object-drag";
+import { LatestFrame } from "./pointer-frame";
 import { rhwpDocumentEngine } from "./hwp-engine";
 import type {
   DocumentSession,
@@ -33,6 +36,7 @@ import type {
   ParagraphFormat,
   SearchMatch,
   SearchOptions,
+  SelectionRectangle,
   TableCommand,
   TextPosition,
 } from "./document-engine";
@@ -193,19 +197,6 @@ function shouldMeasureInitialPage(session: DocumentSession, pageIndex: number) {
   return true;
 }
 
-function addCaret(svg: string, caret: TextPosition | null, pageIndex: number, enabled: boolean) {
-  if (!enabled || !caret || caret.cursorRect.pageIndex !== pageIndex) return svg;
-  const viewBoxMatch = svg.match(/\bviewBox=["']([^"']+)["']/i);
-  if (!viewBoxMatch) return svg;
-  const viewBox = viewBoxMatch[1].trim().split(/[\s,]+/).map(Number);
-  if (viewBox.length !== 4 || viewBox.some((value) => !Number.isFinite(value))) return svg;
-  const width = Math.max(1, viewBox[2] / 794);
-  const { x, y, height } = caret.cursorRect;
-  if (![x, y, height].every(Number.isFinite)) return svg;
-  const line = `<line class="hanul-caret" x1="${x}" y1="${y}" x2="${x}" y2="${y + Math.max(height, 16)}" stroke="#315f86" stroke-width="${width}" />`;
-  return svg.replace(/<\/svg>\s*$/i, `${line}</svg>`);
-}
-
 type EditorSelection = { anchor: TextPosition; focus: TextPosition };
 
 function sameEditorScope(left: TextPosition, right: TextPosition) {
@@ -228,32 +219,6 @@ function isRangeSelection(selection: EditorSelection | null) {
       && sameEditorScope(selection.anchor, selection.focus)
       && compareEditorPositions(selection.anchor, selection.focus) !== 0,
   );
-}
-
-function addSelection(
-  svg: string,
-  session: DocumentSession,
-  selection: EditorSelection | null,
-  pageIndex: number,
-) {
-  if (!selection || compareEditorPositions(selection.anchor, selection.focus) === 0) return svg;
-  try {
-    const rectangles = session.selectionRectangles(selection.anchor, selection.focus)
-      .filter((rect) => rect.pageIndex === pageIndex && rect.width > 0 && rect.height > 0)
-      .map((rect) => `<rect x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" fill="#7bb8ff" fill-opacity="0.42" pointer-events="none" />`)
-      .join("");
-    return rectangles ? svg.replace(/<\/svg>\s*$/i, `${rectangles}</svg>`) : svg;
-  } catch {
-    return svg;
-  }
-}
-
-function addObjectSelection(svg: string, object: DocumentObject | null, pageIndex: number) {
-  if (!object || object.pageIndex !== pageIndex) return svg;
-  const { x, y, width, height } = object.bounds;
-  const handleSize = 10;
-  const overlay = `<rect x="${x}" y="${y}" width="${width}" height="${height}" fill="none" stroke="#2468a2" stroke-width="1.5" stroke-dasharray="4 2" pointer-events="none"/><rect x="${x + width - handleSize / 2}" y="${y + height - handleSize / 2}" width="${handleSize}" height="${handleSize}" fill="#ffffff" stroke="#2468a2" stroke-width="1.5" pointer-events="none"/>`;
-  return svg.replace(/<\/svg>\s*$/i, `${overlay}</svg>`);
 }
 
 function placeImeInput(input: HTMLTextAreaElement, svg: SVGSVGElement, position: TextPosition) {
@@ -324,9 +289,25 @@ type ObjectEditDraft = {
 
 type ObjectPointerDrag = {
   object: DocumentObject;
+  pageIndex: number;
   startX: number;
   startY: number;
   resize: boolean;
+};
+
+type PointerGestureMetrics = {
+  kind: "object-drag" | "table-selection" | "text-selection";
+  startedAt: number;
+  rawMoves: number;
+  frames: number;
+  lastFrameAt: number | null;
+  maxFrameGapMs: number;
+};
+
+type PendingPointerSample = {
+  pageIndex: number;
+  x: number;
+  y: number;
 };
 
 type TableContextMenuPosition = { left: number; top: number };
@@ -378,12 +359,14 @@ function DocumentPage({
   renderVersion,
   editMode,
   caret,
-  selection,
+  selectionRectsByPage,
   selectedObject,
+  objectPreviewElementRef,
   showRulers,
   onPagePointerDown,
   onPagePointerMove,
   onPagePointerUp,
+  onPagePointerCancel,
   onPageContextMenu,
 }: {
   session: DocumentSession;
@@ -392,18 +375,21 @@ function DocumentPage({
   renderVersion: number;
   editMode: boolean;
   caret: TextPosition | null;
-  selection: EditorSelection | null;
+  selectionRectsByPage: ReadonlyMap<number, SelectionRectangle[]>;
   selectedObject: DocumentObject | null;
+  objectPreviewElementRef: MutableRefObject<SVGRectElement | null>;
   showRulers: boolean;
   onPagePointerDown: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
   onPagePointerMove: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
   onPagePointerUp: (pageIndex: number, event: PointerEvent<HTMLDivElement>) => void;
+  onPagePointerCancel: (event: PointerEvent<HTMLDivElement>) => void;
   onPageContextMenu: (pageIndex: number, event: ReactMouseEvent<HTMLDivElement>) => void;
 }) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
   const pendingSvgCommitStartedAt = useRef<number | null>(null);
   const pageInfo = useMemo(() => session.pageInfo(pageIndex), [session, pageIndex, renderVersion]);
+  const selectionRects = selectionRectsByPage.get(pageIndex) ?? [];
 
   useEffect(() => {
     let active = true;
@@ -452,10 +438,16 @@ function DocumentPage({
     }
   }, [pageIndex, svg]);
 
-  const pageSvg = useMemo(
-    () => addObjectSelection(addCaret(addSelection(svg, session, selection, pageIndex), caret, pageIndex, editMode), selectedObject, pageIndex),
-    [svg, session, selection, caret, selectedObject, pageIndex, editMode],
-  );
+  const pageSvgViewBox = useMemo(() => {
+    const match = svg.match(/\bviewBox=["']([^"']+)["']/i);
+    const values = match?.[1].trim().split(/[\s,]+/).map(Number);
+    return values?.length === 4 && values.every(Number.isFinite)
+      ? values.join(" ")
+      : `0 0 ${pageInfo.width} ${pageInfo.height}`;
+  }, [svg, pageInfo.width, pageInfo.height]);
+  const cursorOnPage = editMode && caret?.cursorRect.pageIndex === pageIndex ? caret.cursorRect : null;
+  const selectedObjectOnPage = selectedObject?.pageIndex === pageIndex ? selectedObject : null;
+  const hasOverlay = selectionRects.length > 0 || cursorOnPage !== null || selectedObjectOnPage !== null;
 
   return (
     <div className="page-slot" style={{ "--zoom": String(zoom), "--page-width": `${pageInfo.width}px`, "--page-height": `${pageInfo.height}px` } as CSSProperties}>
@@ -485,9 +477,58 @@ function DocumentPage({
             onPointerDown={(event) => onPagePointerDown(pageIndex, event)}
             onPointerMove={(event) => onPagePointerMove(pageIndex, event)}
             onPointerUp={(event) => onPagePointerUp(pageIndex, event)}
+            onPointerCancel={onPagePointerCancel}
             onContextMenu={(event) => onPageContextMenu(pageIndex, event)}
-            dangerouslySetInnerHTML={{ __html: pageSvg }}
-          />
+          >
+            <div className="page-render-layer" dangerouslySetInnerHTML={{ __html: svg }} />
+            {hasOverlay && <svg className="page-overlays" aria-hidden="true" viewBox={pageSvgViewBox}>
+              {selectionRects.map((rect, index) => <rect
+                key={`selection-${index}`}
+                x={rect.x}
+                y={rect.y}
+                width={rect.width}
+                height={rect.height}
+                fill="#7bb8ff"
+                fillOpacity="0.42"
+              />)}
+              {cursorOnPage && [cursorOnPage.x, cursorOnPage.y, cursorOnPage.height].every(Number.isFinite) && <line
+                className="hanul-caret"
+                x1={cursorOnPage.x}
+                y1={cursorOnPage.y}
+                x2={cursorOnPage.x}
+                y2={cursorOnPage.y + Math.max(cursorOnPage.height, 16)}
+                stroke="#315f86"
+                strokeWidth={Math.max(1, pageInfo.width / 794)}
+              />}
+              {selectedObjectOnPage && (() => {
+                const bounds = selectedObjectOnPage.bounds;
+                const handleSize = 10;
+                return <>
+                  <rect
+                    ref={objectPreviewElementRef}
+                    x={bounds.x}
+                    y={bounds.y}
+                    width={bounds.width}
+                    height={bounds.height}
+                    fill="none"
+                    fillOpacity="0"
+                    stroke="#2468a2"
+                    strokeWidth="1.5"
+                    strokeDasharray="4 2"
+                  />
+                  <rect
+                    x={bounds.x + bounds.width - handleSize / 2}
+                    y={bounds.y + bounds.height - handleSize / 2}
+                    width={handleSize}
+                    height={handleSize}
+                    fill="#ffffff"
+                    stroke="#2468a2"
+                    strokeWidth="1.5"
+                  />
+                </>;
+              })()}
+            </svg>}
+          </div>
         ) : (
           <div className="page-loading" aria-label="페이지 렌더링 중" />
         )}
@@ -530,6 +571,22 @@ function App() {
   const imeInputGate = useRef(new ImeInputGate());
   const pointerSelection = useRef<EditorSelection | null>(null);
   const objectPointerDrag = useRef<ObjectPointerDrag | null>(null);
+  const objectPreviewElement = useRef<SVGRectElement | null>(null);
+  const pointerGestureMetrics = useRef<PointerGestureMetrics | null>(null);
+  const pointerMoveFrames = useRef<LatestFrame<PendingPointerSample> | null>(null);
+  if (!pointerMoveFrames.current) pointerMoveFrames.current = new LatestFrame();
+  const clearObjectDragPreview = () => {
+    const element = objectPreviewElement.current;
+    if (!element) return;
+    if (selectedObject) {
+      element.setAttribute("x", String(selectedObject.bounds.x));
+      element.setAttribute("y", String(selectedObject.bounds.y));
+      element.setAttribute("width", String(selectedObject.bounds.width));
+      element.setAttribute("height", String(selectedObject.bounds.height));
+    }
+    element.setAttribute("fill", "none");
+    element.setAttribute("fill-opacity", "0");
+  };
   const [session, setSession] = useState<DocumentSession | null>(null);
   const [fileName, setFileName] = useState("");
   const [filePath, setFilePath] = useState("");
@@ -601,6 +658,21 @@ function App() {
     }
   }, [session, currentPage, renderVersion]);
   const selectedObject = documentObjects.find((object) => object.id === selectedObjectId) ?? null;
+  const selectionRectsByPage = useMemo(() => {
+    const byPage = new Map<number, SelectionRectangle[]>();
+    if (!session || !selection || compareEditorPositions(selection.anchor, selection.focus) === 0) return byPage;
+    try {
+      for (const rect of session.selectionRectangles(selection.anchor, selection.focus)) {
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const pageRects = byPage.get(rect.pageIndex) ?? [];
+        pageRects.push(rect);
+        byPage.set(rect.pageIndex, pageRects);
+      }
+    } catch {
+      // Keep a valid caret if the current range includes an unsupported control.
+    }
+    return byPage;
+  }, [session, selection]);
 
   useEffect(() => {
     if (!selectedObject) {
@@ -1121,6 +1193,13 @@ function App() {
     setPageInput(String(position.cursorRect.pageIndex + 1));
   };
 
+  useEffect(() => () => {
+    pointerMoveFrames.current?.cancelPending();
+    objectPointerDrag.current = null;
+    pointerSelection.current = null;
+    clearObjectDragPreview();
+  }, []);
+
   const documentPointFromPointer = (
     pageIndex: number,
     event: Pick<PointerEvent<HTMLDivElement>, "clientX" | "clientY" | "currentTarget">,
@@ -1183,9 +1262,71 @@ function App() {
     }
   };
 
+  const processPointerSample = (sample: PendingPointerSample, isAnimationFrame = true) => {
+    const metrics = pointerGestureMetrics.current;
+    if (isAnimationFrame && metrics) {
+      const now = performance.now();
+      metrics.frames += 1;
+      if (metrics.lastFrameAt !== null) metrics.maxFrameGapMs = Math.max(metrics.maxFrameGapMs, now - metrics.lastFrameAt);
+      metrics.lastFrameAt = now;
+    }
+
+    const drag = objectPointerDrag.current;
+    if (drag) {
+      const bounds = previewObjectDrag(
+        drag.object,
+        { x: drag.startX, y: drag.startY },
+        { x: sample.x, y: sample.y },
+        drag.resize,
+      );
+      const element = objectPreviewElement.current;
+      if (element) {
+        element.setAttribute("x", String(bounds.x));
+        element.setAttribute("y", String(bounds.y));
+        element.setAttribute("width", String(bounds.width));
+        element.setAttribute("height", String(bounds.height));
+        element.setAttribute("fill", "#dce8f3");
+        element.setAttribute("fill-opacity", "0.24");
+      }
+      return;
+    }
+
+    const active = pointerSelection.current;
+    const currentSession = activeSession.current;
+    if (!currentSession || !active) return;
+    try {
+      const focus = currentSession.hitTest(sample.pageIndex, sample.x, sample.y);
+      const next = { anchor: active.anchor, focus };
+      if (!sameEditorScope(next.anchor, next.focus)) return;
+      pointerSelection.current = next;
+      setSelection(next);
+      setCaretPosition(focus);
+    } catch {
+      // 드래그가 본문 바깥을 지나가면 마지막 유효 위치를 유지한다.
+    }
+  };
+
+  const reportPointerGesture = (modelCommitMs = 0) => {
+    const metrics = pointerGestureMetrics.current;
+    if (metrics?.rawMoves) {
+      reportAppPerformance("pointer-gesture", {
+        kind: metrics.kind,
+        rawMoves: metrics.rawMoves,
+        processedFrames: metrics.frames,
+        durationMs: Number((performance.now() - metrics.startedAt).toFixed(1)),
+        maxFrameGapMs: Number(metrics.maxFrameGapMs.toFixed(1)),
+        modelCommitMs: Number(modelCommitMs.toFixed(1)),
+      });
+    }
+    pointerGestureMetrics.current = null;
+  };
+
   const handlePagePointerDown = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
     if (!session) return;
     event.preventDefault();
+    pointerMoveFrames.current?.cancelPending();
+    pointerGestureMetrics.current = null;
+    clearObjectDragPreview();
     setObjectContextMenu(null);
     try {
       const point = documentPointFromPointer(pageIndex, event);
@@ -1216,9 +1357,18 @@ function App() {
         pointerSelection.current = null;
         objectPointerDrag.current = {
           object,
+          pageIndex,
           startX: point.x,
           startY: point.y,
           resize: resizeTarget?.id === object.id,
+        };
+        pointerGestureMetrics.current = {
+          kind: "object-drag",
+          startedAt: performance.now(),
+          rawMoves: 0,
+          frames: 0,
+          lastFrameAt: null,
+          maxFrameGapMs: 0,
         };
         event.currentTarget.setPointerCapture(event.pointerId);
         editInput.current?.focus();
@@ -1229,6 +1379,14 @@ function App() {
       if (!position) return;
       const next = { anchor: position, focus: position };
       pointerSelection.current = next;
+      pointerGestureMetrics.current = {
+        kind: position.cellPath?.length ? "table-selection" : "text-selection",
+        startedAt: performance.now(),
+        rawMoves: 0,
+        frames: 0,
+        lastFrameAt: null,
+        maxFrameGapMs: 0,
+      };
       setSelection(next);
       setPendingCharacterFormat({});
       session.clearTypingFormat();
@@ -1241,26 +1399,21 @@ function App() {
   };
 
   const handlePagePointerMove = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
-    if (objectPointerDrag.current) return;
-    const active = pointerSelection.current;
-    if (!session || !active) return;
-    try {
-      const focus = hitPositionFromPointer(pageIndex, event);
-      if (!focus) return;
-      const next = { anchor: active.anchor, focus };
-      if (!sameEditorScope(next.anchor, next.focus)) return;
-      pointerSelection.current = next;
-      setSelection(next);
-      setCaretPosition(focus);
-    } catch {
-      // 드래그가 본문 바깥을 지나가면 마지막 유효 위치를 유지한다.
-    }
+    const drag = objectPointerDrag.current;
+    if (!drag && !pointerSelection.current) return;
+    const point = documentPointFromPointer(pageIndex, event);
+    if (!point) return;
+    if (pointerGestureMetrics.current) pointerGestureMetrics.current.rawMoves += 1;
+    pointerMoveFrames.current?.enqueue(point, processPointerSample);
   };
 
   const handlePagePointerUp = (pageIndex: number, event: PointerEvent<HTMLDivElement>) => {
+    pointerMoveFrames.current?.cancelPending();
     const drag = objectPointerDrag.current;
+    let modelCommitMs = 0;
     if (drag && session) {
       objectPointerDrag.current = null;
+      clearObjectDragPreview();
       try {
         const point = documentPointFromPointer(pageIndex, event);
         if (point) {
@@ -1269,13 +1422,33 @@ function App() {
           const updates = drag.resize
             ? { widthMm: Math.max(1, drag.object.widthMm + dxMm), heightMm: Math.max(1, drag.object.heightMm + dyMm) }
             : { offsetXmm: drag.object.offsetXmm + dxMm, offsetYmm: drag.object.offsetYmm + dyMm };
-          if (dxMm || dyMm) updateAfterEdit(session.updateObject(drag.object, updates));
+          if (dxMm || dyMm) {
+            const commitStartedAt = performance.now();
+            const position = session.updateObject(drag.object, updates);
+            modelCommitMs = performance.now() - commitStartedAt;
+            updateAfterEdit(position);
+          }
         }
       } catch (cause) {
         setMessage(cause instanceof Error ? cause.message : "문서 개체를 이동하거나 크기를 바꾸지 못했습니다.");
       }
+    } else if (pointerSelection.current) {
+      const point = documentPointFromPointer(pageIndex, event);
+      if (point) processPointerSample(point, false);
     }
     pointerSelection.current = null;
+    reportPointerGesture(modelCommitMs);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const handlePagePointerCancel = (event: PointerEvent<HTMLDivElement>) => {
+    pointerMoveFrames.current?.cancelPending();
+    pointerSelection.current = null;
+    objectPointerDrag.current = null;
+    pointerGestureMetrics.current = null;
+    clearObjectDragPreview();
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -2573,12 +2746,14 @@ function App() {
               renderVersion={renderVersion}
               editMode={editMode}
               caret={caret}
-              selection={selection}
+              selectionRectsByPage={selectionRectsByPage}
               selectedObject={selectedObject}
+              objectPreviewElementRef={objectPreviewElement}
               showRulers={showRulers}
               onPagePointerDown={handlePagePointerDown}
               onPagePointerMove={handlePagePointerMove}
               onPagePointerUp={handlePagePointerUp}
+              onPagePointerCancel={handlePagePointerCancel}
               onPageContextMenu={handlePageContextMenu}
             />
           </div>
@@ -2602,12 +2777,14 @@ function App() {
                 renderVersion={renderVersion}
                 editMode={editMode}
                 caret={caret}
-                selection={selection}
+                selectionRectsByPage={selectionRectsByPage}
                 selectedObject={selectedObject}
+                objectPreviewElementRef={objectPreviewElement}
                 showRulers={showRulers}
                 onPagePointerDown={handlePagePointerDown}
                 onPagePointerMove={handlePagePointerMove}
                 onPagePointerUp={handlePagePointerUp}
+                onPagePointerCancel={handlePagePointerCancel}
                 onPageContextMenu={handlePageContextMenu}
               />
             )}

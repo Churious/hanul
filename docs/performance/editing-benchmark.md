@@ -26,6 +26,30 @@ The previous benchmark run recorded 1,143.53 ms / 1,210.61 ms for late-page inse
 
 No Worker or full engine rewrite was introduced: neither is supported by the current measurement as a way to reduce total edit computation. These timings measure RHWP model commands, not physical key-to-paint latency. A real speedup requires paragraph/page-level incremental page composition in RHWP or a separately validated Hanul layout path. That larger change needs page-boundary convergence tests for wrapping, tables, floats, headers/footers, sections, and cross-page objects before it can replace the current paginator.
 
+### 2026-10-15 interaction and 100-page follow-up
+
+The follow-up adds a UI-only drag preview for selected objects. Pointer Events are coalesced through `requestAnimationFrame`; intermediate move/resize samples update the existing selection outline, and pointer-up commits one `updateObject` call. Pointer cancellation clears the preview without changing the document. Text selection hit-testing is likewise capped at one sample per animation frame. The generated document SVG is now a stable sibling layer: caret, selection, and object-selection overlays no longer concatenate into and reparse the entire SVG string on each React update. Unit tests verify latest-sample coalescing, cancellation, move/resize bounds, and minimum object size.
+
+The current synthetic model-command measurements remain slow:
+
+| Probe | Windows 11 x64 / Node 24 | Ubuntu 26.04 WSL2 / Node 22 |
+| --- | ---: | ---: |
+| 35-page character insert | 1,113.39 ms | 1,223.59 ms |
+| 35-page paragraph alignment | 1,076.12 ms | 1,118.35 ms |
+| 35-page table-row insertion | 170.00 ms | 150.10 ms |
+| 35-page object move model update | 93.22 ms | 82.71 ms |
+| 98-page character insert | 9,475.39 ms | 9,628.87 ms |
+| 98-page character insert in batch mode | 9,159.63 ms | 9,941.25 ms |
+| 98-page synchronous batch finalization | 174.58 ms | 176.73 ms |
+
+The 35-page timings are a synthetic RHWP/WASM fixture, not actual physical key-to-paint input. The 98-page case is also synthetic (4,000 repeated lines; generated page count was 98), not a real customer file. They show that pagination alone is not the dominant 98-page cost: skipping pagination during the edit still leaves 9.2–10.0 seconds of synchronous work, while the final batch pagination takes under 0.21 seconds. Exact subphase timing inside RHWP is not exposed by the WASM API, so this does not identify which of text insertion, paragraph reflow, vertical-position recalculation, or recomposition dominates.
+
+Upstream RHWP source at commit [`1a76570e`](https://github.com/edwardkim/rhwp/tree/1a76570e833917d15817415a53c09ad61ab3203f) confirms the path: `insert_text_native` reflows the edited paragraph, recalculates section vertical positions, recomposes that paragraph, and invokes pagination; it may repeat the sequence up to twice if the paragraph changes columns. `recompose_paragraph` composes one paragraph and marks paragraph/section dirty, while `paginate_if_needed` skips the page pass in batch mode. `recalculate_section_vpos` walks from the changed paragraph through the remaining paragraphs. The source has paragraph-level reuse, but no evidence that page composition is bounded to only the changed page. The measured batch experiment is consistent with significant work before the final page pass. Source references: [`insert_text_native`](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/document_core/commands/text_editing.rs#L1422), [`recompose_paragraph` and pagination](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/document_core/queries/rendering.rs#L4279), and [`recalculate_section_vpos`](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/renderer/composer/line_breaking.rs#L4833).
+
+The page SVG cache remained cheap in the changed-page probe: Windows late-page model edit 1,258.16 ms, unchanged page lookup 0.21 ms, changed-page SVG render 3.16 ms; WSL2 edit/reflow 1,208.98 ms, unchanged lookup 0.45 ms, changed SVG 1.59 ms. SVG generation and React SVG replacement were not the one-second model-command bottleneck. Windows GUI smoke testing on a disposable document verified table row add/Undo/Redo, shape move/resize, drag Undo/Redo, and HWP save/reopen with object coordinates retained. Final WSLg release testing verified table row insertion, shape drag, Undo/Redo, GTK save to `/tmp/hanul-linux-perf-final-20261015.hwp`, and reopen with the three-row table and X/Y coordinates retained. These GUI checks are functional smoke tests, not frame-time measurements; standalone X11/Wayland were not verified. Development builds emit per-gesture raw move count, processed frame count, maximum frame gap, duration, and final model-commit time; no 60 FPS result is claimed until those traces are collected on representative hardware.
+
+**Outcome:** the interaction path now avoids applying a full document edit and rebuilding the page SVG for every drag event, but the 35-page text insertion target is not met and the model-command measurements did not improve. A Worker could keep this synchronous computation from blocking paint, but would not reduce its 9–12 second cost. The next performance step must instrument RHWP's inner stages or implement a validated page/paragraph incremental layout slice; a Worker alone is not a compute optimization.
+
 ## Header/footer field preservation
 
 Hanul currently inserts page number, total-page, and file-name markers into the RHWP header/footer model as U+0015, U+0016, and U+0017 control characters. These markers are not complete field records with their original field command/reference metadata. RHWP's HWPX text writer filters other control characters below U+0020 from `<hp:t>`; the HWP and HWPX round-trip tests also show that the marker does not return as the same field after export/reopen.
