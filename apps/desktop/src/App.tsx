@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import DOMPurify from "dompurify";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
@@ -21,6 +21,7 @@ import {
   createNewHwpDocumentSession,
   loadHwpDocument,
   type DocumentSession,
+  type DocumentInfo,
   type CharacterFormat,
   type DocumentStyle,
   type ExportResult,
@@ -45,14 +46,13 @@ function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
       <svg viewBox="0 0 32 32" fill="none">
-        <rect x="1" y="1" width="30" height="30" rx="9" fill="currentColor" />
+        <rect x="1" y="1" width="30" height="30" rx="3" fill="currentColor" />
         <path
           d="M9 10h14M9 16h14M9 22h8"
           stroke="white"
-          strokeLinecap="round"
-          strokeWidth="2.2"
+          strokeLinecap="square"
+          strokeWidth="2"
         />
-        <circle cx="23" cy="22" r="2" fill="#B7F1D3" />
       </svg>
     </span>
   );
@@ -138,16 +138,54 @@ interface PendingDocument {
   createNew?: true;
 }
 
-type DialogState = "unsaved" | "loss" | null;
+type DialogState = "unsaved" | "loss" | "pdf-loss" | null;
 
 type PendingFileAction =
   | { kind: "open"; pending: PendingDocument }
   | { kind: "close" }
   | { kind: "exit" };
 
+type DocumentInfoDialogState = {
+  fileName: string;
+  filePath: string;
+  fileFormat: string;
+  fileSize: number;
+  info: DocumentInfo;
+};
+
+type PrintRequest = "print";
+
+interface PdfExportCandidate {
+  result: ExportResult;
+  outputPath: string;
+}
+
 function getBaseName(path: string) {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
+}
+
+function errorDetail(cause: unknown, fallback: string) {
+  if (cause instanceof Error) return cause.message;
+  return typeof cause === "string" && cause ? cause : fallback;
+}
+
+function reportAppPerformance(phase: string, details: Record<string, number | string>) {
+  if (import.meta.env.DEV) console.info(`[Hanul performance] ${phase}`, details);
+}
+
+const measuredInitialPages = new WeakMap<DocumentSession, Set<number>>();
+
+function shouldMeasureInitialPage(session: DocumentSession, pageIndex: number) {
+  if (!import.meta.env.DEV || pageIndex > 2) return false;
+  let measuredPages = measuredInitialPages.get(session);
+  if (!measuredPages) {
+    measuredPages = new Set<number>();
+    measuredInitialPages.set(session, measuredPages);
+  }
+  if (measuredPages.has(pageIndex)) return false;
+  measuredPages.add(pageIndex);
+  return true;
 }
 
 function addCaret(svg: string, caret: TextPosition | null, pageIndex: number, enabled: boolean) {
@@ -159,7 +197,7 @@ function addCaret(svg: string, caret: TextPosition | null, pageIndex: number, en
   const width = Math.max(1, viewBox[2] / 794);
   const { x, y, height } = caret.cursorRect;
   if (![x, y, height].every(Number.isFinite)) return svg;
-  const line = `<line class="hanul-caret" x1="${x}" y1="${y}" x2="${x}" y2="${y + Math.max(height, 16)}" stroke="#167a52" stroke-width="${width}" />`;
+  const line = `<line class="hanul-caret" x1="${x}" y1="${y}" x2="${x}" y2="${y + Math.max(height, 16)}" stroke="#315f86" stroke-width="${width}" />`;
   return svg.replace(/<\/svg>\s*$/i, `${line}</svg>`);
 }
 
@@ -290,6 +328,8 @@ function DocumentPage({
 }) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
+  const pendingSvgCommitStartedAt = useRef<number | null>(null);
+  const pageInfo = useMemo(() => session.pageInfo(pageIndex), [session, pageIndex, renderVersion]);
 
   useEffect(() => {
     let active = true;
@@ -297,9 +337,25 @@ function DocumentPage({
     setError("");
 
     try {
+      const measure = shouldMeasureInitialPage(session, pageIndex);
+      const renderStartedAt = performance.now();
       const rendered = session.renderPage(pageIndex);
+      const renderMs = performance.now() - renderStartedAt;
+      const sanitizeStartedAt = performance.now();
       const safeSvg = sanitizeRenderedSvg(DOMPurify, rendered);
-      if (active) setSvg(safeSvg);
+      const sanitizeMs = performance.now() - sanitizeStartedAt;
+      if (active) {
+        if (measure) {
+          reportAppPerformance("first-page-svg", {
+            page: pageIndex + 1,
+            sourceSvgCharacters: rendered.length,
+            renderMs: Number(renderMs.toFixed(1)),
+            sanitizeMs: Number(sanitizeMs.toFixed(1)),
+          });
+          pendingSvgCommitStartedAt.current = performance.now();
+        }
+        setSvg(safeSvg);
+      }
     } catch (cause) {
       if (active) {
         setError(cause instanceof Error ? cause.message : "페이지를 그리지 못했습니다.");
@@ -311,18 +367,29 @@ function DocumentPage({
     };
   }, [session, pageIndex, renderVersion]);
 
+  useLayoutEffect(() => {
+    const startedAt = pendingSvgCommitStartedAt.current;
+    if (svg && startedAt !== null) {
+      reportAppPerformance("first-page-react-commit", {
+        page: pageIndex + 1,
+        durationMs: Number((performance.now() - startedAt).toFixed(1)),
+      });
+      pendingSvgCommitStartedAt.current = null;
+    }
+  }, [pageIndex, svg]);
+
   const pageSvg = useMemo(
     () => addCaret(addSelection(svg, session, selection, pageIndex), caret, pageIndex, editMode),
     [svg, session, selection, caret, pageIndex, editMode],
   );
 
   return (
-    <div className="page-slot">
+    <div className="page-slot" style={{ "--zoom": String(zoom), "--page-width": `${pageInfo.width}px`, "--page-height": `${pageInfo.height}px` } as CSSProperties}>
       {showRulers && <>
-        <div className="horizontal-ruler" aria-hidden="true" style={{ "--zoom": String(zoom) } as CSSProperties}>
+        <div className="horizontal-ruler" aria-hidden="true">
           {Array.from({ length: 20 }, (_, index) => <span key={index}>{index}</span>)}
         </div>
-        <div className="vertical-ruler" aria-hidden="true" style={{ "--zoom": String(zoom) } as CSSProperties}>
+        <div className="vertical-ruler" aria-hidden="true">
           {Array.from({ length: 29 }, (_, index) => <span key={index}>{index}</span>)}
         </div>
       </>}
@@ -330,7 +397,7 @@ function DocumentPage({
         className={`document-page${editMode ? " is-editing" : ""}`}
         aria-label={`${pageIndex + 1}쪽`}
         data-page-index={pageIndex}
-        style={{ "--zoom": String(zoom) } as CSSProperties}
+        style={{ "--zoom": String(zoom), "--page-width": `${pageInfo.width}px`, "--page-height": `${pageInfo.height}px` } as CSSProperties}
       >
         {error ? (
           <div className="page-error">
@@ -355,6 +422,27 @@ function DocumentPage({
   );
 }
 
+function PrintPreviewPage({ session, pageIndex }: { session: DocumentSession; pageIndex: number }) {
+  try {
+    const info = session.pageInfo(pageIndex);
+    const widthMm = Math.max(1, info.width * 25.4 / 96);
+    const heightMm = Math.max(1, info.height * 25.4 / 96);
+    const svg = sanitizeRenderedSvg(DOMPurify, session.renderPage(pageIndex));
+    return (
+      <article
+        className="print-preview-page"
+        aria-label={`${info.pageNumber}쪽`}
+        data-page-index={pageIndex}
+        style={{ "--print-page-width": `${widthMm}mm`, "--print-page-height": `${heightMm}mm` } as CSSProperties}
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+    );
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : "페이지를 미리 볼 수 없습니다.";
+    return <article className="print-preview-page print-preview-error" aria-label={`${pageIndex + 1}쪽 오류`}>{message}</article>;
+  }
+}
+
 function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const imageInput = useRef<HTMLInputElement>(null);
@@ -363,6 +451,7 @@ function App() {
   const reader = useRef<VirtuosoHandle>(null);
   const activeSession = useRef<DocumentSession | null>(null);
   const allowWindowClose = useRef(false);
+  const originalPrintTitle = useRef<string | null>(null);
   const imeInputGate = useRef(new ImeInputGate());
   const pointerSelection = useRef<EditorSelection | null>(null);
   const [session, setSession] = useState<DocumentSession | null>(null);
@@ -376,6 +465,7 @@ function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState("");
   const [message, setMessage] = useState("");
   const editMode = Boolean(session);
   const [dirty, setDirty] = useState(false);
@@ -386,6 +476,10 @@ function App() {
   const [tableColumns, setTableColumns] = useState(2);
   const [ribbonTab, setRibbonTab] = useState<RibbonTab>("편집");
   const [pageSetupDialog, setPageSetupDialog] = useState<PageSetupDialogState | null>(null);
+  const [documentInfoDialog, setDocumentInfoDialog] = useState<DocumentInfoDialogState | null>(null);
+  const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
+  const [printRequest, setPrintRequest] = useState<PrintRequest | null>(null);
+  const [printIssue, setPrintIssue] = useState("");
   const [hyperlinkRange, setHyperlinkRange] = useState<EditorSelection | null>(null);
   const [hyperlinkUri, setHyperlinkUri] = useState("");
   const [hyperlinkLabel, setHyperlinkLabel] = useState("");
@@ -403,6 +497,7 @@ function App() {
   const [dialogState, setDialogState] = useState<DialogState>(null);
   const [saveCandidate, setSaveCandidate] = useState<ExportResult | null>(null);
   const [saveDestination, setSaveDestination] = useState<string | null>(null);
+  const [pdfCandidate, setPdfCandidate] = useState<PdfExportCandidate | null>(null);
   const [recentDocuments, setRecentDocuments] = useState(() => {
     try {
       return readRecentDocuments(window.localStorage);
@@ -434,6 +529,57 @@ function App() {
     },
     [],
   );
+
+  useEffect(() => {
+    const restorePrintTitle = () => {
+      if (originalPrintTitle.current !== null) {
+        document.title = originalPrintTitle.current;
+        originalPrintTitle.current = null;
+      }
+      setPrintRequest(null);
+    };
+    window.addEventListener("afterprint", restorePrintTitle);
+    return () => window.removeEventListener("afterprint", restorePrintTitle);
+  }, []);
+
+  useEffect(() => {
+    if (!printPreviewOpen || !printRequest || !session) return;
+    let secondFrame = 0;
+    const restorePrintTitle = () => {
+      if (originalPrintTitle.current !== null) {
+        document.title = originalPrintTitle.current;
+        originalPrintTitle.current = null;
+      }
+      setPrintRequest(null);
+    };
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        if (typeof window.print !== "function") {
+          const issue = "이 환경에서는 시스템 인쇄 대화상자를 사용할 수 없습니다.";
+          setPrintIssue(issue);
+          setMessage(issue);
+          setPrintRequest(null);
+          return;
+        }
+        originalPrintTitle.current = document.title;
+        document.title = fileName.replace(/\.(hwp|hwpx)$/i, "") || "한울 문서";
+        try {
+          window.print();
+        } catch (cause) {
+          restorePrintTitle();
+          const issue = cause instanceof Error
+            ? `시스템 인쇄를 시작하지 못했습니다. (${cause.message})`
+            : "시스템 인쇄를 시작하지 못했습니다.";
+          setPrintIssue(issue);
+          setMessage(issue);
+        }
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [fileName, printPreviewOpen, printRequest, session]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -488,35 +634,55 @@ function App() {
       }
     }
 
+    const openStartedAt = performance.now();
     setIsLoading(true);
+    setLoadingStatus(pending.createNew ? "새 문서를 구성하는 중…" : "파일을 읽는 중…");
     setMessage("");
     try {
       let bytes = new Uint8Array();
       let nextSession: DocumentSession;
       if (pending.createNew) {
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
+        setLoadingStatus("새 문서의 쪽을 구성하는 중…");
         nextSession = await createNewHwpDocumentSession();
       } else {
+        const readStartedAt = performance.now();
         bytes = pending.file
           ? new Uint8Array(await pending.file.arrayBuffer())
           : pending.path
             ? await readFile(pending.path)
             : new Uint8Array();
+        reportAppPerformance("file-read", {
+          bytes: bytes.byteLength,
+          durationMs: Number((performance.now() - readStartedAt).toFixed(1)),
+        });
         const actualValidation = validateDocumentFile(pending.name, bytes.byteLength);
         if (!actualValidation.ok) throw new Error(actualValidation.message);
+        setLoadingStatus("문서 구조와 쪽을 분석하는 중…");
+        // RHWP's public WASM constructor is synchronous; yield a paint first so
+        // this plain status is visible during parsing and initial pagination.
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
         nextSession = await loadHwpDocument(bytes);
       }
       let initialCaret: TextPosition | null = null;
+      const hitTestStartedAt = performance.now();
       try {
         initialCaret = nextSession.hitTest(0, 113, 132);
       } catch {
         // Keep opening readable when the first body position is not editable.
       }
+      reportAppPerformance("initial-hit-test", {
+        durationMs: Number((performance.now() - hitTestStartedAt).toFixed(1)),
+      });
       activeSession.current?.dispose();
       activeSession.current = nextSession;
       setSession(nextSession);
       setFileName(pending.name);
       setFilePath(pending.path ?? "");
       setFileFormat(nextSession.sourceFormat === "hwpx" ? "hwpx" : "hwp");
+      setDocumentInfoDialog(null);
+      setPrintPreviewOpen(false);
+      setPrintRequest(null);
       if (pending.path) rememberRecent(pending.path, pending.name);
       setFileSize(pending.createNew ? 0 : bytes.byteLength);
       setDirty(false);
@@ -534,6 +700,11 @@ function App() {
           if (activeSession.current === nextSession) editInput.current?.focus();
         });
       }
+      reportAppPerformance("document-session-ready", {
+        totalMs: Number((performance.now() - openStartedAt).toFixed(1)),
+        bytes: bytes.byteLength,
+        pages: nextSession.pageCount,
+      });
     } catch (cause) {
       setMessage(
         cause instanceof Error
@@ -542,6 +713,7 @@ function App() {
       );
     } finally {
       setIsLoading(false);
+      setLoadingStatus("");
       if (fileInput.current) fileInput.current.value = "";
     }
   }, [rememberRecent]);
@@ -598,6 +770,9 @@ function App() {
     setFilePath("");
     setFileFormat("");
     setFileSize(0);
+    setDocumentInfoDialog(null);
+    setPrintPreviewOpen(false);
+    setPrintRequest(null);
     setDirty(false);
     setCaret(null);
     setSelection(null);
@@ -739,6 +914,60 @@ function App() {
     if (saved && pendingAction) await continuePendingAction();
   }, [continuePendingAction, pendingAction, saveCandidate, saveDestination, saveExport]);
 
+  const writePdfExport = useCallback(async ({ result, outputPath }: PdfExportCandidate) => {
+    try {
+      const pageCount = await invoke<number>("export_pdf", {
+        documentBytes: Array.from(result.bytes),
+        outputPath,
+      });
+      setMessage(`${pageCount}쪽 PDF 파일을 저장했습니다.`);
+    } catch (cause) {
+      setMessage(`PDF를 내보내지 못했습니다. (${errorDetail(cause, "알 수 없는 오류")})`);
+    } finally {
+      setPdfCandidate(null);
+      setDialogState(null);
+    }
+  }, []);
+
+  const exportPdf = useCallback(async () => {
+    if (!session) return;
+    if (!isTauri()) {
+      setMessage("PDF 파일 내보내기는 Windows/Linux 데스크톱 앱에서 사용할 수 있습니다.");
+      return;
+    }
+    try {
+      const baseName = (fileName || "문서").replace(/\.(hwp|hwpx)$/i, "") || "문서";
+      const selected = await saveDialog({
+        title: "PDF로 내보내기",
+        defaultPath: `${baseName}.pdf`,
+        filters: [{ name: "PDF 문서 (*.pdf)", extensions: ["pdf"] }],
+      });
+      if (!selected) return;
+      const extension = /\.([^.\\/]+)$/i.exec(selected)?.[1]?.toLowerCase();
+      if (extension && extension !== "pdf") {
+        setMessage("PDF 내보내기 경로에는 .pdf 파일을 선택해 주세요.");
+        return;
+      }
+      const outputPath = extension ? selected : `${selected}.pdf`;
+      const format = fileFormat || session.sourceFormat;
+      if (format !== "hwp" && format !== "hwpx") throw new Error("현재 문서 형식은 PDF 내보내기를 지원하지 않습니다.");
+      const result = session.exportWithReport(format);
+      if (result.report.count > 0) {
+        setPdfCandidate({ result, outputPath });
+        setDialogState("pdf-loss");
+        return;
+      }
+      await writePdfExport({ result, outputPath });
+    } catch (cause) {
+      setMessage(`PDF 내보내기를 준비하지 못했습니다. (${errorDetail(cause, "알 수 없는 오류")})`);
+    }
+  }, [fileFormat, fileName, session, writePdfExport]);
+
+  const confirmPdfLossExport = useCallback(async () => {
+    if (!pdfCandidate) return;
+    await writePdfExport(pdfCandidate);
+  }, [pdfCandidate, writePdfExport]);
+
   const discardPendingAction = useCallback(async () => {
     await continuePendingAction();
   }, [continuePendingAction]);
@@ -748,6 +977,7 @@ function App() {
     setPendingAction(null);
     setSaveCandidate(null);
     setSaveDestination(null);
+    setPdfCandidate(null);
   };
 
   const openRecentDocument = useCallback(async (path: string) => {
@@ -762,18 +992,8 @@ function App() {
 
   const fileMenuItems = useMemo(() => createFileMenuItems(
     recentDocuments,
-    { hasDocument: Boolean(session), canExit: isTauri() },
-  ), [recentDocuments, session]);
-
-  const runFileCommand = useCallback((command: FileMenuCommand, argument?: string) => {
-    if (command === "new-document") void chooseNewDocument();
-    else if (command === "open-document") void chooseDocument();
-    else if (command === "save-document") void saveCurrent();
-    else if (command === "save-as") void saveCurrent(true);
-    else if (command === "close-document") requestCloseDocument();
-    else if (command === "exit-app") requestExitApp();
-    else if (command === "open-recent" && argument) void openRecentDocument(argument);
-  }, [chooseDocument, chooseNewDocument, openRecentDocument, requestCloseDocument, requestExitApp, saveCurrent]);
+    { hasDocument: Boolean(session), canEditPage: Boolean(session && caret), canExit: isTauri(), canExportPdf: isTauri() },
+  ), [recentDocuments, session, caret]);
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
@@ -924,6 +1144,86 @@ function App() {
       setMessage(cause instanceof Error ? cause.message : "용지 설정을 읽지 못했습니다.");
     }
   };
+
+  const openDocumentInformation = useCallback(() => {
+    if (!session) return;
+    try {
+      setDocumentInfoDialog({
+        fileName: fileName || "새 문서",
+        filePath,
+        fileFormat: fileFormat || session.sourceFormat,
+        fileSize,
+        info: session.documentInfo(),
+      });
+    } catch (cause) {
+      setMessage(cause instanceof Error ? `문서 정보를 읽지 못했습니다. (${cause.message})` : "문서 정보를 읽지 못했습니다.");
+    }
+  }, [fileFormat, fileName, filePath, fileSize, session]);
+
+  const preparePrintRequest = useCallback((request: PrintRequest) => {
+    if (!session) return;
+    try {
+      const pages = Array.from({ length: session.pageCount }, (_, pageIndex) => {
+        const info = session.pageInfo(pageIndex);
+        if (!(info.width > 0 && info.height > 0)) throw new Error(`${info.pageNumber}쪽 크기가 올바르지 않습니다.`);
+        const svg = sanitizeRenderedSvg(DOMPurify, session.renderPage(pageIndex));
+        if (!/<svg(?:\s|>)/i.test(svg)) throw new Error(`${info.pageNumber}쪽을 출력용으로 렌더링하지 못했습니다.`);
+        return info;
+      });
+      const firstPage = pages[0];
+      const mixedPageSizes = Boolean(firstPage && pages.some((page) =>
+        Math.abs(page.width - firstPage.width) > 1 || Math.abs(page.height - firstPage.height) > 1,
+      ));
+      if (mixedPageSizes) {
+        setPrintIssue("쪽마다 용지 크기가 다른 문서는 현재 시스템 인쇄 경로에서 안전하게 출력할 수 없습니다. 문서 손실을 막기 위해 인쇄를 중단했습니다.");
+        setPrintRequest(null);
+        return;
+      }
+      setPrintIssue("");
+      setPrintRequest(request);
+    } catch (cause) {
+      const issue = cause instanceof Error
+        ? `출력 페이지를 준비하지 못했습니다. (${cause.message})`
+        : "출력 페이지를 준비하지 못했습니다.";
+      setPrintIssue(issue);
+      setPrintRequest(null);
+    }
+  }, [session]);
+
+  const openPrintPreview = useCallback((request: PrintRequest | null = null) => {
+    if (!session) return;
+    setMessage("");
+    setPrintPreviewOpen(true);
+    setPrintIssue("");
+    setPrintRequest(null);
+    if (request) preparePrintRequest(request);
+    else {
+      try {
+        for (let pageIndex = 0; pageIndex < session.pageCount; pageIndex += 1) {
+          session.pageInfo(pageIndex);
+          const svg = sanitizeRenderedSvg(DOMPurify, session.renderPage(pageIndex));
+          if (!/<svg(?:\s|>)/i.test(svg)) throw new Error(`${pageIndex + 1}쪽을 표시할 수 없습니다.`);
+        }
+      } catch (cause) {
+        setPrintIssue(cause instanceof Error ? `미리보기를 준비하지 못했습니다. (${cause.message})` : "미리보기를 준비하지 못했습니다.");
+      }
+    }
+  }, [preparePrintRequest, session]);
+
+  const runFileCommand = useCallback((command: FileMenuCommand, argument?: string) => {
+    if (command === "new-document") void chooseNewDocument();
+    else if (command === "open-document") void chooseDocument();
+    else if (command === "save-document") void saveCurrent();
+    else if (command === "save-as") void saveCurrent(true);
+    else if (command === "export-pdf") void exportPdf();
+    else if (command === "document-info") openDocumentInformation();
+    else if (command === "page-setup") openPageSetup();
+    else if (command === "print-preview") openPrintPreview();
+    else if (command === "print") openPrintPreview("print");
+    else if (command === "close-document") requestCloseDocument();
+    else if (command === "exit-app") requestExitApp();
+    else if (command === "open-recent" && argument) void openRecentDocument(argument);
+  }, [chooseDocument, chooseNewDocument, exportPdf, openDocumentInformation, openPageSetup, openPrintPreview, openRecentDocument, requestCloseDocument, requestExitApp, saveCurrent]);
 
   const commitPageSetup = () => {
     if (!session || !pageSetupDialog) return;
@@ -1214,6 +1514,12 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && printPreviewOpen) {
+        event.preventDefault();
+        setPrintPreviewOpen(false);
+        setPrintRequest(null);
+        return;
+      }
       if (!(event.ctrlKey || event.metaKey)) return;
       const key = event.key.toLowerCase();
       if (key === "o") {
@@ -1225,6 +1531,9 @@ function App() {
       } else if (key === "s") {
         event.preventDefault();
         runFileCommand(event.shiftKey ? "save-as" : "save-document");
+      } else if (key === "p") {
+        event.preventDefault();
+        runFileCommand("print");
       } else if (key === "enter") {
         event.preventDefault();
         insertPageBreak();
@@ -1278,7 +1587,7 @@ function App() {
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat]);
+  }, [runFileCommand, redo, undo, copySelection, pasteText, selection, session, caret, insertPageBreak, applyCharacterFormat, pendingCharacterFormat, printPreviewOpen]);
 
   const characterProperties = useMemo(() => {
     if (!session || !caret) return {} as Record<string, unknown>;
@@ -1306,6 +1615,19 @@ function App() {
       return [] as DocumentStyle[];
     }
   }, [session, renderVersion]);
+
+  const printPageSize = useMemo(() => {
+    if (!session) return { widthMm: 210, heightMm: 297 };
+    try {
+      const firstPage = session.pageInfo(0);
+      return {
+        widthMm: Math.max(1, Math.round(firstPage.width * 25.4 / 96 * 100) / 100),
+        heightMm: Math.max(1, Math.round(firstPage.height * 25.4 / 96 * 100) / 100),
+      };
+    } catch {
+      return { widthMm: 210, heightMm: 297 };
+    }
+  }, [session]);
 
   const setFontSize = (fontSize: number) => applyCharacterFormat({ fontSize });
   const toggleCharacterFormat = (key: "bold" | "italic" | "underline") => {
@@ -1392,6 +1714,7 @@ function App() {
         }}
         onKeyDown={(event) => {
           const nativeEvent = event.nativeEvent;
+          imeInputGate.current.noteKeydown(event.key);
           traceImeEvent("keydown", nativeEvent, event.currentTarget.value.length);
             if (event.key === "Escape") imeInputGate.current.cancelComposition();
           if (!imeInputGate.current.shouldHandleKey(nativeEvent.isComposing, nativeEvent.keyCode, event.key)) {
@@ -1498,7 +1821,7 @@ function App() {
         </button>
         <div className="header-spacer" />
         <span className="header-document-title" title={fileName || "새 문서"}>
-          {fileName || "새 문서"}{dirty ? " •" : ""}
+          {fileName || "새 문서"}
         </span>
         <div className="header-spacer" />
         {session && (
@@ -1514,7 +1837,7 @@ function App() {
             </button>
           </>
         )}
-        {!session && <span className="mode-label"><span className="mode-dot" />문서 편집</span>}
+        {!session && <span className="mode-label">문서 편집</span>}
       </header>
 
       <section className="editor-ribbon" aria-label="편집 리본 메뉴">
@@ -1704,7 +2027,7 @@ function App() {
         <div className="document-tab">
           <Icon name="file" />
           <span className="document-tab-name" title={fileName || "새 문서"}>
-            {fileName || "새 문서"}{dirty ? " •" : ""}
+            {fileName || "새 문서"}
           </span>
           {fileName && <span className="format-chip">{fileFormat || session?.sourceFormat}</span>}
         </div>
@@ -1742,12 +2065,11 @@ function App() {
           </div>
         ) : (
           <Virtuoso
-            key={Math.round(zoom * 100)}
             ref={reader}
             className="page-list"
             totalCount={session.pageCount}
             defaultItemHeight={1123 * zoom + 86}
-            increaseViewportBy={700}
+            increaseViewportBy={320}
             rangeChanged={(range) => {
               const page = Math.min(session.pageCount, range.startIndex + 1);
               setCurrentPage(page);
@@ -1796,7 +2118,9 @@ function App() {
 
       <footer className="status-bar">
         <div className="status-left">
-          {session ? (
+          {isLoading ? (
+            <span role="status" aria-live="polite">{loadingStatus || "문서를 여는 중…"}</span>
+          ) : session ? (
             <>
               <button className="page-nav" type="button" aria-label="이전 페이지" disabled={currentPage <= 1} onClick={() => moveToPage(currentPage - 1)}><Icon name="chevron-left" size={15} /></button>
               <label className="page-counter">
@@ -1811,12 +2135,58 @@ function App() {
           ) : <span>HWP · HWPX 문서 편집</span>}
         </div>
         <div className="status-right">
-          <span className={`edit-status-dot${editMode ? " editing" : ""}`} />
           <span>{session ? (caret?.cellPath ? "표 셀 편집" : "문서 편집") : "편집 준비"}</span>
           <span className="status-separator" />
           <span>한울 문서 0.1.0</span>
         </div>
       </footer>
+
+      {printPreviewOpen && session && (
+        <section className="print-preview-layer" role="dialog" aria-modal="true" aria-labelledby="print-preview-title">
+          <style>{`@media print { @page { size: ${printPageSize.widthMm}mm ${printPageSize.heightMm}mm; margin: 0; } }`}</style>
+          <header className="print-preview-toolbar">
+            <div className="print-preview-heading">
+              <strong id="print-preview-title">인쇄 미리보기</strong>
+              <span>{fileName || "새 문서"} · {session.pageCount}쪽</span>
+            </div>
+            <div className="print-preview-actions">
+              <button className="primary-button" type="button" disabled={Boolean(printIssue)} onClick={() => preparePrintRequest("print")}>인쇄</button>
+              <button className="secondary-button" type="button" autoFocus onClick={() => { setPrintPreviewOpen(false); setPrintRequest(null); setPrintIssue(""); }}>닫기</button>
+            </div>
+          </header>
+          <p className={`print-preview-guidance${printIssue ? " has-issue" : ""}`} role={printIssue ? "alert" : undefined}>
+            {printIssue || "페이지 크기와 배치를 확인한 다음 인쇄를 선택하세요."}
+          </p>
+          <div className="print-preview-pages" aria-label="문서 인쇄 페이지">
+            {Array.from({ length: session.pageCount }, (_, index) => (
+              <PrintPreviewPage key={`${renderVersion}-${index}`} session={session} pageIndex={index} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {documentInfoDialog && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDocumentInfoDialog(null); }}>
+          <section className="confirm-dialog document-info-dialog" role="dialog" aria-modal="true" aria-labelledby="document-info-title">
+            <p className="eyebrow">파일</p>
+            <h2 id="document-info-title">문서 정보</h2>
+            <dl className="document-info-list">
+              <div><dt>파일 이름</dt><dd>{documentInfoDialog.fileName}</dd></div>
+              <div><dt>위치</dt><dd>{documentInfoDialog.filePath || "아직 저장하지 않은 문서"}</dd></div>
+              <div><dt>형식</dt><dd>{documentInfoDialog.fileFormat.toUpperCase()}</dd></div>
+              <div><dt>파일 크기</dt><dd>{documentInfoDialog.fileSize ? formatFileSize(documentInfoDialog.fileSize) : "저장 전"}</dd></div>
+              <div><dt>쪽 수</dt><dd>{documentInfoDialog.info.pageCount ?? "정보 없음"}</dd></div>
+              <div><dt>구역 수</dt><dd>{documentInfoDialog.info.sectionCount ?? "정보 없음"}</dd></div>
+              <div><dt>문서 버전</dt><dd>{documentInfoDialog.info.version || "정보 없음"}</dd></div>
+              <div><dt>암호화</dt><dd>{documentInfoDialog.info.encrypted === undefined ? "정보 없음" : documentInfoDialog.info.encrypted ? "암호화됨" : "암호화되지 않음"}</dd></div>
+              <div><dt>사용 글꼴</dt><dd>{documentInfoDialog.info.fontsUsed?.length ? documentInfoDialog.info.fontsUsed.join(", ") : "정보 없음"}</dd></div>
+            </dl>
+            <div className="dialog-actions">
+              <button className="primary-button" type="button" autoFocus onClick={() => setDocumentInfoDialog(null)}>닫기</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {pageSetupDialog && (
         <div className="modal-backdrop" role="presentation">
@@ -1887,7 +2257,7 @@ function App() {
                     <button className="primary-button" type="button" onClick={() => void saveCurrent()}>저장</button>
                 </div>
               </>
-            ) : (
+            ) : dialogState === "loss" ? (
               <>
                 <p className="eyebrow warning-eyebrow">저장 형식 확인</p>
                 <h2 id="confirm-title">일부 내용을 저장하지 못할 수 있습니다</h2>
@@ -1904,6 +2274,25 @@ function App() {
                 <div className="dialog-actions">
                   <button className="secondary-button" type="button" onClick={cancelDialog}>저장 취소</button>
                   <button className="primary-button warning-button" type="button" onClick={() => void confirmLossSave()}>손실 가능성을 알고 저장</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="eyebrow warning-eyebrow">PDF 변환 확인</p>
+                <h2 id="confirm-title">일부 내용을 PDF에 표시하지 못할 수 있습니다</h2>
+                <p>RHWP 변환 보고서에 {pdfCandidate?.result.report.count ?? 0}개의 손실 항목이 있습니다. 아래 항목을 확인한 뒤 계속할 수 있습니다.</p>
+                <ul className="loss-list">
+                  {pdfCandidate?.result.report.losses.slice(0, 8).map((loss, index) => (
+                    <li key={`${loss.code ?? "loss"}-${index}`}>
+                      <strong>{String(loss.subject ?? loss.code ?? `항목 ${index + 1}`)}</strong>
+                      <span>{String(loss.message ?? loss.reason ?? "PDF에 표시되지 않을 수 있습니다.")}</span>
+                    </li>
+                  ))}
+                  {(pdfCandidate?.result.report.count ?? 0) > 8 && <li>그 외 {((pdfCandidate?.result.report.count ?? 0) - 8)}개 항목</li>}
+                </ul>
+                <div className="dialog-actions">
+                  <button className="secondary-button" type="button" onClick={cancelDialog}>PDF 내보내기 취소</button>
+                  <button className="primary-button warning-button" type="button" onClick={() => void confirmPdfLossExport()}>손실 가능성을 알고 계속</button>
                 </div>
               </>
             )}

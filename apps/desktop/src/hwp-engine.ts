@@ -70,6 +70,24 @@ export interface PageDefinition {
   binding: number;
 }
 
+export interface DocumentInfo {
+  version?: string;
+  sectionCount?: number;
+  pageCount?: number;
+  encrypted?: boolean;
+  hwp3Variant?: boolean;
+  fontsUsed?: string[];
+  fontSubstitutions?: unknown[];
+}
+
+export interface RenderedPageInfo {
+  pageIndex: number;
+  pageNumber: number;
+  width: number;
+  height: number;
+  sectionIndex: number;
+}
+
 export interface DocumentStyle {
   id: number;
   name: string;
@@ -119,6 +137,8 @@ export type TableCommand =
 export interface DocumentSession {
   readonly pageCount: number;
   readonly sourceFormat: string;
+  documentInfo(): DocumentInfo;
+  pageInfo(pageIndex: number): RenderedPageInfo;
   renderPage(pageIndex: number): string;
   hitTest(pageIndex: number, x: number, y: number): TextPosition;
   moveCaret(position: TextPosition, delta: -1 | 1): TextPosition;
@@ -189,6 +209,18 @@ interface RawSearchHit {
 }
 
 let initialization: Promise<void> | undefined;
+let initializationDurationMs = 0;
+let initializationRuns = 0;
+
+const MAX_CACHED_RENDERED_PAGES = 12;
+
+function now() {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
+}
+
+function reportEnginePerformance(details: Record<string, string | number | boolean>) {
+  if (import.meta.env.DEV) console.info("[Hanul performance] RHWP", details);
+}
 
 function parseJson<T>(value: string, label: string): T {
   try {
@@ -224,8 +256,12 @@ function registerTextMeasurement() {
 
 function initializeEngine() {
   if (!initialization) {
+    initializationRuns += 1;
     registerTextMeasurement();
-    initialization = init({ module_or_path: wasmUrl }).then(() => undefined);
+    const startedAt = now();
+    initialization = init({ module_or_path: wasmUrl }).then(() => {
+      initializationDurationMs = now() - startedAt;
+    });
   }
   return initialization;
 }
@@ -251,6 +287,17 @@ class RhwpDocumentSession implements DocumentSession {
     return this.document.pageCount();
   }
 
+  documentInfo() {
+    return parseJson<DocumentInfo>(this.document.getDocumentInfo(), "문서 정보");
+  }
+
+  pageInfo(pageIndex: number) {
+    if (pageIndex < 0 || pageIndex >= this.pageCount) {
+      throw new RangeError("페이지 번호가 문서 범위를 벗어났습니다.");
+    }
+    return parseJson<RenderedPageInfo>(this.document.getPageInfo(pageIndex), "쪽 정보");
+  }
+
   get canUndo() {
     return this.undoStack.length > 0;
   }
@@ -264,9 +311,17 @@ class RhwpDocumentSession implements DocumentSession {
       throw new RangeError("페이지 번호가 문서 범위를 벗어났습니다.");
     }
     const cached = this.renderedPages.get(pageIndex);
-    if (cached) return cached;
+    if (cached !== undefined) {
+      this.renderedPages.delete(pageIndex);
+      this.renderedPages.set(pageIndex, cached);
+      return cached;
+    }
     const svg = this.document.renderPageSvg(pageIndex);
     this.renderedPages.set(pageIndex, svg);
+    if (this.renderedPages.size > MAX_CACHED_RENDERED_PAGES) {
+      const leastRecentlyUsedPage = this.renderedPages.keys().next().value;
+      if (leastRecentlyUsedPage !== undefined) this.renderedPages.delete(leastRecentlyUsedPage);
+    }
     return svg;
   }
 
@@ -759,7 +814,8 @@ class RhwpDocumentSession implements DocumentSession {
       if (index < paragraphs.length - 1) position = this.splitParagraph(position);
     });
     const operations = this.undoStack.splice(historyStart);
-    if (operations.length > 1) this.undoStack.push({ kind: "compound", operations });
+    if (operations.length === 1) this.undoStack.push(operations[0]);
+    else if (operations.length > 1) this.undoStack.push({ kind: "compound", operations });
     if (operations.length) this.clearRedo();
     return position;
   }
@@ -1550,9 +1606,27 @@ class RhwpDocumentSession implements DocumentSession {
 }
 
 export async function loadHwpDocument(bytes: Uint8Array): Promise<DocumentSession> {
+  const waitingStartedAt = now();
   await initializeEngine();
+  const initializationWaitMs = now() - waitingStartedAt;
+
+  const parseStartedAt = now();
   const document = new HwpDocument(bytes);
-  return new RhwpDocumentSession(document);
+  const parseAndLayoutMs = now() - parseStartedAt;
+  const sessionStartedAt = now();
+  const session = new RhwpDocumentSession(document);
+  reportEnginePerformance({
+    phase: "open",
+    bytes: bytes.byteLength,
+    format: session.sourceFormat,
+    wasmInitializationRuns: initializationRuns,
+    wasmInitializationMs: Number(initializationDurationMs.toFixed(1)),
+    wasmWaitMs: Number(initializationWaitMs.toFixed(1)),
+    rhwpParseModelAndInitialLayoutMs: Number(parseAndLayoutMs.toFixed(1)),
+    sessionSetupMs: Number((now() - sessionStartedAt).toFixed(1)),
+    pageCount: session.pageCount,
+  });
+  return session;
 }
 
 export async function createNewHwpDocumentSession(): Promise<DocumentSession> {

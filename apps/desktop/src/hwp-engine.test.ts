@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import init, { HwpDocument } from "@rhwp/core";
 import { readFile } from "node:fs/promises";
 import {
@@ -19,6 +19,32 @@ beforeAll(async () => {
 });
 
 describe("RHWP document session", () => {
+  it("keeps only the twelve most recently used rendered pages", () => {
+    const document = HwpDocument.createEmpty();
+    document.createBlankDocument();
+    document.insertText(
+      0,
+      0,
+      0,
+      ("SVG cache bound benchmark sentence 0123456789 가나다라마바사아자차카타파하\n").repeat(500),
+    );
+    expect(document.pageCount()).toBeGreaterThan(12);
+
+    const renderSpy = vi.spyOn(document, "renderPageSvg");
+    const session = wrapHwpDocument(document);
+    try {
+      for (let pageIndex = 0; pageIndex <= 12; pageIndex += 1) session.renderPage(pageIndex);
+      session.renderPage(1); // Refresh page 1 before asking for an evicted page.
+      session.renderPage(0); // Page 0 was the least recently used entry.
+      session.renderPage(1); // Page 1 should still be cached.
+
+      expect(renderSpy).toHaveBeenCalledTimes(14);
+    } finally {
+      session.dispose();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("edits Korean text, undoes paragraph changes, and round-trips HWP without reported loss", async () => {
     const session = await createNewHwpDocumentSession();
     const contains = (text: string) => session.searchText(text, false).length > 0;
@@ -89,6 +115,28 @@ describe("RHWP document session", () => {
       expect(exported.report.outputFormat).toBe("hwp");
       expect(exported.report.count).toBe(0);
       expect(exported.bytes.byteLength).toBeGreaterThan(0);
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("exposes page and document metadata through the session adapter", async () => {
+    const session = await createNewHwpDocumentSession();
+    try {
+      expect(session.documentInfo()).toMatchObject({
+        sectionCount: 1,
+        pageCount: 1,
+        encrypted: false,
+      });
+      expect(session.pageInfo(0)).toMatchObject({
+        pageIndex: 0,
+        pageNumber: 1,
+        sectionIndex: 0,
+      });
+      expect(session.pageInfo(0).width).toBeGreaterThan(0);
+      expect(session.pageInfo(0).height).toBeGreaterThan(0);
+      expect(() => session.pageInfo(-1)).toThrow(RangeError);
+      expect(() => session.pageInfo(session.pageCount)).toThrow(RangeError);
     } finally {
       session.dispose();
     }
@@ -361,6 +409,26 @@ describe("RHWP document session", () => {
         reopened.dispose();
       }
       expect(end.charOffset).toBe(5);
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("keeps a single replaceRange insertion available to undo and redo", async () => {
+    const session = await createNewHwpDocumentSession();
+    try {
+      const start = session.hitTest(0, 113, 132);
+
+      session.replaceRange(start, start, "가");
+
+      expect(session.searchText("가", false)).toHaveLength(1);
+      expect(session.canUndo).toBe(true);
+      session.undo();
+      expect(session.searchText("가", false)).toHaveLength(0);
+      expect(session.canRedo).toBe(true);
+      session.redo();
+      expect(session.searchText("가", false)).toHaveLength(1);
+      expect(session.canUndo).toBe(true);
     } finally {
       session.dispose();
     }

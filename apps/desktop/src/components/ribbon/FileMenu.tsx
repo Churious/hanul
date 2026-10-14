@@ -1,5 +1,5 @@
 import { createPortal } from "react-dom";
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import type { FileMenuCommand, FileMenuEntry, FileMenuItem } from "./file-menu-model";
 import "./FileMenu.css";
 
@@ -31,12 +31,25 @@ interface SubmenuPosition {
 }
 
 function MenuIcon({ name }: { name?: string }) {
-  const symbol: Record<string, string> = {
-    new: "＋", templates: "▤", assistant: "✦", open: "↗", convert: "⇄", image: "▧", xml: "‹›",
-    save: "▣", "save-as": "▧", pdf: "P", mobile: "▯", info: "i", accessibility: "◉",
-    license: "©", send: "➤", page: "▱", preview: "◫", print: "▤", recent: "◷", close: "×", exit: "↪",
+  const paths: Record<string, ReactNode> = {
+    new: <><path d="M12 4v16M4 12h16" /></>,
+    open: <><path d="M3 7.5h7l2 2H21v9.75a1.75 1.75 0 0 1-1.75 1.75H4.75A1.75 1.75 0 0 1 3 19.25Z" /><path d="M3 11h18" /></>,
+    save: <><path d="M4 3.5h13l3.5 3.5v13.5H3.5v-15A2 2 0 0 1 4 3.5Z" /><path d="M7 4v6h9V4M7 20v-7h10v7" /></>,
+    "save-as": <><path d="M4 3.5h13l3.5 3.5v13.5H3.5v-15A2 2 0 0 1 4 3.5Z" /><path d="M7 20v-7h10v7M7 4v4" /><path d="m15 11 4-4" /></>,
+    pdf: <><path d="M6 2.75h8l5 5v13.5H6a2 2 0 0 1-2-2v-14a2 2 0 0 1 2-2Z" /><path d="M14 3v5h5M8 13h8M8 16h6" /></>,
+    info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></>,
+    page: <><path d="M4 4h16v16H4z" /><path d="M7 7h10M7 10h10M7 17h10" /></>,
+    preview: <><path d="M3 4h18v16H3z" /><path d="M7 8h10M7 11h10M7 14h7" /></>,
+    print: <><path d="M7 8V3.5h10V8M7 17H4.5A1.5 1.5 0 0 1 3 15.5v-6A1.5 1.5 0 0 1 4.5 8h15A1.5 1.5 0 0 1 21 9.5v6a1.5 1.5 0 0 1-1.5 1.5H17" /><path d="M7 14h10v6.5H7zM17.5 11h.01" /></>,
+    recent: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+    close: <><path d="m5 5 14 14M19 5 5 19" /></>,
+    exit: <><path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10" /></>,
   };
-  return <span className="file-menu-icon" aria-hidden="true">{name ? symbol[name] ?? "•" : ""}</span>;
+  return (
+    <span className="file-menu-icon" aria-hidden="true">
+      {name && <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.55" strokeLinecap="square" strokeLinejoin="miter">{paths[name] ?? paths.page}</svg>}
+    </span>
+  );
 }
 
 export function FileMenu({ items, onCommand }: FileMenuProps) {

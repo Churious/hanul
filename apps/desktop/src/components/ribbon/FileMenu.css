@@ -7,16 +7,16 @@
 
 .file-menu-trigger {
   min-width: 46px;
-  color: #536157;
+  color: #4d5965;
 }
 
 .file-menu-trigger.active {
-  color: #fff;
-  background: var(--green);
+  color: var(--accent-strong);
+  background: transparent;
 }
 
 .file-menu-trigger.active::after {
-  display: none;
+  display: block;
 }
 
 .file-menu-panel,
@@ -24,15 +24,15 @@
   position: absolute;
   z-index: 30;
   width: max-content;
-  min-width: 288px;
+  min-width: 272px;
   max-width: min(440px, calc(100vw - 16px));
   padding: 5px 0;
   overflow-x: hidden;
   overflow-y: auto;
-  border: 1px solid #d9ded9;
-  border-radius: 3px;
+  border: 1px solid #c7ced5;
+  border-radius: 2px;
   background: #fff;
-  box-shadow: 0 5px 16px rgb(26 40 30 / 16%), 0 1px 3px rgb(26 40 30 / 10%);
+  box-shadow: 0 3px 10px rgb(25 35 45 / 18%), 0 1px 2px rgb(25 35 45 / 10%);
 }
 
 .file-menu-panel {
@@ -55,13 +55,13 @@
 .file-menu-item {
   display: flex;
   width: 100%;
-  min-height: 29px;
+  min-height: 30px;
   align-items: center;
-  gap: 9px;
-  padding: 4px 11px 4px 9px;
+  gap: 10px;
+  padding: 4px 12px 4px 10px;
   border: 0;
   background: transparent;
-  color: #29332c;
+  color: #293540;
   cursor: pointer;
   font-size: 12px;
   text-align: left;
@@ -70,28 +70,32 @@
 
 .file-menu-item:hover:not(:disabled),
 .file-menu-item:focus-visible:not(:disabled) {
-  background: #edf4ee;
+  background: #e6eef5;
 }
 
 .file-menu-item:disabled {
-  color: #929a93;
+  color: #858f99;
   cursor: default;
 }
 
 .file-menu-icon {
   display: inline-flex;
-  width: 17px;
-  height: 18px;
-  flex: 0 0 17px;
+  width: 19px;
+  height: 19px;
+  flex: 0 0 19px;
   align-items: center;
   justify-content: center;
-  color: #718276;
-  font-size: 13px;
-  font-weight: 600;
+  color: #61788b;
+}
+
+.file-menu-icon svg {
+  display: block;
+  width: 17px;
+  height: 17px;
 }
 
 .file-menu-item:disabled .file-menu-icon {
-  color: #aeb5af;
+  color: #a7b0b8;
 }
 
 .file-menu-label {
@@ -102,14 +106,14 @@
 
 .file-menu-item kbd {
   margin-left: 25px;
-  color: #7e887f;
+  color: #6f7b87;
   font: inherit;
   font-size: 10px;
 }
 
 .file-menu-arrow {
   margin-left: 22px;
-  color: #8a938b;
+  color: #77838e;
   font-size: 17px;
   line-height: 12px;
 }
@@ -117,7 +121,7 @@
 .file-menu-separator {
   height: 1px;
   margin: 4px 9px;
-  background: #e6eae6;
+  background: #e0e5e9;
 }
 
 .file-menu-submenu {

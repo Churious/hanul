@@ -13,6 +13,24 @@ describe("native IME input gate", () => {
     expect(gate.acceptInput("나", { inputType: "insertText" }, 22)).toBe("나");
   });
 
+  it("suppresses an exact post-composition echo with an unfamiliar input type", () => {
+    const gate = new ImeInputGate();
+    gate.startComposition();
+    gate.updateComposition("가");
+    expect(gate.finishComposition("가", 20)).toBe("가");
+
+    expect(gate.acceptInput("가", { inputType: "insertReplacementText" }, 21)).toBeNull();
+  });
+
+  it("keeps a quick repeated character after composition when a new key starts it", () => {
+    const gate = new ImeInputGate();
+    gate.startComposition();
+    expect(gate.finishComposition("가", 20)).toBe("가");
+    gate.noteKeydown("r");
+
+    expect(gate.acceptInput("가", { inputType: "insertText" }, 21)).toBe("가");
+  });
+
   it("does not suppress a later matching character outside the composition event window", () => {
     const gate = new ImeInputGate();
     gate.startComposition();

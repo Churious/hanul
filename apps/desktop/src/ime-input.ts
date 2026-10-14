@@ -47,6 +47,14 @@ export class ImeInputGate {
     return committedText || null;
   }
 
+  noteKeydown(key: string) {
+    // A new printable key after the commit is a new user action, even if it
+    // produces the same character as the previous composition.
+    if (!this.compositionActive && key.length === 1) {
+      this.pendingCompositionInput = null;
+    }
+  }
+
   acceptInput(text: string, event: ImeInputEventState = {}, now = Date.now()) {
     if (
       this.compositionActive ||
@@ -60,12 +68,10 @@ export class ImeInputGate {
 
     const pending = this.pendingCompositionInput;
     this.pendingCompositionInput = null;
-    if (
-      pending &&
-      now <= pending.expiresAt &&
-      text === pending.text &&
-      (event.inputType === "insertFromComposition" || event.inputType === "insertText" || !event.inputType)
-    ) {
+    // WebView2 and WebKitGTK differ on the inputType used for the DOM echo
+    // following compositionend (some report insertReplacementText). Match the
+    // committed payload itself, then clear the guard on the next printable key.
+    if (pending && now <= pending.expiresAt && text === pending.text) {
       return null;
     }
 

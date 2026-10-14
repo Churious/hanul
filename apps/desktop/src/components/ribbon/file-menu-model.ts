@@ -3,6 +3,11 @@ export type FileMenuCommand =
   | "open-document"
   | "save-document"
   | "save-as"
+  | "export-pdf"
+  | "document-info"
+  | "page-setup"
+  | "print-preview"
+  | "print"
   | "close-document"
   | "exit-app"
   | "open-recent";
@@ -21,50 +26,17 @@ export interface FileMenuItem {
 
 export type FileMenuEntry = FileMenuItem | { id: string; kind: "separator" };
 
-const unsupportedReason = "이 기능은 아직 구현되지 않았습니다.";
-
-function unavailable<K extends keyof typeof FILE_MENU_SUPPORT>(
-  feature: K,
-  id: string,
-  label: string,
-  icon: string,
-  children?: FileMenuItem[],
-): FileMenuItem {
-  const capability = FILE_MENU_SUPPORT[feature];
-  return {
-    id,
-    label,
-    icon,
-    disabled: !capability.supported,
-    disabledReason: capability.supported ? undefined : capability.reason,
-    ...(children ? { children } : {}),
-  };
-}
-
-const separator = (id: string): FileMenuEntry => ({ id, kind: "separator" });
-
-/** Central menu capability map: disabled commands have no application handler yet. */
+/** Visible file-menu commands and their implementation status live in one place. */
 export const FILE_MENU_SUPPORT = {
   newDocument: { supported: true },
-  documentGarden: { supported: false, reason: unsupportedReason },
-  startAssistant: { supported: false, reason: unsupportedReason },
   openDocument: { supported: true },
-  convertPdf: { supported: false, reason: unsupportedReason },
-  convertImage: { supported: false, reason: unsupportedReason },
-  xmlDocument: { supported: false, reason: unsupportedReason },
   saveDocument: { supported: true },
   saveAs: { supported: true },
-  savePdf: { supported: false, reason: unsupportedReason },
-  saveMobile: { supported: false, reason: unsupportedReason },
-  documentInfo: { supported: false, reason: unsupportedReason },
-  daisy: { supported: false, reason: unsupportedReason },
-  ccl: { supported: false, reason: unsupportedReason },
-  publicNuri: { supported: false, reason: unsupportedReason },
-  braille: { supported: false, reason: unsupportedReason },
-  send: { supported: false, reason: unsupportedReason },
-  pageSetup: { supported: false, reason: unsupportedReason },
-  preview: { supported: false, reason: unsupportedReason },
-  print: { supported: false, reason: unsupportedReason },
+  exportPdf: { supported: true },
+  documentInfo: { supported: true },
+  pageSetup: { supported: true },
+  printPreview: { supported: true },
+  print: { supported: true },
   recentDocuments: { supported: true },
   closeDocument: { supported: true },
   exit: { supported: true },
@@ -75,9 +47,13 @@ export interface RecentFileMenuItem {
   label: string;
 }
 
+function isSupported(feature: keyof typeof FILE_MENU_SUPPORT) {
+  return FILE_MENU_SUPPORT[feature].supported;
+}
+
 export function createFileMenuItems(
   recentDocuments: RecentFileMenuItem[],
-  state: { hasDocument: boolean; canExit: boolean },
+  state: { hasDocument: boolean; canEditPage: boolean; canExit: boolean; canExportPdf: boolean },
 ): FileMenuEntry[] {
   const recentChildren: FileMenuItem[] = recentDocuments.length
     ? recentDocuments.map((recent, index) => ({
@@ -95,47 +71,33 @@ export function createFileMenuItems(
         disabledReason: "문서를 열거나 저장하면 최근 문서에 표시됩니다.",
       }];
 
+  const separator = (id: string): FileMenuEntry => ({ id, kind: "separator" });
+
   return [
-    { id: "new-document", label: "새 문서", shortcut: "Ctrl+N", icon: "new", command: "new-document" },
-    unavailable("documentGarden", "document-garden", "문서마당", "templates"),
-    unavailable("startAssistant", "start-assistant", "문서 시작 도우미", "assistant"),
+    { id: "new-document", label: "새 문서", shortcut: "Ctrl+N", icon: "new", command: "new-document", disabled: !isSupported("newDocument") },
     separator("before-open"),
-    { id: "open-document", label: "불러오기", shortcut: "Ctrl+O", icon: "open", command: "open-document" },
-    unavailable("convertPdf", "convert-pdf", "PDF를 오피스 문서로 변환하기", "convert"),
-    unavailable("convertImage", "convert-image", "그림을 오피스 문서로 변환하기", "image"),
-    unavailable("xmlDocument", "xml-document", "XML 문서", "xml"),
+    { id: "open-document", label: "불러오기", shortcut: "Ctrl+O", icon: "open", command: "open-document", disabled: !isSupported("openDocument") },
     separator("before-save"),
-    { id: "save-document", label: "저장하기", shortcut: "Ctrl+S", icon: "save", command: "save-document", disabled: !state.hasDocument },
-    { id: "save-as", label: "다른 이름으로 저장하기", shortcut: "Ctrl+Shift+S", icon: "save-as", command: "save-as", disabled: !state.hasDocument },
-    unavailable("savePdf", "save-pdf", "PDF로 저장하기", "pdf"),
-    unavailable("saveMobile", "save-mobile", "모바일 최적화 문서로 저장하기", "mobile"),
-    unavailable("documentInfo", "document-info", "문서 정보", "info"),
-    separator("before-accessibility"),
-    unavailable("daisy", "daisy", "DAISY 문서", "accessibility"),
-    unavailable("ccl", "ccl", "CCL 넣기", "license"),
-    unavailable("publicNuri", "public-nuri", "공공누리 넣기", "license"),
-    unavailable("braille", "braille", "점자로 바꾸기", "accessibility"),
-    separator("before-send"),
-    unavailable("send", "send", "보내기", "send", [
-      unavailable("send", "send-mail", "메일로 보내기", "send"),
-      unavailable("send", "send-link", "링크로 보내기", "send"),
-    ]),
+    { id: "save-document", label: "저장하기", shortcut: "Ctrl+S", icon: "save", command: "save-document", disabled: !isSupported("saveDocument") || !state.hasDocument },
+    { id: "save-as", label: "다른 이름으로 저장하기", shortcut: "Ctrl+Shift+S", icon: "save-as", command: "save-as", disabled: !isSupported("saveAs") || !state.hasDocument },
+    { id: "export-pdf", label: "PDF로 내보내기", icon: "pdf", command: "export-pdf", disabled: !isSupported("exportPdf") || !state.hasDocument || !state.canExportPdf, disabledReason: !state.canExportPdf ? "PDF 파일 내보내기는 데스크톱 앱에서 사용할 수 있습니다." : undefined },
+    separator("before-info"),
+    { id: "document-info", label: "문서 정보", icon: "info", command: "document-info", disabled: !isSupported("documentInfo") || !state.hasDocument },
     separator("before-page"),
-    unavailable("pageSetup", "page-setup", "편집 용지", "page"),
-    unavailable("preview", "preview", "미리 보기", "preview"),
-    unavailable("print", "print", "인쇄", "print"),
+    { id: "page-setup", label: "편집 용지", icon: "page", command: "page-setup", disabled: !isSupported("pageSetup") || !state.hasDocument || !state.canEditPage, disabledReason: state.hasDocument && !state.canEditPage ? "페이지의 편집 위치를 먼저 선택하세요." : undefined },
+    { id: "preview", label: "인쇄 미리보기", icon: "preview", command: "print-preview", disabled: !isSupported("printPreview") || !state.hasDocument },
+    { id: "print", label: "인쇄", shortcut: "Ctrl+P", icon: "print", command: "print", disabled: !isSupported("print") || !state.hasDocument },
     separator("before-recent"),
     {
       id: "recent-documents",
       label: "최근 문서",
       icon: "recent",
       children: recentChildren,
-      disabled: !state.hasDocument && recentDocuments.length === 0,
+      disabled: !isSupported("recentDocuments") || recentDocuments.length === 0,
       disabledReason: recentDocuments.length === 0 ? "문서를 열거나 저장하면 최근 문서에 표시됩니다." : undefined,
     },
     separator("before-close"),
-    { id: "close-document", label: "문서 닫기", icon: "close", command: "close-document", disabled: !state.hasDocument },
-    { id: "exit", label: "끝", icon: "exit", command: "exit-app", disabled: !state.canExit },
+    { id: "close-document", label: "문서 닫기", icon: "close", command: "close-document", disabled: !isSupported("closeDocument") || !state.hasDocument },
+    { id: "exit", label: "끝", icon: "exit", command: "exit-app", disabled: !isSupported("exit") || !state.canExit },
   ];
 }
-
