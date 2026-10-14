@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hanul rendering backend PoC</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #777; font: 12px sans-serif; }
+    #stage { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+    .page { width: 794px; height: 1123px; flex: none; overflow: hidden; background: white; }
+    .page svg, .page canvas { display: block; width: 794px; height: 1123px; }
+    #result { position: fixed; left: -10000px; top: 0; white-space: pre; }
+  </style>
+</head>
+<body>
+  <main id="stage"></main>
+  <pre id="result">pending</pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const mode = params.get("mode") === "canvas" ? "canvas" : "svg";
+    const PAGE_COUNT = 100;
+    const VIEWPORT_PAGES = 6;
+    const WIDTH = 794;
+    const HEIGHT = 1123;
+    const FONT_FAMILY = '"Malgun Gothic", Arial, sans-serif';
+    const stage = document.querySelector("#stage");
+    const resultElement = document.querySelector("#result");
+
+    const imageSource = document.createElement("canvas");
+    imageSource.width = 192;
+    imageSource.height = 112;
+    const imageSourceContext = imageSource.getContext("2d");
+    const imageGradient = imageSourceContext.createLinearGradient(0, 0, 192, 112);
+    imageGradient.addColorStop(0, "#bdd0df");
+    imageGradient.addColorStop(1, "#435b73");
+    imageSourceContext.fillStyle = imageGradient;
+    imageSourceContext.fillRect(0, 0, 192, 112);
+    imageSourceContext.fillStyle = "rgba(255,255,255,.75)";
+    imageSourceContext.fillRect(18, 18, 76, 28);
+    imageSourceContext.fillStyle = "#c97742";
+    imageSourceContext.beginPath();
+    imageSourceContext.arc(148, 64, 27, 0, Math.PI * 2);
+    imageSourceContext.fill();
+    const imageUrl = imageSource.toDataURL("image/png");
+    const testImage = new Image();
+    testImage.src = imageUrl;
+    await testImage.decode();
+    await document.fonts.ready;
+
+    function pageScene(pageIndex) {
+      const items = [
+        { type: "rect", x: 64, y: 54, width: 666, height: 1, fill: "#aab3bd" },
+        { type: "text", x: 64, y: 42, text: `Hanul 공통 페이지 표시 목록 · ${pageIndex + 1}쪽`, size: 13, weight: 600, fill: "#24374a" },
+        { type: "text", x: 64, y: 104, text: "한글과 English가 함께 있는 문서 조판 샘플", size: 22, weight: 700, fill: "#17212b" },
+        { type: "image", x: 542, y: 130, width: 188, height: 110 },
+        { type: "path", points: [[64, 260], [124, 224], [188, 264], [248, 226], [310, 260]], stroke: "#496982", width: 2 },
+      ];
+
+      const paragraphText = [
+        "문서 렌더링은 Unicode 텍스트를 글리프 위치와 줄 상자로 정리한 뒤 화면에 그립니다.",
+        "HWP/HWPX 페이지에는 문자 모양, 문단 간격, 표 선, 그림과 쪽 나눔이 함께 놓입니다.",
+        "This paragraph mixes Latin words, punctuation, numbers (2026), and 한글 조판 characters.",
+        "사용자가 확대하거나 스크롤할 때 보이는 쪽만 다시 그리는 비용을 관찰합니다.",
+      ];
+      for (let line = 0; line < 22; line += 1) {
+        items.push({
+          type: "text",
+          x: 64,
+          y: 302 + line * 22,
+          text: `${paragraphText[line % paragraphText.length]}  [${pageIndex + 1}.${line + 1}]`,
+          size: line % 7 === 0 ? 15 : 13,
+          weight: line % 7 === 0 ? 600 : 400,
+          fill: "#20262c",
+        });
+      }
+
+      const tableX = 64;
+      const tableY = 830;
+      const colWidth = 133;
+      const rowHeight = 30;
+      const columns = 5;
+      const rows = 8;
+      items.push({ type: "rect", x: tableX, y: tableY, width: colWidth * columns, height: rowHeight, fill: "#e8edf2" });
+      for (let row = 0; row <= rows; row += 1) {
+        items.push({
+          type: "line", x1: tableX, y1: tableY + row * rowHeight,
+          x2: tableX + colWidth * columns, y2: tableY + row * rowHeight,
+          stroke: "#798795", width: 1,
+        });
+      }
+      for (let column = 0; column <= columns; column += 1) {
+        items.push({
+          type: "line", x1: tableX + column * colWidth, y1: tableY,
+          x2: tableX + column * colWidth, y2: tableY + rows * rowHeight,
+          stroke: "#798795", width: 1,
+        });
+      }
+      for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < columns; column += 1) {
+          items.push({
+            type: "text", x: tableX + column * colWidth + 7,
+            y: tableY + row * rowHeight + 20,
+            text: row === 0 ? ["항목", "내용", "쪽", "형식", "상태"][column] : `${column + 1}-${row} 한글`,
+            size: 11, weight: row === 0 ? 600 : 400, fill: "#263746",
+          });
+        }
+      }
+      items.push({ type: "text", x: 64, y: 1100, text: `표·벡터·래스터 샘플  |  page ${pageIndex + 1}`, size: 11, weight: 400, fill: "#59636d" });
+      return items;
+    }
+
+    const pages = Array.from({ length: PAGE_COUNT }, (_, index) => pageScene(index));
+    const xmlEscape = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+    function renderSvg(items) {
+      const body = items.map((item) => {
+        if (item.type === "rect") return `<rect x="${item.x}" y="${item.y}" width="${item.width}" height="${item.height}" fill="${item.fill}"/>`;
+        if (item.type === "line") return `<path d="M${item.x1} ${item.y1}L${item.x2} ${item.y2}" fill="none" stroke="${item.stroke}" stroke-width="${item.width}"/>`;
+        if (item.type === "path") {
+          const [first, ...rest] = item.points;
+          const data = `M${first[0]} ${first[1]} ${rest.map(([x, y]) => `L${x} ${y}`).join(" ")}`;
+          return `<path d="${data}" fill="none" stroke="${item.stroke}" stroke-width="${item.width}"/>`;
+        }
+        if (item.type === "image") return `<image x="${item.x}" y="${item.y}" width="${item.width}" height="${item.height}" href="${imageUrl}"/>`;
+        return `<text x="${item.x}" y="${item.y}" font-family="${xmlEscape(FONT_FAMILY)}" font-size="${item.size}" font-weight="${item.weight}" fill="${item.fill}">${xmlEscape(item.text)}</text>`;
+      }).join("");
+      return `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}"><rect width="${WIDTH}" height="${HEIGHT}" fill="white"/>${body}</svg>`;
+    }
+
+    function renderCanvas(canvas, items) {
+      canvas.width = WIDTH;
+      canvas.height = HEIGHT;
+      const context = canvas.getContext("2d", { alpha: false });
+      context.fillStyle = "white";
+      context.fillRect(0, 0, WIDTH, HEIGHT);
+      for (const item of items) {
+        if (item.type === "rect") {
+          context.fillStyle = item.fill;
+          context.fillRect(item.x, item.y, item.width, item.height);
+        } else if (item.type === "line") {
+          context.beginPath();
+          context.moveTo(item.x1, item.y1);
+          context.lineTo(item.x2, item.y2);
+          context.strokeStyle = item.stroke;
+          context.lineWidth = item.width;
+          context.stroke();
+        } else if (item.type === "path") {
+          context.beginPath();
+          context.moveTo(item.points[0][0], item.points[0][1]);
+          for (const [x, y] of item.points.slice(1)) context.lineTo(x, y);
+          context.strokeStyle = item.stroke;
+          context.lineWidth = item.width;
+          context.stroke();
+        } else if (item.type === "image") {
+          context.drawImage(testImage, item.x, item.y, item.width, item.height);
+        } else {
+          context.font = `${item.weight} ${item.size}px ${FONT_FAMILY}`;
+          context.fillStyle = item.fill;
+          context.fillText(item.text, item.x, item.y);
+        }
+      }
+    }
+
+    function drawPage(pageIndex) {
+      const wrapper = document.createElement("section");
+      wrapper.className = "page";
+      wrapper.dataset.page = String(pageIndex + 1);
+      if (mode === "svg") {
+        const svg = renderSvg(pages[pageIndex]);
+        wrapper.innerHTML = svg;
+        return { wrapper, bytes: new TextEncoder().encode(svg).byteLength };
+      }
+      const canvas = document.createElement("canvas");
+      renderCanvas(canvas, pages[pageIndex]);
+      wrapper.append(canvas);
+      return { wrapper, bytes: 0 };
+    }
+
+    function measureWindow(startPage, count) {
+      stage.replaceChildren();
+      let serializedBytes = 0;
+      for (let index = startPage; index < Math.min(startPage + count, PAGE_COUNT); index += 1) {
+        const rendered = drawPage(index);
+        serializedBytes += rendered.bytes;
+        stage.append(rendered.wrapper);
+      }
+      return serializedBytes;
+    }
+
+    const startedAt = performance.now();
+    const firstPageBytes = measureWindow(0, 1);
+    const firstPageMs = performance.now() - startedAt;
+
+    const viewportStartedAt = performance.now();
+    const viewportSvgBytes = measureWindow(0, VIEWPORT_PAGES);
+    const viewportSixPagesMs = performance.now() - viewportStartedAt;
+    const viewportDomNodes = stage.querySelectorAll("*").length;
+
+    const repeatWindowMs = [];
+    for (let start = VIEWPORT_PAGES; start < VIEWPORT_PAGES * 6; start += VIEWPORT_PAGES) {
+      const windowStartedAt = performance.now();
+      measureWindow(start, VIEWPORT_PAGES);
+      repeatWindowMs.push(performance.now() - windowStartedAt);
+    }
+
+    let fullDocumentBytes = 0;
+    const fullDocumentStartedAt = performance.now();
+    for (let start = 0; start < PAGE_COUNT; start += VIEWPORT_PAGES) {
+      fullDocumentBytes += measureWindow(start, VIEWPORT_PAGES);
+    }
+    const fullDocumentWindowedMs = performance.now() - fullDocumentStartedAt;
+    measureWindow(0, VIEWPORT_PAGES);
+    const gc = globalThis.gc;
+    if (typeof gc === "function") gc();
+    const memory = performance.memory ? {
+      usedJsHeapBytes: performance.memory.usedJSHeapSize,
+      totalJsHeapBytes: performance.memory.totalJSHeapSize,
+    } : null;
+    const canvasBytesPerPage = WIDTH * HEIGHT * 4;
+    const result = {
+      mode,
+      browser: navigator.userAgent,
+      devicePixelRatio: window.devicePixelRatio,
+      pageCount: PAGE_COUNT,
+      viewportPages: VIEWPORT_PAGES,
+      pagePixels: `${WIDTH}x${HEIGHT}`,
+      displayListOperationsPerPage: pages[0].length,
+      firstPageMs: Number(firstPageMs.toFixed(2)),
+      firstPageSerializedSvgBytes: firstPageBytes,
+      viewportSixPagesMs: Number(viewportSixPagesMs.toFixed(2)),
+      viewportSerializedSvgBytes: viewportSvgBytes,
+      viewportDomNodeCount: viewportDomNodes,
+      averageRepeatedWindowMs: Number((repeatWindowMs.reduce((sum, value) => sum + value, 0) / repeatWindowMs.length).toFixed(2)),
+      repeatedWindowSamplesMs: repeatWindowMs.map((value) => Number(value.toFixed(2))),
+      fullDocumentWindowedMs: Number(fullDocumentWindowedMs.toFixed(2)),
+      fullDocumentSerializedSvgBytes: fullDocumentBytes,
+      retainedCanvasBackingBytesForViewport: mode === "canvas" ? canvasBytesPerPage * Math.min(VIEWPORT_PAGES, PAGE_COUNT) : 0,
+      canvasBackingBytesPerPage: mode === "canvas" ? canvasBytesPerPage : 0,
+      jsMemory: memory,
+      memoryScope: "Chromium performance.memory JS heap only; canvas backing-store size is separately estimated.",
+      renderingScope: "Display-list-to-browser-renderer only; repeated viewport timing measures synchronous build/draw submission, not a real desktop scroll/compositor frame. No RHWP layout, React commit, Tauri IPC, or page parsing.",
+    };
+    resultElement.textContent = JSON.stringify(result);
+    document.body.dataset.done = "true";
+  </script>
+</body>
+</html>
