@@ -2418,10 +2418,10 @@ function serializePlainTextWithRhwpInternal(
 }
 
 /**
- * Produces a diagnostic HWP candidate for structural tests. A pre-margin-fix,
- * isolated one-textbox Korean candidate opened in Hanword 2024, but the current
- * margin-preserving output and mixed-content/resized/moved/styled cases remain
- * unverified. User saves stay blocked until a safe subset is verified end to end.
+ * Produces a diagnostic HWP candidate for structural tests. An isolated Korean
+ * textbox candidate with the current margin-preserving output opened and rendered
+ * in Hanword 2024's GUI. Mixed-content/resized/moved/styled cases and the normal
+ * application save workflow remain unverified, so user saves stay blocked.
  */
 function exportHwpTextBoxViaHwpx(document: HwpDocument): DocumentExport {
   const intermediate = document.exportHwpxWithReport();
