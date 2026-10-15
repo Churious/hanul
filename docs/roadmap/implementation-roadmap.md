@@ -21,14 +21,14 @@
 | 순서 | 마일스톤 | 우선순위 / 규모 | 대상 ID | 의존성 | 완료 증거 |
 | ---: | --- | --- | --- | --- | --- |
 | 0 | 호환성 게이트와 fixture 기준선 | P0 / L | FIL-04, FIL-07, XPL-04 | 기존 엔진 어댑터와 현재 Compatibility Validator | 단순/복합 HWP/HWPX corpus, 기능별 허용·차단 사유, Golden 구조 비교, 저장 실패 원본 보호 및 왕복 테스트 |
-| 1 | 입력·커서·명령 기본기 | P0 / L | EDT-01, EDT-02, EDT-05, EDT-06, EDT-09, VW-01, VW-02, XPL-01, XPL-02, XPL-03, XPL-06 | M0의 손실 없는 편집 가능 경로 | Windows Microsoft IME와 Linux IBus/Fcitx5 실제 조합, 커서/선택/클립보드/Undo/Redo GUI 테스트; 취소·확정 중복, Esc/Backspace/Enter 포함 |
+| 1 | 입력·커서·명령 기본기 | P0 / L | EDT-01, EDT-02, EDT-05, EDT-06, EDT-09, VW-01, VW-02, VW-05, XPL-01, XPL-02, XPL-03, XPL-06 | M0의 손실 없는 편집 가능 경로 | Windows Microsoft IME와 Linux IBus/Fcitx5 실제 조합, 커서/선택/클립보드/Undo/Redo GUI 테스트; 취소·확정 중복, Esc/Backspace/Enter 포함 |
 | 2 | 문자·문단 서식과 스타일 | P0 / L | FMT-01–FMT-05, FMT-07, FIL-09 | M0, M1; 엔진 표현·직렬화에 쓸 수 있는 포맷 속성 표 | 혼합 한글/영문 범위, 문단 선택, Undo/Redo, HWP/HWPX 재열기와 저장 손실 경고. Hanword 비교 fixture |
-| 3 | 표 편집 및 보존 | P0 / XL | INS-01, TBL-01–TBL-06, TBL-07 | M0–M2; 표/셀 모델, 페이지 배치, 어댑터 | 병합·분할·행열·테두리/배경/크기, 여러 쪽 걸침, Tab 입력, 취소/재실행, HWP/HWPX 재열기 및 Windows 한글 2024 표시 |
+| 3 | 표 편집 및 보존 | P0 / XL | INS-01, TBL-01–TBL-06 | M0–M2; 표/셀 모델, 페이지 배치, 어댑터 | 병합·분할·행열·테두리/배경/크기, 여러 쪽 걸침, Tab 입력, 취소/재실행, HWP/HWPX 재열기 및 Windows 한글 2024 표시 |
 | 4 | 용지·쪽 구성과 머리말/꼬리말 | P0 / XL | FIL-13, PAG-01, PAG-02, PAG-07–PAG-09 | M0–M3; 페이지네이션과 필드 보존 | 여백/방향/페이지 나누기/쪽 번호/홀짝 머리말·꼬리말과 필드, 저장 전후 쪽 수·위치 비교 |
 | 5 | 그림·도형·글상자 핵심 편집 | P0 / XL | INS-02, INS-05, INS-06, OBJ-01–OBJ-04, PIC-01, PIC-02, PIC-04 | M0–M3; 앵커·좌표·텍스트 배치 모델 | 이동·크기·선택·삭제/Undo, 비율·배치, 겹침/클리핑 및 개체 혼합 fixture, HWP/HWPX 보존 게이트, 한글 2024 재열기 |
 | 6 | 저장·인쇄·PDF 품질 확정 | P0 / L | FIL-14, XPL-04, XPL-05, XPL-06 | M0–M5; 공통 조판/출력 경로 | 35/98/500쪽 문서에서 편집 반응성; PDF 페이지 수·용지·글꼴·표·그림 검증; Windows/Linux 결과와 프린터 종속성 기록 |
 | 7 | 문서 탐색·고급 편집 | P1 / L | EDT-03, EDT-04, EDT-07, EDT-08, VW-04–VW-09, VW-12, INS-09–INS-13, INS-17–INS-18, FMT-08–FMT-09, FMT-11–FMT-12 | M1–M6; 이벤트/필드/서식 표현 | 메모·책갈피·하이퍼링크·각주, 탐색/개요/표시 패널의 모델 편집 및 round-trip, 범위별 검색, 문서 탐색 키보드 접근성 |
-| 8 | 복합 쪽·표·그림 기능 | P1 / XL | PAG-03–PAG-06, PAG-10, PAG-13, TBL-08–TBL-10, PIC-03, PIC-05, OBJ-05 | M3–M6; 구역과 앵커/컨테이너 레이아웃 | 다단·구역·바탕쪽, 줄 번호, 표 도구/스타일, 이미지 크롭·캡션, 개체 정렬을 개별 Golden 및 한글 2024에서 확인 |
+| 8 | 복합 쪽·표·그림 기능 | P1 / XL | PAG-03–PAG-06, PAG-10, PAG-13, TBL-07–TBL-10, PIC-03, PIC-05, OBJ-05 | M3–M6; 구역과 앵커/컨테이너 레이아웃 | 다단·구역·바탕쪽, 줄 번호, 표 분할·도구/스타일, 이미지 크롭·캡션, 개체 정렬을 개별 Golden 및 한글 2024에서 확인 |
 | 9 | 검토·맞춤법·문서 생성 도구 | P1 / L | REV-01–REV-05, TLS-01, TLS-02, TLS-04, TLS-08, TLS-09, TLS-11, FIL-02–FIL-03 | M0–M8; 변경 추적용 작업 이력과 안정적인 스타일/필드 | 변경 추적 적용/거부, 비교 결과, 목차·색인 갱신, 맞춤법 사전 라이선스/오프라인, 개인정보 마스킹 회귀 |
 | 10 | 선택형 고급 기능 | P2 / L–XL | FIL-05–FIL-06, FIL-08, FIL-10, EDT-10, INS-03–INS-04, INS-07–INS-08, INS-15–INS-16, FMT-10, PAG-11–PAG-12, TBL-11–TBL-12, PIC-06, TLS-03, TLS-05, TLS-10, TLS-12–TLS-14, SEC-01, SEC-04 | 핵심 M0–M9와 문서 보안/확장 인터페이스 | 개별 수요와 라이선스/보안 검토를 통과한 기능만 추가. 한 기능이 다른 형식의 데이터 손실이나 OS 전용 경로를 만들지 않는 테스트 |
 
@@ -42,8 +42,8 @@ M0은 제품 작업에 앞서 편집 가능 여부뿐 아니라 저장 후 보�
 
 | 우선순위 | ID |
 | --- | --- |
-| P0 | FIL-01, FIL-04, FIL-07, FIL-09, FIL-13–FIL-15; EDT-01–EDT-02, EDT-05–EDT-06, EDT-09; VW-01–VW-03; INS-01–INS-02, INS-05–INS-06, INS-14; FMT-01–FMT-05, FMT-07; PAG-01–PAG-02, PAG-07–PAG-09; TBL-01–TBL-06; PIC-01–PIC-02, PIC-04; OBJ-01–OBJ-04; XPL-01–XPL-06 |
-| P1 | FIL-02–FIL-03; EDT-03–EDT-04, EDT-07–EDT-08; VW-04–VW-06, VW-08–VW-09, VW-12; INS-09–INS-13, INS-17–INS-18; FMT-06, FMT-08–FMT-09, FMT-11–FMT-12; PAG-03–PAG-06, PAG-10, PAG-13; TBL-07–TBL-10; PIC-03, PIC-05; OBJ-05; REV-01–REV-05; TLS-01–TLS-02, TLS-04, TLS-08–TLS-09, TLS-11; SEC-03 |
+| P0 | FIL-01, FIL-04, FIL-07, FIL-09, FIL-13–FIL-15; EDT-01–EDT-02, EDT-05–EDT-06, EDT-09; VW-01–VW-02, VW-05; INS-01–INS-02, INS-05–INS-06, INS-14; FMT-01–FMT-05, FMT-07; PAG-01–PAG-02, PAG-07–PAG-09; TBL-01–TBL-06; PIC-01–PIC-02, PIC-04; OBJ-01–OBJ-04; XPL-01–XPL-06 |
+| P1 | FIL-02–FIL-03; EDT-03–EDT-04, EDT-07–EDT-08; VW-03–VW-04, VW-06, VW-08–VW-09, VW-12; INS-09–INS-13, INS-17–INS-18; FMT-06, FMT-08–FMT-09, FMT-11–FMT-12; PAG-03–PAG-06, PAG-10, PAG-13; TBL-07–TBL-10; PIC-03, PIC-05; OBJ-05; REV-01–REV-05; TLS-01–TLS-02, TLS-04, TLS-08–TLS-09, TLS-11; SEC-03 |
 | P2 | FIL-05–FIL-06, FIL-08, FIL-10; EDT-10; VW-07, VW-10–VW-11; INS-03–INS-04, INS-07–INS-08, INS-15–INS-16; FMT-10; PAG-11–PAG-12; TBL-11–TBL-12; PIC-06; TLS-03, TLS-05, TLS-10, TLS-12–TLS-14; SEC-01, SEC-04 |
 | OUT_OF_SCOPE | FIL-11, FIL-12; TLS-06–TLS-07; SEC-02. COM 전용 확장은 제외하며 일반 사용자 환경 설정은 P2에서 다룬다. |
 
