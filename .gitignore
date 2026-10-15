@@ -50,6 +50,8 @@ core.*
 *.hml
 *.pdf
 !.github/**/*.pdf
+# Hanul-generated compatibility golden used by the textbox HWP regression test.
+!apps/desktop/test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp
 
 # Private local document corpora and scratch exports
 /private-documents/

@@ -1138,6 +1138,39 @@ describe("RHWP document session", () => {
     }
   });
 
+  it("matches the Hanword-2024-verified body plus single-text-box HWP golden structure", async () => {
+    const bytes = new Uint8Array(
+      await readFile(new URL("../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp", import.meta.url)),
+    );
+    const document = new HwpDocument(bytes);
+    const session = wrapHwpDocument(document);
+    try {
+      expect(session.pageCount).toBe(1);
+      expect(session.searchText("본문 앞의 일반 문단입니다.")).toHaveLength(1);
+      expect(session.searchText("HWP5 글상자 재현")).toHaveLength(1);
+
+      const textBoxes = session.listObjects(0).filter((object) => object.kind === "textBox");
+      expect(textBoxes).toHaveLength(1);
+      const properties = JSON.parse(
+        document.getShapeProperties(0, textBoxes[0]!.paragraphIndex, textBoxes[0]!.controlIndex),
+      ) as Record<string, number>;
+      // The fixture was opened, edited, saved-as, and reopened in Hanword 2024.
+      // These HWP units correspond to the geometry and 2 mm margins read in its dialogs.
+      expect(properties).toMatchObject({
+        width: 14173,
+        height: 6803,
+        horzOffset: 21895,
+        vertOffset: 5669,
+        tbMarginLeft: 567,
+        tbMarginRight: 567,
+        tbMarginTop: 567,
+        tbMarginBottom: 567,
+      });
+    } finally {
+      session.dispose();
+    }
+  });
+
   it("keeps cropped pictures on the RHWP compatibility path instead of importing them lossily", async () => {
     const source = HwpDocument.createEmpty();
     let session: DocumentSession | null = null;
