@@ -1016,7 +1016,7 @@ describe("RHWP document session", () => {
     }
   });
 
-  it("edits pictures, ellipses, rectangles, and text boxes in Hanul's independent model with HWP/HWPX round trips", async () => {
+  it("blocks HWP export of text boxes and preserves all independent objects through HWPX round trips", async () => {
     const session = await hanulDocumentEngine.createBlank();
     const reopened: DocumentSession[] = [];
     try {
@@ -1043,6 +1043,12 @@ describe("RHWP document session", () => {
       expect(textCaret.cellPath?.[0]).toMatchObject({ controlIndex: box.controlIndex, cellIndex: 0 });
       session.insertText(textCaret, "독립 글상자 내용");
       expect(session.searchText("글상자 내용")).toHaveLength(1);
+      const textBoxSvg = session.renderPage(0);
+      const textBoxShapeIndex = textBoxSvg.lastIndexOf("<rect x=");
+      const textBoxTextIndex = textBoxSvg.indexOf(">독립 글상자 내용</text>");
+      expect(textBoxShapeIndex).toBeGreaterThanOrEqual(0);
+      expect(textBoxTextIndex).toBeGreaterThan(textBoxShapeIndex);
+      expect(textBoxSvg.match(/독립 글상자 내용/g)).toHaveLength(1);
       session.undo();
       expect(session.searchText("글상자 내용")).toHaveLength(0);
       session.redo();
@@ -1054,7 +1060,8 @@ describe("RHWP document session", () => {
       session.redo();
       expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.textWrap).toBe("BehindText");
 
-      for (const format of ["hwp", "hwpx"] as const) {
+      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP 파일.*HWPX로 저장/u);
+      for (const format of ["hwpx"] as const) {
         const saved = session.exportWithReport(format);
         expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
         const reopenedSession = await hanulDocumentEngine.open(saved.bytes);

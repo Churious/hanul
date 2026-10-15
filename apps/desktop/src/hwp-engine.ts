@@ -2231,6 +2231,9 @@ export function serializePlainTextWithRhwp(
   format: "hwp" | "hwpx",
   pageDefinition: PageDefinition,
 ): ExportResult {
+  if (format === "hwp" && paragraphs.some((paragraph) => paragraph.objects?.some((object) => object.kind === "textBox"))) {
+    throw new Error("글상자가 포함된 HWP 파일은 한글 2024에서 손상 오류가 발생해 저장을 중단했습니다. 글상자를 보존하려면 HWPX로 저장하세요.");
+  }
   if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
   const document = HwpDocument.createEmpty();
   try {

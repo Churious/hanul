@@ -437,11 +437,11 @@ export class HanulTextDocumentSession implements DocumentSession {
     const width = page.width; const height = page.height;
     const textBoxClips = page.objects.filter((object) => object.kind === "textBox")
       .map((object) => `<clipPath id="text-box-${safeSvgId(object.id)}"><rect x="${object.x.toFixed(2)}" y="${object.y.toFixed(2)}" width="${object.width.toFixed(2)}" height="${object.height.toFixed(2)}"/></clipPath>`).join("");
-    const linesSvg = page.lines.map((line) => {
-      const textBox = line.objectControlIndex === undefined ? undefined : page.objects.find((object) => object.paragraphId === line.paragraphId && object.controlIndex === line.objectControlIndex);
+    const renderLine = (line: DisplayTextLine, textBox?: DisplayDocumentObject) => {
       const clip = textBox ? ` clip-path="url(#text-box-${safeSvgId(textBox.id)})"` : "";
       return `<text x="${line.x.toFixed(2)}" y="${line.y.toFixed(2)}" font-family="${escapeXml(line.fontFamily)}, sans-serif" font-size="${line.fontSize}px" font-weight="${line.bold ? 700 : 400}" font-style="${line.italic ? "italic" : "normal"}" text-decoration="${[line.underline ? "underline" : "", line.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || "none"}"${line.textLength ? ` textLength="${line.textLength.toFixed(2)}" lengthAdjust="spacing"` : ""} fill="#161616"${clip}>${escapeXml(line.text)}</text>`;
-    }).join("");
+    };
+    const linesSvg = page.lines.filter((line) => line.objectControlIndex === undefined).map((line) => renderLine(line)).join("");
     const tableSvg = page.tables.flatMap((table) => table.cells.map((cell) => {
       const fill = cell.properties.fillType === "solid" && typeof cell.properties.fillColor === "string" ? cell.properties.fillColor : "#ffffff";
       const side = (name: "borderLeft" | "borderRight" | "borderTop" | "borderBottom", x1: number, y1: number, x2: number, y2: number) => {
@@ -463,9 +463,15 @@ export class HanulTextDocumentSession implements DocumentSession {
       const stroke = escapeXml(object.strokeColor ?? "#202020");
       const strokeWidth = Math.max(0, object.strokeWidth ?? 0.5).toFixed(2);
       const opacity = Math.max(0, Math.min(1, object.opacity ?? 1)).toFixed(3);
-      return object.kind === "ellipse"
+      const shape = object.kind === "ellipse"
         ? `<ellipse cx="${(object.x + object.width / 2).toFixed(2)}" cy="${(object.y + object.height / 2).toFixed(2)}" rx="${(object.width / 2).toFixed(2)}" ry="${(object.height / 2).toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" opacity="${opacity}"/>`
         : `<rect x="${object.x.toFixed(2)}" y="${object.y.toFixed(2)}" width="${object.width.toFixed(2)}" height="${object.height.toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" opacity="${opacity}"/>`;
+      if (object.kind !== "textBox") return shape;
+      const text = page.lines
+        .filter((line) => line.paragraphId === object.paragraphId && line.objectControlIndex === object.controlIndex)
+        .map((line) => renderLine(line, object))
+        .join("");
+      return `${shape}${text}`;
     };
     const orderedObjects = [...page.objects].sort((left, right) => left.zOrder - right.zOrder);
     const behindObjects = orderedObjects.filter((object) => object.textWrap === "BehindText").map(renderObject).join("");
