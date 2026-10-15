@@ -1,0 +1,27 @@
+{
+  "productName": "Hanul V1-02c E2E",
+  "identifier": "org.hanul.word.e2e",
+  "build": {
+    "devUrl": "http://localhost:1422",
+    "beforeDevCommand": "npm run dev"
+  },
+  "app": {
+    "security": {
+      "capabilities": ["e2e"],
+      "csp": "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:1422 ws://localhost:1422 ws://localhost:1423"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Hanul V1-02c E2E",
+        "width": 1360,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

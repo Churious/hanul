@@ -93,7 +93,7 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 | 작업 | 범위 / 크기 | ID 연결 | 선행 조건 | 독립 완료 증거 |
 | --- | --- | --- | --- | --- |
 | V1-01 저장 호환성 기준선 — **COMPLETE** | M. 대표 HWP/HWPX 구조별 판정, 엔진별 게이트와 저장 실패 보호 | FIL-04, FIL-07, XPL-04 | 기존 어댑터·Compatibility Validator | [완료 기록](#v1-01-완료-기록): UI/저장 계층 정책 일치, 재파싱 또는 명시적 차단, 실패 시 원본 바이트 보존 |
-| V1-02 파일 수명주기 — **IN PROGRESS** | M. 새 문서, 열기 오류, 최근 문서, dirty close/exit, 문서 정보 기본 범위 | FIL-01, FIL-04, FIL-09, FIL-15 | V1-01 | [V1-02a](#v1-02-진행-기록)에서 최신 열기 요청 및 미저장 선택 보호, [V1-02b](#v1-02b--저장-트랜잭션-강화)에서 저장 중 수명주기 잠금과 스냅샷 버전 보호를 구현했다. 네이티브 열기/저장·재열기와 종료 흐름의 실제 GUI 검증은 남음 |
+| V1-02 파일 수명주기 — **IN PROGRESS** | M. 새 문서, 열기 오류, 최근 문서, dirty close/exit, 문서 정보 기본 범위 | FIL-01, FIL-04, FIL-09, FIL-15 | V1-01 | [V1-02a](#v1-02-진행-기록), [V1-02b](#v1-02b--저장-트랜잭션-강화), [V1-02c](#v1-02c--데스크톱-파일-수명주기-e2e) 참조. Windows Tauri 네이티브 열기/저장·재열기와 최근 문서·dirty 보호·종료의 반복 가능한 GUI E2E는 통과했으나, 저장 도중 추가 편집, 실제 늦은 파싱 경합, NTFS ACL 실패, Linux GUI 및 종료 Save는 아직 실 GUI에서 검증되지 않음 |
 | V1-03 편집 명령 통합 | L. 선택·캐럿, 클립보드, Undo/Redo와 단축키를 같은 명령 경로로 통합 | EDT-01, EDT-02, EDT-05, EDT-09, XPL-01, XPL-03, XPL-06 | V1-01, V1-02 | 본문·여러 문단·표 셀 테스트; GUI 키보드/마우스 동작과 Undo 결과 확인 |
 | V1-04 실제 OS IME | L. composition 생명주기와 모델 반영을 통합 검증 | XPL-02, EDT-01, XPL-01 | V1-03 | Windows Microsoft IME와 실제 Linux 데스크톱 IBus; Fcitx5 별도 결과. 확정 문자 모델/저장 파일에 한 번만 반영 |
 | V1-05 보기·좌표 | S/M. 배율, 쪽 보기, 눈금자 표시와 편집 좌표 일치 | VW-01, VW-02, VW-05, XPL-01 | V1-03 | 확대/축소와 보기 변경 뒤 caret/selection 및 페이지 경계가 맞는 GUI 회귀 |
@@ -166,3 +166,14 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 - GUI 검증: Windows 격리 release 앱은 실행과 첫 화면을 캡처했지만 Computer Use 클릭이 앱의 `msedgewebview2.exe` “Chrome Legacy Window”로 전달됐다. 대상 창 재활성화 후 한 번 다시 관찰해도 변화가 없어 조작을 중단했다. Linux Ubuntu 26.04 WSLg에서는 임시 frontend copy로 Tauri 창을 실행하고 페이지가 보이는 첫 화면 및 네이티브 GTK 열기 대화상자를 확인했다. 다만 파일 선택 입력 뒤 포커스를 잃고 캡처가 검게 나와 선택·열기를 중단했다. 이 검은 캡처는 창 렌더링 실패의 증거가 아니다. 어느 쪽에서도 실제 디스크 저장, HWP/HWPX 재열기, 최근 경로 및 종료 경고는 GUI로 확인하지 못했다.
 - 기존 자동 테스트는 HWP/HWPX 제품 세션 왕복, Rust 원자 저장 및 저장 실패 시 원본 유지, 최근 경로 저장/중복 제거/삭제 테스트를 계속 통과한다. 이 결과는 Tauri 네이티브 대화상자를 통한 실제 사용자 경로 검증을 대체하지 않는다.
 - 남음: Windows Tauri에서 새 문서 저장·닫기·재열기, 기존 HWP/HWPX 수정·다른 이름 저장·재열기, 저장 취소/권한 실패, 최근 경로 재열기/끊어진 경로, 창 종료 Save/Discard/Cancel 조합. Linux WSLg에서는 창과 네이티브 열기 대화상자 표시까지만 확인했으며 파일 선택 이후 수명주기는 미검증이다. 따라서 V1-02 및 FIL-01/04/09/15는 계속 PARTIAL이다.
+
+### V1-02c — 데스크톱 파일 수명주기 E2E
+
+**상태: PARTIAL (2026-10-16).** Windows 데스크톱 경로는 아래 범위에서 직접 검증했지만 V1-02 전체 완료 조건을 충족하지 않았다.
+
+- 테스트 인프라: 별도 Tauri 2 E2E 설정(`org.hanul.word.e2e`, 별도 포트/창 제목/임시 저장소)에서 debug 전용 W3C WebDriver를 사용한다. WebView 명령은 WebDriver, 네이티브 Windows 파일 대화상자는 대상 테스트 앱의 owned popup만 확인하는 UI Automation helper로 분리했다. E2E 파일 시스템 capability는 생성된 테스트 임시 디렉터리로 제한하며, release에서 `webdriver-e2e` feature 사용을 빌드 오류로 막는다. 반복 실행법과 제한은 [`desktop-file-lifecycle-e2e.md`](../testing/desktop-file-lifecycle-e2e.md)에 기록했다.
+- Windows 11 Tauri GUI E2E: 11개 시나리오, 20개 단언, 0 failed. 새 문서→입력→HWPX 저장→닫기→재열기; 기존 검증 HWP fixture 열기→수정→다른 이름으로 HWP 저장→재열기; 최근 문서 재열기와 누락 경로 제거; 미저장 문서 닫기 Cancel/Save, 새 문서 Discard, 파일 대화상자 취소, 저장 오류 후 dirty 유지, OS 창 닫기 Cancel, 저장 대화상자가 열린 동안 OS 창 닫기 요청 후 저장 완료/닫기 및 재열기, 앱 종료 Cancel/Discard를 확인했다. 저장된 파일은 앱으로 다시 열어 marker가 실제 페이지에 표시되는 것을 검사했다.
+- E2E 저장 실패 케이스는 별도 capability 범위 밖의 임시 경로에 대한 Tauri 파일 시스템 권한 거부다. 실제 NTFS ACL/읽기전용 디렉터리 권한 오류 검증은 아니다. HWP Save As는 단일 글상자 Golden fixture를 이용한 Hanul 왕복이며 한글 2024 직접 검증을 새로 수행하지 않았다.
+- 자동 검증은 기존 `LatestDocumentLoad`, stale session dispose, `DocumentSaveLock`, edit revision 정책 단위 테스트와 Tauri 저장 백엔드 테스트를 보완하는 목적이다. 실제 GUI의 파싱 완료 역전 경합, 디스크 commit 지연 중 편집, 앱 종료 Save, 저장 중 문서 전환 경합 전체는 아직 재현하지 않았다.
+- Linux: Ubuntu 26.04 WSL2의 프런트엔드 111/111, build, Rust 16 passed / 1 ignored, native `cargo build`를 통과했다. Linux `/tmp` 여유가 133 MiB(99%)여서 출력과 임시 파일은 Windows temp 마운트에 두었다. WSLg에서 WebDriver-enabled Tauri 앱을 실제 기동해 편집 화면과 입력 마커 렌더링을 확인했다. GTK/portal Save picker에 경로를 입력했지만 포커스가 앱으로 돌아오지 않아 Save가 pending 상태로 남고 파일이 생기지 않았다. 따라서 Linux GUI 저장·재열기 시나리오는 성공으로 세지 않았으며, 현재 E2E 명령은 이 플랫폼에서 실행 전에 명시적으로 중단한다. 기존 `.linux-validation-objects-20261015`와 사용자 데이터는 수정·삭제하지 않았다. 일반 X11/Wayland 데스크톱 동작도 검증하지 않았다.
+- 다음 작업: Linux 전용 GUI 자동화 또는 AT-SPI 기반 dialog driver를 마련해 WSLg 저장·재열기를 확인하고, 일반 Linux 세션은 별도로 검증한다. 테스트 전용 저장 지연 주입으로 edit-during-save/열기 완료 역전 시나리오를 GUI에서 확인한다. 앱 종료 Save와 실제 OS 권한 거부도 별도로 추가한다. 그 전까지 V1-02 및 FIL-01/04/09/15는 PARTIAL 유지.

@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "e2e",
+  "description": "Development-only permission set for the isolated desktop lifecycle E2E app",
+  "windows": ["main"],
+  "permissions": [
+    "wdio-webdriver:default",
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "fs:allow-read-file",
+    "fs:allow-stat",
+    "fs:allow-write-file",
+    {
+      "identifier": "fs:scope",
+      "allow": [{ "path": "$TEMP/hanul-v102c-e2e-*/*" }]
+    }
+  ]
+}

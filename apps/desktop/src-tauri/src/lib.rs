@@ -1,3 +1,6 @@
+#[cfg(all(feature = "webdriver-e2e", not(debug_assertions)))]
+compile_error!("webdriver-e2e is only available in debug builds; never ship the test server");
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -818,9 +821,14 @@ fn write_atomically(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    #[cfg(feature = "webdriver-e2e")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             export_pdf,
             commit_document_save,

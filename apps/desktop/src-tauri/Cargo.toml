@@ -15,6 +15,9 @@ edition = "2024"
 name = "hanul_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+webdriver-e2e = ["dep:tauri-plugin-wdio-webdriver"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -24,6 +27,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 rhwp = { git = "https://github.com/edwardkim/rhwp", tag = "v0.8.7" }
+tauri-plugin-wdio-webdriver = { version = "1.5.0", optional = true }
 
 [dev-dependencies]
 png = "0.18"

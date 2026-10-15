@@ -183,7 +183,17 @@ function getBaseName(path: string) {
 
 function errorDetail(cause: unknown, fallback: string) {
   if (cause instanceof Error) return cause.message;
-  return typeof cause === "string" && cause ? cause : fallback;
+  if (typeof cause === "string" && cause) return cause;
+  if (cause && typeof cause === "object") {
+    if ("message" in cause && typeof cause.message === "string" && cause.message) return cause.message;
+    try {
+      const serialized = JSON.stringify(cause);
+      if (serialized && serialized !== "{}") return serialized.slice(0, 500);
+    } catch {
+      // Fall through to the user-facing fallback for non-serializable errors.
+    }
+  }
+  return fallback;
 }
 
 function reportAppPerformance(phase: string, details: Record<string, number | string>) {
@@ -1208,7 +1218,7 @@ function App() {
         setMessage("문서를 저장했습니다.");
         return true;
       } catch (cause) {
-        setMessage(cause instanceof Error ? `저장하지 못했습니다. (${cause.message})` : "문서를 저장하지 못했습니다.");
+        setMessage(`저장하지 못했습니다. (${errorDetail(cause, "알 수 없는 오류")})`);
         return false;
       }
     },
@@ -1287,7 +1297,7 @@ function App() {
         }
       }
     } catch (cause) {
-      setMessage(cause instanceof Error ? `저장을 준비하지 못했습니다. (${cause.message})` : "저장을 준비하지 못했습니다.");
+      setMessage(`저장을 준비하지 못했습니다. (${errorDetail(cause, "알 수 없는 오류")})`);
     } finally {
       endSaveTransaction();
     }

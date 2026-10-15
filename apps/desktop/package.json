@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "test:e2e:desktop": "node e2e/run-desktop-e2e.mjs",
     "benchmark:open": "node --expose-gc scripts/benchmark-open.mjs",
     "benchmark:render": "node scripts/rendering-benchmark.mjs",
     "benchmark:editor-engine": "node scripts/benchmark-editor-engine.mjs",
