@@ -84,4 +84,25 @@ Hanul checks header/footer paragraphs before offering the exported bytes for sav
 
 ## Linux GUI validation scope
 
-The Linux test/build target is Ubuntu 26.04 under WSL2/WSLg (`DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0`, IBus `hangul`). This does not establish compatibility on a standalone X11 or Wayland desktop. GUI results for object edits, file dialogs, IBus model commit, save, and reopen are recorded in `docs/compatibility/matrix.md` after the current WSLg test run.
+The Linux target is Ubuntu 26.04 under WSL2/WSLg (`DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0`). The IBus Hangul engine is installed and listed; when the daemon was started for this task, its active engine remained `xkb:us::eng`. The Linux Tauri window, object drag, and IME composition were not exercised in this task. This does not establish compatibility on a standalone X11 or Wayland desktop. Earlier WSLg GUI smoke tests are scoped in `docs/compatibility/matrix.md` and do not validate the new independent object path.
+
+## Independent picture/shape update probe (2026-10-15)
+
+The independent engine now measures shape insertion and movement in a fresh synthetic document with 44 body paragraphs per page. Each operation records model mutation, incremental layout, page SVG generation, and total synchronous engine-to-SVG time. A changed first-page object invalidated one paragraph and one page at each size. This benchmark does not import a real HWP/HWPX file, run React, or measure a physical key/pointer-to-display frame.
+
+| Runtime / pages | Operation | Model mutation | Incremental layout | SVG generation | Engine to generated SVG |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Windows 11 / 35 | Insert rectangle | 0.13 ms | 0.20 ms | 0.26 ms | 1.19 ms |
+| Windows 11 / 35 | Move rectangle | 0.11 ms | 0.06 ms | 0.08 ms | 0.68 ms |
+| Windows 11 / 98 | Insert rectangle | 0.15 ms | 0.04 ms | 0.12 ms | 0.59 ms |
+| Windows 11 / 98 | Move rectangle | 0.09 ms | 0.02 ms | 0.09 ms | 0.42 ms |
+| Windows 11 / 500 | Insert rectangle | 0.92 ms | 0.04 ms | 0.10 ms | 1.94 ms |
+| Windows 11 / 500 | Move rectangle | 0.50 ms | 0.05 ms | 0.11 ms | 1.77 ms |
+| Ubuntu 26.04 WSL2 / 35 | Insert rectangle | 0.16 ms | 0.18 ms | 0.28 ms | 1.40 ms |
+| Ubuntu 26.04 WSL2 / 35 | Move rectangle | 0.08 ms | 0.05 ms | 0.08 ms | 0.50 ms |
+| Ubuntu 26.04 WSL2 / 98 | Insert rectangle | 0.17 ms | 0.09 ms | 0.13 ms | 0.89 ms |
+| Ubuntu 26.04 WSL2 / 98 | Move rectangle | 0.09 ms | 0.03 ms | 0.07 ms | 0.41 ms |
+| Ubuntu 26.04 WSL2 / 500 | Insert rectangle | 0.82 ms | 0.03 ms | 0.09 ms | 1.73 ms |
+| Ubuntu 26.04 WSL2 / 500 | Move rectangle | 1.16 ms | 0.04 ms | 0.08 ms | 2.25 ms |
+
+These are single test-process observations, not a stable latency distribution. The 500-page Linux move has higher model-mutation time than the other samples and should be repeated before diagnosing it. Process RSS change during fixture construction was 25.4/12.8/90.0 MiB on Windows and 9.8/21.8/44.4 MiB on Linux for 35/98/500 pages; this includes the shared Vitest, WASM and allocator state and is not a per-document memory estimate. `npm test` passed 87 tests and `npm run build` passed on Windows and Ubuntu 26.04 WSL2 (Node 22.22.1, while a few locked dev dependencies request 22.22.2). The Tauri Rust workspace passed `cargo check --workspace --locked` on both Windows and WSL2. The Windows Hanul window was observable in the accessibility tree but its captured client area was black, so no input was sent; this task did not verify a native object drag or collect React/WebKit paint, IME, or physical frame times. No Linux Tauri GUI interaction was run. WSLg availability and an installed Hangul IBus engine alone do not establish those results.

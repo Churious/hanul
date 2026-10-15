@@ -32,4 +32,11 @@ describe("previewObjectDrag", () => {
     expect(previewObjectDrag(object, { x: 180, y: 240 }, { x: 0, y: 0 }, true))
       .toEqual({ x: 100, y: 200, width: 96 / 25.4, height: 96 / 25.4 });
   });
+
+  it("keeps a picture's current aspect ratio while previewing a corner resize", () => {
+    const picture = { ...object, id: "picture-1", kind: "picture" } satisfies DocumentObject;
+    const bounds = previewObjectDrag(picture, { x: 180, y: 240 }, { x: 220, y: 244 }, true);
+    expect(bounds.width / bounds.height).toBeCloseTo(2);
+    expect(bounds).toEqual({ x: 100, y: 200, width: 120, height: 60 });
+  });
 });

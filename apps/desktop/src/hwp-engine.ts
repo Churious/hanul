@@ -28,7 +28,7 @@ import type {
   TableUpdates,
   TextPosition,
 } from "./document-engine";
-import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
+import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextObject, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
 
 export type {
   CellPathSegment,
@@ -87,7 +87,8 @@ interface RawSearchHit {
 interface RawDocumentObject {
   para: number;
   controlIndex: number;
-  kind: "picture" | "shape";
+  kind: string;
+  listId?: number | null;
 }
 
 interface RawObjectCycle {
@@ -105,6 +106,31 @@ interface RawEditableObjectProperties {
   textWrap?: string;
   treatAsChar?: boolean;
   description?: string;
+}
+
+interface RawDocumentControl {
+  ctrlId?: string;
+  para?: number;
+  controlIndex?: number;
+  pos?: number;
+  list?: number;
+}
+
+interface RawLayerTreeNode {
+  bounds?: { x?: number; y?: number; width?: number; height?: number };
+  layer?: { stableIndex?: number; zOrder?: number; textWrap?: string };
+  ops?: Array<Record<string, unknown>>;
+  children?: RawLayerTreeNode[];
+  child?: RawLayerTreeNode;
+}
+
+interface RawObjectLayer {
+  pageIndex: number;
+  stableIndex: number;
+  zOrder: number;
+  textWrap: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  op: Record<string, unknown>;
 }
 
 const OBJECT_TEXT_WRAPS: readonly DocumentObjectTextWrap[] = [
@@ -862,7 +888,7 @@ class RhwpDocumentSession implements DocumentSession {
     });
   }
 
-  insertShape(position: TextPosition, kind: "rectangle" | "textBox", widthMm: number, heightMm: number) {
+  insertShape(position: TextPosition, kind: "rectangle" | "ellipse" | "textBox", widthMm: number, heightMm: number) {
     if (this.isCellPosition(position)) throw new Error("표 셀 안에는 도형을 삽입할 수 없습니다.");
     if (![widthMm, heightMm].every((value) => Number.isFinite(value) && value >= 1)) {
       throw new Error("도형 너비와 높이는 1mm 이상이어야 합니다.");
@@ -880,6 +906,7 @@ class RhwpDocumentSession implements DocumentSession {
         vertOffset: Math.round(position.cursorRect.y * 75),
         treatAsChar: false,
         textWrap: "Square",
+        shapeType: kind === "ellipse" ? "ellipse" : "rectangle",
       }));
       const created = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(raw, "도형 삽입");
       if (!created.ok || !Number.isInteger(created.paraIdx) || !Number.isInteger(created.controlIdx)) {
@@ -902,6 +929,7 @@ class RhwpDocumentSession implements DocumentSession {
     }
     const objects = parseJson<RawDocumentObject[]>(this.document.getObjects(), "문서 개체 목록");
     const cycles = parseJson<RawObjectCycle[]>(this.document.getObjectCycle(), "개체 쪽 위치");
+    const layers = objectLayerIndex(this.document, cycles.map((cycle) => cycle.page));
     return objects.flatMap((item) => {
       if (!Number.isInteger(item.para) || !Number.isInteger(item.controlIndex) || (item.kind !== "picture" && item.kind !== "shape")) return [];
       const cycle = cycles.find((candidate) => candidate.para === item.para && candidate.controlIndex === item.controlIndex);
@@ -913,6 +941,8 @@ class RhwpDocumentSession implements DocumentSession {
         : this.document.getShapeProperties(sectionIndex, item.para, item.controlIndex);
       const props = parseJson<RawEditableObjectProperties>(rawProperties, "문서 개체 속성");
       if (!Number.isFinite(props.width) || !Number.isFinite(props.height)) return [];
+      const layer = (layers.get(`${pageIndex}:${item.controlIndex}`) ?? []).find((entry) => (entry.op.type === "image") === (item.kind === "picture")
+        && ["image", "rectangle", "ellipse"].includes(String(entry.op.type)));
       let bounds = {
         pageIndex,
         x: (Number.isFinite(props.horzOffset) ? props.horzOffset! : 0) / 75,
@@ -920,7 +950,8 @@ class RhwpDocumentSession implements DocumentSession {
         width: props.width! / 75,
         height: props.height! / 75,
       };
-      if (item.kind === "shape") {
+      if (layer) bounds = { pageIndex, ...layer.bounds };
+      else if (item.kind === "shape") {
         try {
           const exact = parseJson<{ pageIndex: number; x: number; y: number; width: number; height: number }>(
             this.document.getShapeBBox(sectionIndex, item.para, item.controlIndex),
@@ -932,7 +963,7 @@ class RhwpDocumentSession implements DocumentSession {
         }
       }
       const hasTextBox = item.kind === "shape" && this.document.getTextBoxControlIndex(sectionIndex, item.para) === item.controlIndex;
-      const kind: DocumentObjectKind = item.kind === "picture" ? "picture" : hasTextBox ? "textBox" : "rectangle";
+      const kind: DocumentObjectKind = item.kind === "picture" ? "picture" : hasTextBox ? "textBox" : layer?.op.type === "ellipse" ? "ellipse" : "rectangle";
       return [{
         id: `${sectionIndex}:${item.para}:${item.controlIndex}:${kind}`,
         kind,
@@ -2240,6 +2271,7 @@ export function serializePlainTextWithRhwp(
       }
       targetParagraphs[index] = targetParagraphIndex;
       if (paragraph.table) {
+        if (paragraph.objects?.length) throw new Error("표 앵커와 개체가 함께 있는 문서는 개체 순서를 안전하게 저장할 수 없습니다.");
         const table = paragraph.table;
         const createdTable = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(
           document.createTable(0, targetParagraphIndex, 0, table.rowCount, table.colCount),
@@ -2328,6 +2360,9 @@ export function serializePlainTextWithRhwp(
         const applied = parseJson<{ ok: boolean }>(document.applyCharFormat(0, targetParagraphIndex, run.start, run.end, JSON.stringify(formatValue)), "글자 서식");
         if (!applied.ok) throw new Error(`${index + 1}번째 문단의 글자 서식을 저장하지 못했습니다.`);
       }
+      for (const object of [...(paragraph.objects ?? [])].sort((left, right) => left.zOrder - right.zOrder)) {
+        serializePlainTextObject(document, targetParagraphIndex, object);
+      }
     }
     document.endBatch();
     const exported = format === "hwp" ? document.exportHwpWithReport() : document.exportHwpxWithReport();
@@ -2350,6 +2385,85 @@ export function serializePlainTextWithRhwp(
     }
   } finally {
     document.free();
+  }
+}
+
+function serializePlainTextObject(document: HwpDocument, paraIndex: number, object: PlainTextObject): void {
+  const width = Math.round(object.widthMm * RHWP_OBJECT_UNITS_PER_MM);
+  const height = Math.round(object.heightMm * RHWP_OBJECT_UNITS_PER_MM);
+  const horzOffset = Math.round(object.offsetXmm * RHWP_OBJECT_UNITS_PER_MM);
+  const vertOffset = Math.round(object.offsetYmm * RHWP_OBJECT_UNITS_PER_MM);
+  if (object.kind === "picture") {
+    if (!object.imageData?.length || !object.imageExtension || !object.naturalWidthPx || !object.naturalHeightPx) {
+      throw new Error("그림 원본 데이터와 크기가 없어 저장할 수 없습니다.");
+    }
+    const raw = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(document.insertPictureEx(JSON.stringify({
+      sectionIdx: 0, paraIdx: paraIndex, charOffset: object.anchorCharOffset,
+      width, height, naturalWidthPx: object.naturalWidthPx, naturalHeightPx: object.naturalHeightPx,
+      extension: object.imageExtension, description: object.description,
+      paperOffsetXHu: horzOffset, paperOffsetYHu: vertOffset,
+    }), object.imageData), "그림 저장");
+    if (!raw.ok || !Number.isInteger(raw.paraIdx) || !Number.isInteger(raw.controlIdx)) throw new Error("그림을 HWP/HWPX 문서에 추가하지 못했습니다.");
+    const properties: Record<string, unknown> = { ...object.properties, width, height, horzOffset, vertOffset, textWrap: object.textWrap, treatAsChar: false, description: object.description };
+    delete properties.instanceId;
+    delete properties.scInstId;
+    delete properties.zOrder;
+    if (!parseJson<{ ok: boolean }>(document.setPictureProperties(0, raw.paraIdx, raw.controlIdx, JSON.stringify(properties)), "그림 속성 저장").ok) {
+      throw new Error("그림 위치·크기·배치 속성을 저장하지 못했습니다.");
+    }
+    return;
+  }
+
+  const shapeType = object.kind === "ellipse" ? "ellipse" : "rectangle";
+  const created = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(document.createShapeControl(JSON.stringify({
+    sectionIdx: 0, paraIdx: paraIndex, charOffset: object.anchorCharOffset,
+    width, height, horzOffset, vertOffset, treatAsChar: false, textWrap: object.textWrap,
+    shapeType, description: object.description,
+  })), "도형 저장");
+  if (!created.ok || !Number.isInteger(created.paraIdx) || !Number.isInteger(created.controlIdx)) throw new Error("도형을 HWP/HWPX 문서에 추가하지 못했습니다.");
+  if (object.kind === "textBox" && !parseJson<{ ok: boolean }>(document.setTextBoxAt(created.paraIdx, created.controlIdx, true), "글상자 저장").ok) {
+    throw new Error("글상자 편집 영역을 문서에 추가하지 못했습니다.");
+  }
+  const properties: Record<string, unknown> = { ...object.properties, width, height, horzOffset, vertOffset, textWrap: object.textWrap, treatAsChar: false, description: object.description };
+  delete properties.instanceId;
+  delete properties.scInstId;
+  delete properties.zOrder;
+  if (!parseJson<{ ok: boolean }>(document.setShapeProperties(0, created.paraIdx, created.controlIdx, JSON.stringify(properties)), "도형 속성 저장").ok) {
+    throw new Error("도형 선·채우기 또는 위치 속성을 저장하지 못했습니다.");
+  }
+  if (object.kind !== "textBox") return;
+  const paragraphs = object.textParagraphs ?? [];
+  if (!paragraphs.length) throw new Error("글상자에는 최소 한 문단이 필요합니다.");
+  for (let cellParaIndex = 0; cellParaIndex < paragraphs.length; cellParaIndex += 1) {
+    const paragraph = paragraphs[cellParaIndex]!;
+    if (cellParaIndex > 0) {
+      const previous = paragraphs[cellParaIndex - 1]!;
+      const splitPath = JSON.stringify([{ controlIndex: created.controlIdx, cellIndex: 0, cellParaIndex: cellParaIndex - 1 }]);
+      if (!parseJson<{ ok: boolean }>(document.splitParagraphInCellByPath(0, created.paraIdx, splitPath, previous.text.length), "글상자 문단 분리").ok) {
+        throw new Error("글상자 문단 구성을 저장하지 못했습니다.");
+      }
+    }
+    const path = JSON.stringify([{ controlIndex: created.controlIdx, cellIndex: 0, cellParaIndex }]);
+    if (paragraph.text && !parseJson<{ ok: boolean }>(document.insertTextInCellByPath(0, created.paraIdx, path, 0, paragraph.text), "글상자 텍스트 저장").ok) {
+      throw new Error("글상자 텍스트를 저장하지 못했습니다.");
+    }
+    if (Object.keys(paragraph.paragraphFormat).length) {
+      const format = { ...paragraph.paragraphFormat };
+      for (const key of ["marginLeft", "marginRight", "indent"] as const) if (typeof format[key] === "number") format[key] = Math.round(format[key]! * 150);
+      if (!parseJson<{ ok: boolean }>(document.applyParaFormatInCell(0, created.paraIdx, created.controlIdx, 0, cellParaIndex, JSON.stringify(format)), "글상자 문단 서식 저장").ok) {
+        throw new Error("글상자 문단 서식을 저장하지 못했습니다.");
+      }
+    }
+    for (const run of paragraph.characterFormats) {
+      if (run.end <= run.start) continue;
+      const format: Record<string, unknown> = { ...run.format };
+      const family = typeof format.fontFamily === "string" ? format.fontFamily : "";
+      delete format.fontFamily;
+      if (family) format.fontIds = Array.from({ length: 7 }, (_, language) => document.findOrCreateFontIdForLang(language, family));
+      if (!parseJson<{ ok: boolean }>(document.applyCharFormatInCellByPath(0, created.paraIdx, path, run.start, run.end, JSON.stringify(format)), "글상자 글자 서식 저장").ok) {
+        throw new Error("글상자 글자 서식을 저장하지 못했습니다.");
+      }
+    }
   }
 }
 
@@ -2385,6 +2499,10 @@ interface PlainTextImportDefaults {
   tableParagraph: Record<string, unknown>;
   tableCharacter: Record<string, unknown>;
   tableStyleAt: Record<string, unknown>;
+  picture: Record<string, unknown>;
+  rectangle: Record<string, unknown>;
+  ellipse: Record<string, unknown>;
+  textBox: Record<string, unknown>;
 }
 
 let plainTextImportDefaults: PlainTextImportDefaults | undefined;
@@ -2397,6 +2515,7 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
     if (!created.version) throw new Error("새 문서 호환성 기준을 만들지 못했습니다.");
     const createdTable = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(blank.createTable(0, 0, 0, 1, 1), "기본 표 기준");
     if (!createdTable.ok) throw new Error("기본 표 기준을 만들지 못했습니다.");
+    const objectDefaults = getDocumentObjectImportDefaults();
     plainTextImportDefaults = {
       paragraph: parseJson(blank.getParaPropertiesAt(0, 0), "기본 문단 서식"),
       character: parseJson(blank.getCharPropertiesAt(0, 0, 0), "기본 글자 서식"),
@@ -2410,6 +2529,7 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
       tableParagraph: parseJson(blank.getCellParaPropertiesAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0), "기본 셀 문단 서식"),
       tableCharacter: parseJson(blank.getCellCharPropertiesAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0, 0), "기본 셀 글자 서식"),
       tableStyleAt: parseJson(blank.getCellStyleAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0), "기본 셀 스타일"),
+      ...objectDefaults,
     };
     return plainTextImportDefaults;
   } finally {
@@ -2417,7 +2537,339 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
   }
 }
 
+const PROBE_PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII="), (character) => character.charCodeAt(0));
+let objectImportDefaults: Pick<PlainTextImportDefaults, "picture" | "rectangle" | "ellipse" | "textBox"> | undefined;
+
+function getDocumentObjectImportDefaults(): Pick<PlainTextImportDefaults, "picture" | "rectangle" | "ellipse" | "textBox"> {
+  if (objectImportDefaults) return objectImportDefaults;
+  const document = HwpDocument.createEmpty();
+  try {
+    const created = parseJson<{ version?: string }>(document.createBlankDocument(), "개체 호환성 기준 문서");
+    if (!created.version) throw new Error("개체 호환성 기준을 만들지 못했습니다.");
+    document.insertPictureEx(JSON.stringify({
+      sectionIdx: 0, paraIdx: 0, charOffset: 0, width: 7200, height: 7200,
+      naturalWidthPx: 1, naturalHeightPx: 1, extension: "png", paperOffsetXHu: 0, paperOffsetYHu: 0,
+    }), PROBE_PNG);
+    const picture = parseJson<RawDocumentObject[]>(document.getObjects(), "기본 그림 개체").find((item) => item.kind === "picture");
+    if (!picture) throw new Error("기본 그림 개체를 만들지 못했습니다.");
+    const pictureProperties = parseJson<Record<string, unknown>>(document.getPictureProperties(0, picture.para, picture.controlIndex), "기본 그림 속성");
+    const shapeProperties = (shapeType: "rectangle" | "ellipse", textBox = false) => {
+      const result = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(document.createShapeControl(JSON.stringify({
+        sectionIdx: 0, paraIdx: 0, charOffset: 0, width: 7200, height: 7200,
+        horzOffset: 0, vertOffset: 0, treatAsChar: false, textWrap: "InFrontOfText", shapeType,
+      })), "기본 도형 개체");
+      if (!result.ok) throw new Error("기본 도형 개체를 만들지 못했습니다.");
+      if (textBox && !parseJson<{ ok: boolean }>(document.setTextBoxAt(result.paraIdx, result.controlIdx, true), "기본 글상자 설정").ok) {
+        throw new Error("기본 글상자 모델을 만들지 못했습니다.");
+      }
+      return parseJson<Record<string, unknown>>(document.getShapeProperties(0, result.paraIdx, result.controlIdx), "기본 도형 속성");
+    };
+    objectImportDefaults = {
+      picture: pictureProperties,
+      rectangle: shapeProperties("rectangle"),
+      ellipse: shapeProperties("ellipse"),
+      textBox: shapeProperties("rectangle", true),
+    };
+    return objectImportDefaults;
+  } finally {
+    document.free();
+  }
+}
+
 type RhwpTableControl = { ctrlId?: string; para?: number; controlIndex?: number };
+
+const OBJECT_LAYER_OPS = new Set(["image", "rectangle", "ellipse"]);
+const COMMON_OBJECT_PROPERTY_DIFFERENCES = new Set([
+  "width", "height", "horzOffset", "vertOffset", "textWrap", "description", "zOrder", "instanceId", "scInstId",
+]);
+const SHAPE_STYLE_PROPERTY_DIFFERENCES = new Set([
+  ...COMMON_OBJECT_PROPERTY_DIFFERENCES,
+  "borderColor", "borderWidth", "borderAttr", "fillType", "fillBgColor", "fillPatColor", "fillPatType", "fillAlpha",
+  "tbMarginLeft", "tbMarginRight", "tbMarginTop", "tbMarginBottom",
+]);
+// RHWP represents an uncropped image's final source pixel as a 75-HU inset
+// from the image extent (1/96 inch at its 96-dpi logical image scale).
+const DEFAULT_IMAGE_CROP_INSET_HU = 75;
+
+function onlySupportedObjectPropertyDifferences(
+  value: Record<string, unknown>,
+  baseline: Record<string, unknown>,
+  allowedDifferences: ReadonlySet<string>,
+): boolean {
+  const keys = new Set([...Object.keys(value), ...Object.keys(baseline)]);
+  return [...keys].every((key) => allowedDifferences.has(key) || stableJson(value[key]) === stableJson(baseline[key]));
+}
+
+function layerTextWrap(value: string | undefined): DocumentObjectTextWrap | undefined {
+  const normalized = value?.replace(/[\s_-]/gu, "").toLowerCase();
+  const values: Record<string, DocumentObjectTextWrap> = {
+    square: "Square", topandbottom: "TopAndBottom", tight: "Tight", through: "Through",
+    behindtext: "BehindText", infrontoftext: "InFrontOfText",
+  };
+  return normalized ? values[normalized] : undefined;
+}
+
+function objectLayerIndex(document: HwpDocument, pages: readonly number[]): Map<string, RawObjectLayer[]> {
+  const result = new Map<string, RawObjectLayer[]>();
+  for (const pageIndex of new Set(pages)) {
+    const tree = parseJson<{ root?: RawLayerTreeNode }>(document.getPageLayerTreeWithProfile(pageIndex, "screen", true), "개체 조판 정보");
+    const visit = (node: RawLayerTreeNode, inheritedLayer?: RawLayerTreeNode["layer"]): void => {
+      const layer = node.layer ?? inheritedLayer;
+      const stableIndex = layer?.stableIndex;
+      if (Number.isInteger(stableIndex)) {
+        for (const op of node.ops ?? []) {
+          if (typeof op.type !== "string" || !OBJECT_LAYER_OPS.has(op.type)) continue;
+          const bbox = typeof op.bbox === "object" && op.bbox !== null ? op.bbox as Record<string, unknown> : node.bounds;
+          if (!bbox || ![bbox.x, bbox.y, bbox.width, bbox.height].every((value) => typeof value === "number" && Number.isFinite(value))) continue;
+          const entry: RawObjectLayer = {
+            pageIndex, stableIndex: stableIndex!, zOrder: Number.isFinite(layer?.zOrder) ? layer!.zOrder! : 0,
+            textWrap: String(layer?.textWrap ?? (typeof op.wrap === "string" ? op.wrap : "")),
+            bounds: { x: bbox.x as number, y: bbox.y as number, width: bbox.width as number, height: bbox.height as number },
+            op,
+          };
+          const key = `${pageIndex}:${stableIndex}`;
+          const bucket = result.get(key) ?? [];
+          bucket.push(entry); result.set(key, bucket);
+        }
+      }
+      for (const child of node.children ?? []) visit(child, layer);
+      if (node.child) visit(node.child, layer);
+    };
+    if (tree.root) visit(tree.root);
+  }
+  return result;
+}
+
+function objectAnchorOffset(control: RawDocumentControl, allControls: readonly RawDocumentControl[]): number {
+  if (!Number.isInteger(control.pos) || !Number.isInteger(control.para)) throw new Error("개체 앵커 위치를 확인할 수 없습니다.");
+  const before = allControls.filter((candidate) => candidate.para === control.para
+    && Number.isInteger(candidate.pos)
+    && ((candidate.pos ?? 0) < control.pos! || ((candidate.pos ?? 0) === control.pos! && (candidate.controlIndex ?? 0) < (control.controlIndex ?? 0)))
+    && ["secd", "cold", "gso", "tbl"].includes(candidate.ctrlId ?? "")).length;
+  return Math.max(0, control.pos! - before * 8);
+}
+
+function rasterDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ascii = (start: number, length: number) => String.fromCharCode(...bytes.subarray(start, start + length));
+  if (bytes.length >= 24 && ascii(0, 8) === "\x89PNG\r\n\x1a\n") return { width: view.getUint32(16), height: view.getUint32(20) };
+  if (bytes.length >= 10 && (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a")) return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  if (bytes.length >= 26 && ascii(0, 2) === "BM") return { width: Math.abs(view.getInt32(18, true)), height: Math.abs(view.getInt32(22, true)) };
+  if (bytes.length > 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 4 < bytes.length) {
+      if (bytes[offset] !== 0xff) { offset += 1; continue; }
+      const marker = bytes[offset + 1]!; const length = view.getUint16(offset + 2);
+      if (length < 2 || offset + 2 + length > bytes.length) break;
+      if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+        return { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) };
+      }
+      offset += 2 + length;
+    }
+  }
+  return null;
+}
+
+function extractTextBoxParagraphs(
+  document: HwpDocument,
+  paraIndex: number,
+  controlIndex: number,
+  defaults: PlainTextImportDefaults,
+): Array<Omit<PlainTextParagraph, "table" | "objects">> {
+  const paragraphCount = document.getCellParagraphCountByPath(0, paraIndex, JSON.stringify([{ controlIndex, cellIndex: 0, cellParaIndex: 0 }]));
+  if (!Number.isInteger(paragraphCount) || paragraphCount < 1 || paragraphCount > 256) throw new Error("글상자 문단 수가 지원 범위를 벗어났습니다.");
+  const paragraphs: Array<Omit<PlainTextParagraph, "table" | "objects">> = [];
+  for (let cellParaIndex = 0; cellParaIndex < paragraphCount; cellParaIndex += 1) {
+    const path = JSON.stringify([{ controlIndex, cellIndex: 0, cellParaIndex }]);
+    const length = document.getCellParagraphLengthByPath(0, paraIndex, path);
+    const text = document.getTextInCellByPath(0, paraIndex, path, 0, length);
+    if (!Number.isInteger(length) || length < 0 || text.length !== length || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(text)) {
+      throw new Error("글상자에 변환할 수 없는 필드나 개체가 있습니다.");
+    }
+    const rawParagraph = parseJson<Record<string, unknown>>(document.getCellParaPropertiesAt(0, paraIndex, controlIndex, 0, cellParaIndex), "글상자 문단 속성");
+    const checkable = { ...rawParagraph };
+    if (rawParagraph.fillType === "none") {
+      checkable.patternColor = defaults.tableParagraph.patternColor;
+      checkable.patternType = defaults.tableParagraph.patternType;
+    }
+    if (unsupportedDifferenceKeys(checkable, defaults.tableParagraph, SUPPORTED_TEXT_PARA_PROPERTIES).length) throw new Error("글상자에 지원되지 않는 문단 속성이 있습니다.");
+    if (rawParagraph.pageBreakBefore === true) throw new Error("글상자 문단의 쪽 나누기는 아직 지원되지 않습니다.");
+    const styleAt = parseJson<Record<string, unknown>>(document.getCellStyleAt(0, paraIndex, controlIndex, 0, cellParaIndex), "글상자 문단 스타일");
+    if (stableJson(styleAt) !== stableJson(defaults.tableStyleAt)) throw new Error("글상자에 사용자 지정 문단 스타일이 있습니다.");
+    const alignment = rawParagraph.alignment;
+    if (alignment !== "left" && alignment !== "center" && alignment !== "right" && alignment !== "justify") throw new Error("글상자 문단 정렬을 확인하지 못했습니다.");
+    const paragraphFormat: ParagraphFormat = { alignment };
+    for (const key of ["marginLeft", "marginRight", "indent"] as const) {
+      const value = rawParagraph[key];
+      if (typeof value === "number" && Number.isFinite(value) && stableJson(value) !== stableJson(defaults.tableParagraph[key])) paragraphFormat[key] = value;
+    }
+    const characterFormats: PlainTextParagraph["characterFormats"] = [];
+    if (length > 0) {
+      const runs = parseJson<Array<{ startOffset: number; endOffset: number }>>(document.getCharShapeRunsInCellByPath(0, paraIndex, path, 0, length), "글상자 글자 서식 구간");
+      let nextOffset = 0;
+      for (const run of runs) {
+        if (!Number.isInteger(run.startOffset) || !Number.isInteger(run.endOffset) || run.startOffset !== nextOffset || run.endOffset <= run.startOffset || run.endOffset > length) {
+          throw new Error("글상자 글자 서식 범위가 이어지지 않습니다.");
+        }
+        const props = parseJson<Record<string, unknown>>(document.getCellCharPropertiesAt(0, paraIndex, controlIndex, 0, cellParaIndex, run.startOffset), "글상자 글자 속성");
+        const checkableCharacter = { ...props };
+        if (props.fillType === "none") {
+          checkableCharacter.patternColor = defaults.tableCharacter.patternColor;
+          checkableCharacter.patternType = defaults.tableCharacter.patternType;
+        }
+        if (unsupportedDifferenceKeys(checkableCharacter, defaults.tableCharacter, SUPPORTED_TEXT_CHAR_PROPERTIES).length) throw new Error("글상자에 지원되지 않는 글자 효과가 있습니다.");
+        if (typeof props.fontFamily !== "string" || !Array.isArray(props.fontFamilies) || !props.fontFamilies.every((family) => family === props.fontFamily)) {
+          throw new Error("글상자에서 언어별 글꼴을 안전하게 보존할 수 없습니다.");
+        }
+        const format: CharacterFormat = {};
+        if (props.fontFamily !== "함초롬바탕") format.fontFamily = props.fontFamily;
+        if (typeof props.fontSize === "number" && Number.isFinite(props.fontSize) && props.fontSize !== 1200) format.fontSize = props.fontSize;
+        for (const key of ["bold", "italic", "underline", "strikethrough"] as const) if (props[key] === true) format[key] = true;
+        if (Object.keys(format).length) characterFormats.push({ start: run.startOffset, end: run.endOffset, format });
+        nextOffset = run.endOffset;
+      }
+      if (nextOffset !== length) throw new Error("글상자 글자 서식 범위가 끝까지 이어지지 않습니다.");
+    }
+    paragraphs.push({ text, pageBreakBefore: false, paragraphFormat, characterFormats });
+  }
+  return paragraphs;
+}
+
+function extractObjectsForHanul(
+  document: HwpDocument,
+  objects: RawDocumentObject[],
+  controls: RawDocumentControl[],
+  cycles: RawObjectCycle[],
+  defaults: PlainTextImportDefaults,
+): Map<number, PlainTextObject[]> {
+  if (objects.some((item) => item.kind !== "picture" && item.kind !== "shape" && item.kind !== "table")) {
+    throw new Error("지원하지 않는 개체 종류가 포함되어 있습니다.");
+  }
+  const floatingObjects = objects.filter((item) => item.kind === "picture" || item.kind === "shape");
+  const objectControls = controls.filter((item) => item.ctrlId === "gso");
+  if (objectControls.length !== floatingObjects.length) throw new Error("개체 목록과 문서 컨트롤이 일치하지 않습니다.");
+  const pages = cycles.map((cycle) => cycle.page);
+  const layerMap = objectLayerIndex(document, pages);
+  const byParagraph = new Map<number, PlainTextObject[]>();
+  const seen = new Set<string>();
+  for (const object of floatingObjects) {
+    if (!Number.isInteger(object.para) || !Number.isInteger(object.controlIndex)) throw new Error("개체가 문단에 연결되어 있지 않습니다.");
+    const paraIndex = object.para;
+    const key = `${paraIndex}:${object.controlIndex}`;
+    if (seen.has(key)) throw new Error("중복된 개체 컨트롤이 있습니다.");
+    seen.add(key);
+    const control = objectControls.find((candidate) => candidate.para === paraIndex && candidate.controlIndex === object.controlIndex);
+    const cycle = cycles.find((candidate) => candidate.para === paraIndex && candidate.controlIndex === object.controlIndex);
+    if (!control || !cycle || !Number.isInteger(cycle.page) || cycle.page < 0) throw new Error("개체의 앵커 문단 또는 페이지가 없습니다.");
+    const isTextBox = object.kind === "shape" && document.getTextBoxControlIndex(0, paraIndex) === object.controlIndex;
+    if (object.listId != null && !isTextBox) throw new Error("표나 다른 개체 안에 중첩된 개체는 아직 지원되지 않습니다.");
+    const objectLayers = layerMap.get(`${cycle.page}:${object.controlIndex}`) ?? [];
+    const primaryLayers = objectLayers.filter((entry) => (entry.op.type === "image") === (object.kind === "picture")
+      && (entry.op.type === "rectangle" || entry.op.type === "ellipse" || entry.op.type === "image"));
+    const unique = new Map(primaryLayers.map((entry) => [`${entry.op.type}:${stableJson(entry.bounds)}`, entry]));
+    if (unique.size !== 1) throw new Error(`개체 ${object.controlIndex}의 기본 도형/그림 레이어를 하나로 식별할 수 없습니다.`);
+    const layer = [...unique.values()][0]!;
+    const raw = parseJson<Record<string, unknown>>(object.kind === "picture"
+      ? document.getPictureProperties(0, paraIndex, object.controlIndex)
+      : document.getShapeProperties(0, paraIndex, object.controlIndex), "개체 속성");
+    const width = raw.width; const height = raw.height; const horzOffset = raw.horzOffset; const vertOffset = raw.vertOffset;
+    if (![width, height, horzOffset, vertOffset].every((value) => typeof value === "number" && Number.isFinite(value)) || (width as number) <= 0 || (height as number) <= 0) {
+      throw new Error("개체의 위치 또는 크기가 올바르지 않습니다.");
+    }
+    const wrap = layerTextWrap(typeof raw.textWrap === "string" ? raw.textWrap : layer.textWrap);
+    const layerWrap = layerTextWrap(layer.textWrap);
+    if (!wrap || !layerWrap || wrap !== layerWrap || (wrap !== "BehindText" && wrap !== "InFrontOfText")) throw new Error("이 개체의 글 배치 방식은 아직 독립 엔진에서 재현할 수 없습니다.");
+    if (raw.treatAsChar !== false || raw.horzRelTo !== "Paper" || raw.vertRelTo !== "Paper" || raw.horzAlign !== "Left" || raw.vertAlign !== "Top") {
+      throw new Error("종이 기준 왼쪽 위에 고정되지 않은 개체는 아직 지원되지 않습니다.");
+    }
+    if (!["rectangle", "ellipse", "image"].includes(String(layer.op.type))) throw new Error("복합 도형 또는 개체 효과가 포함되어 있습니다.");
+    const transform = typeof layer.op.transform === "object" && layer.op.transform !== null ? layer.op.transform as Record<string, unknown> : {};
+    if (transform.rotation !== 0 || transform.horzFlip !== false || transform.vertFlip !== false) throw new Error("회전 또는 뒤집기가 적용된 개체는 아직 지원되지 않습니다.");
+    const objectKind = object.kind === "picture" ? "picture" : isTextBox ? "textBox" : layer.op.type === "ellipse" ? "ellipse" : "rectangle";
+    const baseline = object.kind === "picture" ? defaults.picture : objectKind === "textBox" ? defaults.textBox : objectKind === "ellipse" ? defaults.ellipse : defaults.rectangle;
+    const allowed = object.kind === "picture"
+      ? new Set([...COMMON_OBJECT_PROPERTY_DIFFERENCES, "originalWidth", "originalHeight", "cropRight", "cropBottom"])
+      : SHAPE_STYLE_PROPERTY_DIFFERENCES;
+    if (!onlySupportedObjectPropertyDifferences(raw, baseline, allowed)) {
+      const keys = new Set([...Object.keys(raw), ...Object.keys(baseline)]);
+      const differences = [...keys].filter((key) => !allowed.has(key) && stableJson(raw[key]) !== stableJson(baseline[key]));
+      throw new Error(`개체에 아직 지원되지 않는 효과나 저장 속성이 있습니다: ${differences.map((key) => `${key}=${stableJson(raw[key])} (기본 ${stableJson(baseline[key])})`).join(", ")}`);
+    }
+    if (typeof raw.description !== "string" || typeof raw.rotationAngle !== "number" || raw.rotationAngle !== 0 || raw.horzFlip !== false || raw.vertFlip !== false) {
+      throw new Error("개체 설명 또는 변환 속성을 확인하지 못했습니다.");
+    }
+    if (object.kind === "picture") {
+      const crop = ["cropLeft", "cropTop", "cropRight", "cropBottom"].map((key) => raw[key]);
+      if (crop.some((value) => typeof value !== "number") || raw.cropLeft !== 0 || raw.cropTop !== 0
+        || raw.cropRight !== Number(raw.originalWidth) - DEFAULT_IMAGE_CROP_INSET_HU
+        || raw.cropBottom !== Number(raw.originalHeight) - DEFAULT_IMAGE_CROP_INSET_HU
+        || raw.hasCaption !== false || raw.transparency !== 0 || raw.brightness !== 0 || raw.contrast !== 0 || raw.effect !== "RealPic") {
+        throw new Error("자르기·캡션·그림 효과가 있는 그림은 아직 지원되지 않습니다.");
+      }
+    }
+    if (objectKind === "textBox" && (layer.op.type !== "rectangle" || layer.op.cornerRadius !== 0 || raw.tbVerticalAlign !== "Top")) {
+      throw new Error("단순한 위쪽 정렬 글상자만 독립 엔진에서 편집할 수 있습니다.");
+    }
+    if (object.kind === "shape") {
+      const style = typeof layer.op.style === "object" && layer.op.style !== null ? layer.op.style as Record<string, unknown> : {};
+      if (style.strokeDash !== "solid" || typeof style.fillColor !== "string" || typeof style.strokeColor !== "string"
+        || typeof style.strokeWidth !== "number" || !Number.isFinite(style.opacity)) throw new Error("도형 선·채우기 속성을 재현할 수 없습니다.");
+    }
+    const expectedX = (horzOffset as number) / 75; const expectedY = (vertOffset as number) / 75;
+    if (Math.abs(layer.bounds.x - expectedX) > 1.5 || Math.abs(layer.bounds.y - expectedY) > 1.5
+      || Math.abs(layer.bounds.width - (width as number) / 75) > 1.5 || Math.abs(layer.bounds.height - (height as number) / 75) > 1.5) {
+      throw new Error("개체의 페이지 좌표와 저장 위치 속성이 일치하지 않습니다.");
+    }
+    let imageData: Uint8Array | undefined;
+    let imageExtension: string | undefined;
+    let naturalWidthPx: number | undefined;
+    let naturalHeightPx: number | undefined;
+    if (object.kind === "picture") {
+      const mime = layer.op.mime;
+      const extension = mime === "image/png" ? "png" : mime === "image/jpeg" ? "jpg" : mime === "image/gif" ? "gif" : mime === "image/bmp" ? "bmp" : "";
+      const sourceKey = layer.op.sourceImageKey;
+      if (!extension || typeof sourceKey !== "string") throw new Error("그림 원본 바이트 또는 형식을 찾을 수 없습니다.");
+      imageData = new Uint8Array(document.getSourceImageBytes(sourceKey));
+      imageExtension = extension;
+      const dimensions = rasterDimensions(imageData);
+      if (!dimensions || dimensions.width < 1 || dimensions.height < 1) throw new Error("그림 파일의 원본 크기를 확인하지 못했습니다.");
+      naturalWidthPx = dimensions.width; naturalHeightPx = dimensions.height;
+    }
+    const objectValue: PlainTextObject = {
+      id: `0:${paraIndex}:${object.controlIndex}:${objectKind}`,
+      kind: objectKind, sectionIndex: 0, paragraphIndex: paraIndex, controlIndex: object.controlIndex,
+      pageIndex: cycle.page,
+      bounds: { pageIndex: cycle.page, ...layer.bounds },
+      zOrder: Number.isFinite(layer.zOrder) ? layer.zOrder : Number.isFinite(cycle.z) ? cycle.z! : 0,
+      widthMm: rhwpUnitsToMillimeters(width as number), heightMm: rhwpUnitsToMillimeters(height as number),
+      offsetXmm: rhwpUnitsToMillimeters(horzOffset as number), offsetYmm: rhwpUnitsToMillimeters(vertOffset as number),
+      textWrap: wrap, treatAsCharacter: false, description: raw.description,
+      anchorCharOffset: objectAnchorOffset(control, controls),
+      properties: raw,
+      ...(imageData ? { imageData, imageExtension, naturalWidthPx, naturalHeightPx, preserveAspectRatio: true } : {}),
+      ...(object.kind === "shape" ? {
+        shapeType: layer.op.type === "ellipse" ? "ellipse" as const : "rectangle" as const,
+        paint: {
+          fillColor: (layer.op.style as Record<string, unknown>).fillColor as string,
+          strokeColor: (layer.op.style as Record<string, unknown>).strokeColor as string,
+          strokeWidth: (layer.op.style as Record<string, unknown>).strokeWidth as number,
+          opacity: (layer.op.style as Record<string, unknown>).opacity as number,
+        },
+      } : {}),
+      ...(objectKind === "textBox" ? {
+        textMarginsMm: {
+          left: rhwpUnitsToMillimeters(Number(raw.tbMarginLeft ?? 0)), right: rhwpUnitsToMillimeters(Number(raw.tbMarginRight ?? 0)),
+          top: rhwpUnitsToMillimeters(Number(raw.tbMarginTop ?? 0)), bottom: rhwpUnitsToMillimeters(Number(raw.tbMarginBottom ?? 0)),
+        },
+        textParagraphs: extractTextBoxParagraphs(document, paraIndex, object.controlIndex, defaults),
+      } : {}),
+    };
+    const bucket = byParagraph.get(paraIndex) ?? [];
+    bucket.push(objectValue); byParagraph.set(paraIndex, bucket);
+  }
+  for (const bucket of byParagraph.values()) bucket.sort((left, right) => left.anchorCharOffset - right.anchorCharOffset || left.zOrder - right.zOrder);
+  return byParagraph;
+}
 
 function extractTableForHanul(
   document: HwpDocument,
@@ -2693,22 +3145,26 @@ function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocumen
     const styles = parseJson<unknown>(document.getStyleList(), "스타일 목록");
     if (stableJson(styles) !== stableJson(defaults.styles)) return reject("custom document styles");
 
-    const controls = parseJson<RhwpTableControl[]>(document.getControls(), "문서 컨트롤");
+    const controls = parseJson<RawDocumentControl[]>(document.getControls(), "문서 컨트롤");
     const tableControls = controls.filter((item) => item.ctrlId === "tbl");
-    if (controls.some((item) => item.ctrlId !== "secd" && item.ctrlId !== "cold" && item.ctrlId !== "tbl")
+    if (controls.some((item) => item.ctrlId !== "secd" && item.ctrlId !== "cold" && item.ctrlId !== "tbl" && item.ctrlId !== "gso")
       || controls.filter((item) => item.ctrlId === "secd").length !== 1
       || controls.filter((item) => item.ctrlId === "cold").length !== 1) return reject("unsupported document controls");
-    const tableByParagraph = new Map<number, RhwpTableControl>();
+    const tableByParagraph = new Map<number, RawDocumentControl>();
     for (const control of tableControls) {
       if (!Number.isInteger(control.para) || !Number.isInteger(control.controlIndex) || tableByParagraph.has(control.para!)) {
         return reject("multiple or unaddressable table controls in a paragraph");
       }
       tableByParagraph.set(control.para!, control);
     }
-    // Pictures, shapes, and text boxes still require RHWP's lossless object
-    // model. Do not admit a mixed document to the independent serializer.
-    const documentObjects = parseJson<Array<{ kind?: string }>>(document.getObjects(), "문서 개체 목록");
-    if (documentObjects.some((object) => object.kind === "picture" || object.kind === "shape")) return reject("document contains pictures or shapes");
+    const documentObjects = parseJson<RawDocumentObject[]>(document.getObjects(), "문서 개체 목록");
+    const tableObjects = documentObjects.filter((item) => item.kind === "table");
+    if (tableObjects.length !== tableControls.length || tableObjects.some((object) =>
+      !tableControls.some((control) => control.para === object.para && control.controlIndex === object.controlIndex))) {
+      return reject("table object list does not match table controls");
+    }
+    const objectCycles = parseJson<RawObjectCycle[]>(document.getObjectCycle(), "개체 페이지 위치");
+    const objectByParagraph = extractObjectsForHanul(document, documentObjects, controls, objectCycles, defaults);
     if (parseJson<unknown[]>(document.getFieldList(), "필드 목록").length !== 0
       || parseJson<unknown[]>(document.getBookmarks(), "책갈피 목록").length !== 0) return reject("fields or bookmarks");
     for (const isHeader of [true, false]) {
@@ -2744,6 +3200,7 @@ function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocumen
 
       const tableControl = tableByParagraph.get(paragraphIndex);
       if (tableControl) {
+        if (objectByParagraph.has(paragraphIndex)) return reject(`table paragraph ${paragraphIndex + 1} also contains floating objects`);
         // A table anchored in the middle of a body paragraph cannot yet be
         // represented as an ordered block without changing its position.
         if (text.length) return reject(`table at paragraph ${paragraphIndex + 1} shares an anchor with body text`);
@@ -2836,7 +3293,11 @@ function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocumen
         }
         if (nextOffset !== length) return reject(`paragraph ${paragraphIndex + 1} character run coverage is incomplete`);
       }
-      paragraphs.push({ text, pageBreakBefore, paragraphFormat, characterFormats });
+      const objects = objectByParagraph.get(paragraphIndex) ?? [];
+      if (objects.some((object) => object.anchorCharOffset > text.length || object.pageIndex !== startRect.pageIndex)) {
+        return reject(`paragraph ${paragraphIndex + 1} has an object anchor outside the represented page range`);
+      }
+      paragraphs.push({ text, pageBreakBefore, paragraphFormat, characterFormats, ...(objects.length ? { objects } : {}) });
 
       const lastOffset = length > 0 ? length - 1 : 0;
       previousLastPage = parseJson<CursorRectangle>(document.getCursorRect(0, paragraphIndex, lastOffset), "문단 끝 위치").pageIndex;

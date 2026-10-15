@@ -57,6 +57,25 @@ if (process.argv[2] === "--child") {
   session.renderPage(tableCaret.cursorRect.pageIndex);
   const afterRowRender = performance.now();
   const tableRowMetrics = { ...session.metrics };
+  const objectLine = session.displayList(0).lines.find((line) => line.cellIndex === undefined && line.objectControlIndex === undefined);
+  if (!objectLine) throw new Error("no body paragraph is available for the object probe");
+  const objectAnchor = session.hitTest(0, objectLine.x + 1, objectLine.y);
+  const objectInsertStarted = performance.now();
+  session.insertShape(objectAnchor, "rectangle", 40, 24);
+  const objectInsertedAt = performance.now();
+  const objectInsertMetrics = { ...session.metrics };
+  const objectInsertSvg = session.renderPage(0);
+  const objectInsertRenderMetrics = { ...session.metrics };
+  const objectInsertRenderedAt = performance.now();
+  const shape = session.listObjects(0).find((item) => item.kind === "rectangle");
+  if (!shape) throw new Error("shape insertion did not create a document object");
+  const objectMoveStarted = performance.now();
+  session.updateObject(shape, { offsetXmm: shape.offsetXmm + 2, offsetYmm: shape.offsetYmm + 1 });
+  const objectMovedAt = performance.now();
+  const objectMoveMetrics = { ...session.metrics };
+  const objectSvg = session.renderPage(0);
+  const objectMoveRenderMetrics = { ...session.metrics };
+  const objectRenderedAt = performance.now();
   const rssAfterEdits = process.memoryUsage().rss;
   session.dispose();
   console.log(JSON.stringify({
@@ -88,6 +107,26 @@ if (process.argv[2] === "--child") {
         editToSvgMs: afterRowRender - rowEditStarted,
         invalidatedParagraphs: tableRowMetrics.invalidatedParagraphs,
         invalidatedPages: tableRowMetrics.invalidatedPages,
+      },
+      insertRectangle: {
+        modelMutationMs: objectInsertMetrics.modelMutationMs,
+        incrementalLayoutMs: objectInsertMetrics.incrementalLayoutMs,
+        svgMs: objectInsertRenderMetrics.renderedPageMs,
+        modelToSvgMs: objectInsertRenderedAt - objectInsertStarted,
+        elapsedThroughLayoutMs: objectInsertedAt - objectInsertStarted,
+        invalidatedParagraphs: objectInsertMetrics.invalidatedParagraphs,
+        invalidatedPages: objectInsertMetrics.invalidatedPages,
+        svgBytes: objectInsertSvg.length,
+      },
+      moveRectangle: {
+        modelMutationMs: objectMoveMetrics.modelMutationMs,
+        incrementalLayoutMs: objectMoveMetrics.incrementalLayoutMs,
+        svgMs: objectMoveRenderMetrics.renderedPageMs,
+        modelToSvgMs: objectRenderedAt - objectMoveStarted,
+        elapsedThroughLayoutMs: objectMovedAt - objectMoveStarted,
+        invalidatedParagraphs: objectMoveMetrics.invalidatedParagraphs,
+        invalidatedPages: objectMoveMetrics.invalidatedPages,
+        svgBytes: objectSvg.length,
       },
     },
   }));

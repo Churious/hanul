@@ -3,6 +3,10 @@ import type {
   ContentLossReport,
   DocumentEngine,
   DocumentInfo,
+  DocumentObject,
+  DocumentObjectKind,
+  DocumentObjectTextWrap,
+  DocumentObjectUpdates,
   DocumentSession,
   DocumentStyle,
   ExportResult,
@@ -28,6 +32,24 @@ export interface PlainTextParagraph {
   paragraphFormat: ParagraphFormat;
   characterFormats: Array<{ start: number; end: number; format: CharacterFormat }>;
   table?: PlainTextTable;
+  objects?: PlainTextObject[];
+}
+
+export interface PlainTextObject extends DocumentObject {
+  /** RHWP properties retained for the compatibility serializer. */
+  properties: Record<string, unknown>;
+  /** Text offset where the floating object's anchor control is stored. */
+  anchorCharOffset: number;
+  shapeType?: "rectangle" | "ellipse";
+  imageData?: Uint8Array;
+  imageExtension?: string;
+  naturalWidthPx?: number;
+  naturalHeightPx?: number;
+  preserveAspectRatio?: boolean;
+  /** Text box content uses the same paragraph/character model as body text. */
+  textParagraphs?: Array<Omit<PlainTextParagraph, "table" | "objects">>;
+  paint?: { fillColor: string; strokeColor: string; strokeWidth: number; opacity: number };
+  textMarginsMm?: { left: number; right: number; top: number; bottom: number };
 }
 
 export interface PlainTextTableCell {
@@ -76,6 +98,7 @@ export interface DisplayTextLine {
   textLength?: number;
   cellIndex?: number;
   cellParaIndex?: number;
+  objectControlIndex?: number;
 }
 
 export interface DisplayPageList {
@@ -84,6 +107,26 @@ export interface DisplayPageList {
   height: number;
   lines: readonly DisplayTextLine[];
   tables: readonly DisplayTableFragment[];
+  objects: readonly DisplayDocumentObject[];
+}
+
+export interface DisplayDocumentObject {
+  id: string;
+  paragraphId: number;
+  controlIndex: number;
+  kind: DocumentObjectKind;
+  pageIndex: number;
+  zOrder: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  href?: string;
+  fillColor?: string;
+  strokeColor?: string;
+  strokeWidth?: number;
+  opacity?: number;
+  textWrap: DocumentObjectTextWrap;
 }
 
 export interface DisplayTableCell {
@@ -114,9 +157,10 @@ export interface TextEngineMetrics {
 }
 
 interface FlowState { page: number; line: number }
-interface TextLine extends DisplayTextLine { pageIndex: number; lineIndex: number; cellIndex?: number; cellParaIndex?: number }
+interface TextLine extends DisplayTextLine { pageIndex: number; lineIndex: number; cellIndex?: number; cellParaIndex?: number; objectControlIndex?: number }
 interface TableCellLayoutLine { start: number; end: number; text: string; fontSize: number; cellParaIndex: number; lineIndex: number; lineCount: number }
 interface TableCellLayout { cellIndex: number; lines: TableCellLayoutLine[]; paddingLeft: number; paddingRight: number; paddingTop: number; paddingBottom: number }
+type EditableCell = Pick<PlainTextTableCell, "paragraphs" | "properties">;
 interface TableRowLayout { row: number; heightLines: number; cells: TableCellLayout[] }
 interface Para {
   id: number;
@@ -125,6 +169,7 @@ interface Para {
   paragraphFormat: ParagraphFormat;
   characterFormats: Array<{ start: number; end: number; format: CharacterFormat }>;
   table?: PlainTextTable;
+  objects: PlainTextObject[];
   tableRows: TableRowLayout[];
   lines: Array<{ start: number; end: number; text: string; fontSize: number }>;
   placed: TextLine[];
@@ -185,6 +230,27 @@ function cloneTable(table: PlainTextTable | undefined): PlainTextTable | undefin
     })),
   };
 }
+function cloneTextParagraph(paragraph: Omit<PlainTextParagraph, "table" | "objects">): Omit<PlainTextParagraph, "table" | "objects"> {
+  return {
+    text: paragraph.text,
+    pageBreakBefore: paragraph.pageBreakBefore,
+    paragraphFormat: cloneFormat(paragraph.paragraphFormat),
+    characterFormats: paragraph.characterFormats.map((run) => ({ ...run, format: cloneFormat(run.format) })),
+  };
+}
+function cloneObject(object: PlainTextObject): PlainTextObject {
+  return {
+    ...object,
+    bounds: { ...object.bounds },
+    properties: structuredClone(object.properties),
+    ...(object.paint ? { paint: { ...object.paint } } : {}),
+    ...(object.textMarginsMm ? { textMarginsMm: { ...object.textMarginsMm } } : {}),
+    ...(object.textParagraphs ? { textParagraphs: object.textParagraphs.map(cloneTextParagraph) } : {}),
+    // Binary assets are immutable in the editor model; snapshots share their
+    // backing storage and avoid copying large photos for a geometry edit.
+    ...(object.imageData ? { imageData: object.imageData } : {}),
+  };
+}
 function cloneParagraph(p: Para | PlainTextParagraph): PlainTextParagraph {
   return {
     text: p.text,
@@ -192,6 +258,7 @@ function cloneParagraph(p: Para | PlainTextParagraph): PlainTextParagraph {
     paragraphFormat: cloneFormat(p.paragraphFormat),
     characterFormats: p.characterFormats.map((r) => ({ ...r, format: cloneFormat(r.format) })),
     ...(p.table ? { table: cloneTable(p.table) } : {}),
+    ...("objects" in p && p.objects?.length ? { objects: p.objects.map(cloneObject) } : {}),
   };
 }
 function size(node: Para | null): number { return node?.size ?? 0; }
@@ -284,6 +351,7 @@ function createNode(id: number, value: Partial<PlainTextParagraph>, priority: nu
     paragraphFormat: cloneFormat(value.paragraphFormat ?? {}),
     characterFormats: (value.characterFormats ?? []).map((r) => ({ ...r, format: cloneFormat(r.format) })),
     ...(value.table ? { table: cloneTable(value.table) } : {}),
+    objects: (value.objects ?? []).map(cloneObject),
     tableRows: [],
     lines: [], placed: [], inputState: { page: 0, line: 0 }, startState: { page: 0, line: 0 }, endState: { page: 0, line: 0 },
     priority, left: null, right: null, parent: null, size: 1, lineTotal: 0, flowUnits: 0,
@@ -303,9 +371,11 @@ export class HanulTextDocumentSession implements DocumentSession {
   private root: Para | null = null;
   private nodesById = new Map<number, Para>();
   private nextId = 1;
+  private nextObjectControlIndex = 1000;
   private randomState = 0x6d2b79f5;
   private pageLineIndex = new Map<number, TextLine[]>();
   private pageTableIndex = new Map<number, DisplayTableFragment[]>();
+  private pageObjectIndex = new Map<number, DisplayDocumentObject[]>();
   private pageSvgCache = new Map<number, string>();
   private pageRevisions = new Map<number, number>();
   private undoStack: HistoryEntry[] = [];
@@ -324,7 +394,11 @@ export class HanulTextDocumentSession implements DocumentSession {
     this.pageDefinitionValue = { ...pageDefinition };
     this.sourceFormat = sourceFormat;
     const values = initial.length ? initial : [{}];
-    for (const value of values) { const node = createNode(this.nextId++, value, this.priority()); this.nodesById.set(node.id, node); this.root = merge(this.root, node); }
+    for (const value of values) {
+      const node = createNode(this.nextId++, value, this.priority());
+      for (const object of node.objects) this.nextObjectControlIndex = Math.max(this.nextObjectControlIndex, object.controlIndex + 1);
+      this.nodesById.set(node.id, node); this.root = merge(this.root, node);
+    }
     this.reflowFrom(0, new Set(iterate(this.root).map((p) => p.id)));
   }
 
@@ -333,6 +407,7 @@ export class HanulTextDocumentSession implements DocumentSession {
   get canUndo(): boolean { return this.undoStack.length > 0; }
   get canRedo(): boolean { return this.redoStack.length > 0; }
   get metrics(): Readonly<TextEngineMetrics> { return this._metrics; }
+  performanceMetrics(): Readonly<TextEngineMetrics> { return { ...this._metrics }; }
   documentInfo(): DocumentInfo { return { version: "Hanul Text Model 1", sectionCount: 1, pageCount: this.pageCount, fontsUsed: ["Noto Sans CJK KR"] }; }
 
   pageInfo(pageIndex: number): RenderedPageInfo {
@@ -349,6 +424,7 @@ export class HanulTextDocumentSession implements DocumentSession {
       height: this.pageHeightPx(),
       lines: lines.sort((a, b) => a.y - b.y),
       tables: this.pageTableIndex.get(pageIndex) ?? [],
+      objects: this.pageObjectIndex.get(pageIndex) ?? [],
     };
   }
 
@@ -359,7 +435,13 @@ export class HanulTextDocumentSession implements DocumentSession {
     const start = clockNow();
     const page = this.displayList(pageIndex);
     const width = page.width; const height = page.height;
-    const linesSvg = page.lines.map((line) => `<text x="${line.x.toFixed(2)}" y="${line.y.toFixed(2)}" font-family="${escapeXml(line.fontFamily)}, sans-serif" font-size="${line.fontSize}px" font-weight="${line.bold ? 700 : 400}" font-style="${line.italic ? "italic" : "normal"}" text-decoration="${[line.underline ? "underline" : "", line.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || "none"}"${line.textLength ? ` textLength="${line.textLength.toFixed(2)}" lengthAdjust="spacing"` : ""} fill="#161616">${escapeXml(line.text)}</text>`).join("");
+    const textBoxClips = page.objects.filter((object) => object.kind === "textBox")
+      .map((object) => `<clipPath id="text-box-${safeSvgId(object.id)}"><rect x="${object.x.toFixed(2)}" y="${object.y.toFixed(2)}" width="${object.width.toFixed(2)}" height="${object.height.toFixed(2)}"/></clipPath>`).join("");
+    const linesSvg = page.lines.map((line) => {
+      const textBox = line.objectControlIndex === undefined ? undefined : page.objects.find((object) => object.paragraphId === line.paragraphId && object.controlIndex === line.objectControlIndex);
+      const clip = textBox ? ` clip-path="url(#text-box-${safeSvgId(textBox.id)})"` : "";
+      return `<text x="${line.x.toFixed(2)}" y="${line.y.toFixed(2)}" font-family="${escapeXml(line.fontFamily)}, sans-serif" font-size="${line.fontSize}px" font-weight="${line.bold ? 700 : 400}" font-style="${line.italic ? "italic" : "normal"}" text-decoration="${[line.underline ? "underline" : "", line.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || "none"}"${line.textLength ? ` textLength="${line.textLength.toFixed(2)}" lengthAdjust="spacing"` : ""} fill="#161616"${clip}>${escapeXml(line.text)}</text>`;
+    }).join("");
     const tableSvg = page.tables.flatMap((table) => table.cells.map((cell) => {
       const fill = cell.properties.fillType === "solid" && typeof cell.properties.fillColor === "string" ? cell.properties.fillColor : "#ffffff";
       const side = (name: "borderLeft" | "borderRight" | "borderTop" | "borderBottom", x1: number, y1: number, x2: number, y2: number) => {
@@ -373,7 +455,22 @@ export class HanulTextDocumentSession implements DocumentSession {
       const x2 = cell.x + cell.width; const y2 = cell.y + cell.height;
       return `<rect x="${cell.x.toFixed(2)}" y="${cell.y.toFixed(2)}" width="${cell.width.toFixed(2)}" height="${cell.height.toFixed(2)}" fill="${escapeXml(fill)}" stroke="none"/>${side("borderLeft", cell.x, cell.y, cell.x, y2)}${side("borderRight", x2, cell.y, x2, y2)}${side("borderTop", cell.x, cell.y, x2, cell.y)}${side("borderBottom", cell.x, y2, x2, y2)}`;
     })).join("");
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}px" height="${height}px" viewBox="0 0 ${width} ${height}"><rect x="0" y="0" width="100%" height="100%" fill="#fff" stroke="#b8b8b8"/>${tableSvg}${linesSvg}</svg>`;
+    const renderObject = (object: DisplayDocumentObject) => {
+      if (object.kind === "picture" && object.href) {
+        return `<image href="${escapeXml(object.href)}" x="${object.x.toFixed(2)}" y="${object.y.toFixed(2)}" width="${object.width.toFixed(2)}" height="${object.height.toFixed(2)}" preserveAspectRatio="xMidYMid meet"/>`;
+      }
+      const fill = escapeXml(object.fillColor ?? "#ffffff");
+      const stroke = escapeXml(object.strokeColor ?? "#202020");
+      const strokeWidth = Math.max(0, object.strokeWidth ?? 0.5).toFixed(2);
+      const opacity = Math.max(0, Math.min(1, object.opacity ?? 1)).toFixed(3);
+      return object.kind === "ellipse"
+        ? `<ellipse cx="${(object.x + object.width / 2).toFixed(2)}" cy="${(object.y + object.height / 2).toFixed(2)}" rx="${(object.width / 2).toFixed(2)}" ry="${(object.height / 2).toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" opacity="${opacity}"/>`
+        : `<rect x="${object.x.toFixed(2)}" y="${object.y.toFixed(2)}" width="${object.width.toFixed(2)}" height="${object.height.toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" opacity="${opacity}"/>`;
+    };
+    const orderedObjects = [...page.objects].sort((left, right) => left.zOrder - right.zOrder);
+    const behindObjects = orderedObjects.filter((object) => object.textWrap === "BehindText").map(renderObject).join("");
+    const frontObjects = orderedObjects.filter((object) => object.textWrap !== "BehindText").map(renderObject).join("");
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}px" height="${height}px" viewBox="0 0 ${width} ${height}"><defs>${textBoxClips}</defs><rect x="0" y="0" width="100%" height="100%" fill="#fff" stroke="#b8b8b8"/>${tableSvg}${behindObjects}${linesSvg}${frontObjects}</svg>`;
     this.pageSvgCache.set(pageIndex, svg);
     this._metrics = { ...this._metrics, renderedPageMs: clockNow() - start };
     return svg;
@@ -382,6 +479,20 @@ export class HanulTextDocumentSession implements DocumentSession {
   hitTest(pageIndex: number, x: number, y: number): TextPosition {
     this.requirePage(pageIndex);
     const pageLines = this.pageLineIndex.get(pageIndex) ?? [];
+    const objectBox = [...(this.pageObjectIndex.get(pageIndex) ?? [])].reverse().find((item) => item.kind === "textBox"
+      && x >= item.x && x <= item.x + item.width && y >= item.y && y <= item.y + item.height);
+    if (objectBox) {
+      const found = this.findObjectById(objectBox.id);
+      if (found) {
+        const paragraphIndex = indexOf(found.paragraph);
+        const textLines = pageLines.filter((line) => line.paragraphId === found.paragraph.id && line.objectControlIndex === found.value.controlIndex);
+        if (textLines.length) {
+          const closest = textLines.reduce((best, line) => Math.abs(line.y - y) < Math.abs(best.y - y) ? line : best);
+          return this.hitTestLine(closest, x);
+        }
+        return this.positionAtCell(paragraphIndex, 0, 0, 0, pageIndex, found.value.controlIndex);
+      }
+    }
     for (const table of this.pageTableIndex.get(pageIndex) ?? []) {
       const cell = table.cells.find((item) => x >= item.x && x <= item.x + item.width && y >= item.y && y <= item.y + item.height);
       if (!cell) continue;
@@ -404,6 +515,9 @@ export class HanulTextDocumentSession implements DocumentSession {
       if (localX < currentX + width / 2) break;
       offset += char.length; currentX += width;
     }
+    if (closest.objectControlIndex !== undefined) {
+      return this.positionAtCell(closest.paragraphIndex, 0, closest.cellParaIndex ?? 0, closest.start + offset, closest.pageIndex, closest.objectControlIndex);
+    }
     if (closest.cellIndex !== undefined) {
       return this.positionAtCell(closest.paragraphIndex, closest.cellIndex, closest.cellParaIndex ?? 0, closest.start + offset, closest.pageIndex);
     }
@@ -416,19 +530,20 @@ export class HanulTextDocumentSession implements DocumentSession {
       const offset = Math.max(0, Math.min(cell.paragraph.text.length, position.charOffset));
       if (delta < 0 && offset > 0) {
         const start = isLowSurrogate(cell.paragraph.text.charCodeAt(offset - 1)) && offset > 1 ? offset - 2 : offset - 1;
-        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, start);
+        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, start, undefined, position.cellPath[0].controlIndex);
       }
       if (delta > 0 && offset < cell.paragraph.text.length) {
         const end = isHighSurrogate(cell.paragraph.text.charCodeAt(offset)) && offset + 1 < cell.paragraph.text.length ? offset + 2 : offset + 1;
-        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, end);
+        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, end, undefined, position.cellPath[0].controlIndex);
       }
       if (delta < 0 && offset === 0 && cell.cellParaIndex > 0) {
         const previous = cell.cellParaIndex - 1;
-        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, previous, cell.cell.paragraphs[previous].text.length);
+        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, previous, cell.cell.paragraphs[previous].text.length, undefined, position.cellPath[0].controlIndex);
       }
       if (delta > 0 && offset === cell.paragraph.text.length && cell.cellParaIndex + 1 < cell.cell.paragraphs.length) {
-        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex + 1, 0);
+        return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex + 1, 0, undefined, position.cellPath[0].controlIndex);
       }
+      if (position.cellPath[0].controlIndex !== 0) return position;
       return this.moveTableCell(position, delta);
     }
     const para = at(this.root, this.clampPara(position.paragraphIndex));
@@ -445,7 +560,8 @@ export class HanulTextDocumentSession implements DocumentSession {
     const current = (this.pageLineIndex.get(page) ?? []).slice().sort((a, b) => a.y - b.y);
     if (position.cellPath) {
       const cell = position.cellPath[0];
-      const matching = current.filter((line) => line.paragraphId === this.blockAt(position.parentParagraphIndex!).id && line.cellIndex === cell.cellIndex);
+      const matching = current.filter((line) => line.paragraphId === this.blockAt(position.parentParagraphIndex!).id
+        && (cell.controlIndex === 0 ? line.cellIndex === cell.cellIndex : line.objectControlIndex === cell.controlIndex));
       const index = matching.findIndex((line) => line.cellParaIndex === cell.cellParaIndex && position.charOffset >= line.start && position.charOffset <= line.end);
       const next = matching[index + delta];
       return next ? this.hitTest(page, position.cursorRect.x, next.y) : this.hitTest(page, position.cursorRect.x, position.cursorRect.y + delta * DEFAULT_LINE_HEIGHT);
@@ -466,7 +582,7 @@ export class HanulTextDocumentSession implements DocumentSession {
   moveCaretToParagraphEdge(position: TextPosition, edge: "start" | "end"): TextPosition {
     if (position.cellPath) {
       const cell = this.cellParagraph(position);
-      return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, edge === "start" ? 0 : cell.paragraph.text.length);
+      return this.positionAtCell(position.parentParagraphIndex!, cell.cellIndex, cell.cellParaIndex, edge === "start" ? 0 : cell.paragraph.text.length, undefined, position.cellPath[0].controlIndex);
     }
     const p = at(this.root, this.clampPara(position.paragraphIndex));
     return this.positionAt(indexOf(p), edge === "start" ? 0 : p.text.length);
@@ -544,15 +660,17 @@ export class HanulTextDocumentSession implements DocumentSession {
     if (start.cellPath && end.cellPath) {
       if (!sameCell(start, end)) return [];
       const [a, b] = this.ordered(start, end);
-      const cell = this.blockAt(a.parentParagraphIndex!).table!.cells[a.cellPath![0].cellIndex];
       const block = this.blockAt(a.parentParagraphIndex!);
+      const cell = this.cellParagraph(a).cell;
       const result: SelectionRectangle[] = [];
       const fromPara = a.cellPath![0].cellParaIndex; const toPara = b.cellPath![0].cellParaIndex;
       for (let cellParaIndex = fromPara; cellParaIndex <= toPara; cellParaIndex += 1) {
         const paragraph = cell.paragraphs[cellParaIndex];
         const from = cellParaIndex === fromPara ? a.charOffset : 0;
         const to = cellParaIndex === toPara ? b.charOffset : paragraph.text.length;
-        for (const placed of block.placed.filter((line) => line.cellIndex === a.cellPath![0].cellIndex && line.cellParaIndex === cellParaIndex)) {
+        const controlIndex = a.cellPath![0].controlIndex;
+        for (const placed of block.placed.filter((line) => (controlIndex === 0
+          ? line.cellIndex === a.cellPath![0].cellIndex : line.objectControlIndex === controlIndex) && line.cellParaIndex === cellParaIndex)) {
           const left = Math.max(from, placed.start); const right = Math.min(to, placed.end);
           if (left >= right && !(from === to && left === right)) continue;
           const scale = this.visualScale(placed);
@@ -600,7 +718,7 @@ export class HanulTextDocumentSession implements DocumentSession {
       this.reflowFrom(blockIndex, new Set([block.id]));
       const after = this.snapshotBlock(blockIndex, 1);
       this.recordSnapshot(blockIndex, before, after, a, a, false);
-      return this.positionAtCell(blockIndex, cell.cellIndex, cell.cellParaIndex, a.charOffset);
+      return this.positionAtCell(blockIndex, cell.cellIndex, cell.cellParaIndex, a.charOffset, undefined, a.cellPath![0].controlIndex);
     }
     const [a, b] = this.ordered(start, end); if (a.paragraphIndex === b.paragraphIndex && a.charOffset === b.charOffset) return this.positionAt(a.paragraphIndex, a.charOffset);
     const first = a.paragraphIndex; const last = b.paragraphIndex; const before = this.snapshotBlock(first, last - first + 1);
@@ -627,7 +745,7 @@ export class HanulTextDocumentSession implements DocumentSession {
       this.reflowFrom(blockIndex, new Set([block.id]));
       const after = this.snapshotBlock(blockIndex, 1);
       this.recordSnapshot(blockIndex, before, after, position, position, false);
-      return this.positionAtCell(blockIndex, cellIndex, cellParaIndex, position.charOffset);
+      return this.positionAtCell(blockIndex, cellIndex, cellParaIndex, position.charOffset, undefined, position.cellPath[0].controlIndex);
     }
     const p = at(this.root, this.clampPara(position.paragraphIndex)); const before = cloneParagraph(p);
     const normalized: ParagraphFormat = { ...format };
@@ -668,12 +786,91 @@ export class HanulTextDocumentSession implements DocumentSession {
   setHeaderFooterText(_position: TextPosition, _kind: HeaderFooterKind, _scope: HeaderFooterScope, _text: string): TextPosition { throw unsupported("머리말·꼬리말"); }
   deleteHeaderFooter(_position: TextPosition, _kind: HeaderFooterKind, _scope: HeaderFooterScope): TextPosition { throw unsupported("머리말·꼬리말"); }
   insertHeaderFooterField(_position: TextPosition, _kind: HeaderFooterKind, _scope: HeaderFooterScope, _field: HeaderFooterFieldKind): TextPosition { throw unsupported("머리말·꼬리말 필드"); }
-  insertPicture(_position: TextPosition, _imageData: Uint8Array, _extension: string, _naturalWidthPx: number, _naturalHeightPx: number, _widthMm: number, _heightMm: number): TextPosition { throw unsupported("그림 삽입"); }
-  insertShape(_position: TextPosition, _kind: "rectangle" | "textBox", _widthMm: number, _heightMm: number): TextPosition { throw unsupported("도형 삽입"); }
-  listObjects(_sectionIndex: number) { return []; }
-  hitTestObject(_pageIndex: number, _x: number, _y: number) { return null; }
-  updateObject(_object: import("./document-engine").DocumentObject, _updates: import("./document-engine").DocumentObjectUpdates): TextPosition { throw unsupported("개체 편집"); }
-  deleteObject(_object: import("./document-engine").DocumentObject): TextPosition { throw unsupported("개체 삭제"); }
+  insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, widthMm: number, heightMm: number): TextPosition {
+    if (position.cellPath) throw new Error("표 셀 또는 글상자 안에 그림을 넣는 기능은 아직 지원하지 않습니다.");
+    const normalizedExtension = extension.toLowerCase() === "jpeg" ? "jpg" : extension.toLowerCase();
+    if (!(normalizedExtension === "png" || normalizedExtension === "jpg" || normalizedExtension === "gif" || normalizedExtension === "bmp")) throw new Error("PNG, JPEG, GIF, BMP 그림만 넣을 수 있습니다.");
+    if (!imageData.length || imageData.length > 50 * 1024 * 1024) throw new Error("그림 파일 크기는 50MB 이하여야 합니다.");
+    if (![naturalWidthPx, naturalHeightPx, widthMm, heightMm].every((value) => Number.isFinite(value) && value > 0)) throw new Error("그림의 원본 크기와 배치 크기를 확인하세요.");
+    const aspectRatio = naturalWidthPx / naturalHeightPx;
+    const object = this.newObject(position, "picture", widthMm, widthMm / aspectRatio);
+    object.imageData = imageData.slice();
+    object.imageExtension = normalizedExtension;
+    object.naturalWidthPx = naturalWidthPx;
+    object.naturalHeightPx = naturalHeightPx;
+    object.preserveAspectRatio = true;
+    return this.addObject(position, object);
+  }
+  insertShape(position: TextPosition, kind: "rectangle" | "ellipse" | "textBox", widthMm: number, heightMm: number): TextPosition {
+    if (position.cellPath) throw new Error("표 셀 또는 글상자 안에 도형을 넣는 기능은 아직 지원하지 않습니다.");
+    if (![widthMm, heightMm].every((value) => Number.isFinite(value) && value >= 1)) throw new Error("도형 너비와 높이는 1mm 이상이어야 합니다.");
+    const object = this.newObject(position, kind, widthMm, heightMm);
+    object.shapeType = kind === "ellipse" ? "ellipse" : "rectangle";
+    object.paint = { fillColor: "#ffffff", strokeColor: "#202020", strokeWidth: 0.5, opacity: 1 };
+    if (kind === "textBox") {
+      object.textParagraphs = [{ text: "", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] }];
+      object.textMarginsMm = { left: 2, right: 2, top: 2, bottom: 2 };
+    }
+    return this.addObject(position, object);
+  }
+  listObjects(sectionIndex: number): DocumentObject[] {
+    if (sectionIndex !== 0) return [];
+    return iterate(this.root).flatMap((paragraph) => paragraph.objects.map((object) => ({
+      id: object.id, kind: object.kind, sectionIndex: 0, paragraphIndex: indexOf(paragraph), controlIndex: object.controlIndex,
+      pageIndex: object.pageIndex, bounds: { ...object.bounds }, zOrder: object.zOrder,
+      widthMm: object.widthMm, heightMm: object.heightMm, offsetXmm: object.offsetXmm, offsetYmm: object.offsetYmm,
+      textWrap: object.textWrap, treatAsCharacter: object.treatAsCharacter, description: object.description,
+    })));
+  }
+  hitTestObject(pageIndex: number, x: number, y: number): DocumentObject | null {
+    this.requirePage(pageIndex);
+    const hit = [...(this.pageObjectIndex.get(pageIndex) ?? [])].reverse().find((object) => x >= object.x && x <= object.x + object.width && y >= object.y && y <= object.y + object.height);
+    if (!hit) return null;
+    return this.listObjects(0).find((object) => object.id === hit.id) ?? null;
+  }
+  updateObject(object: DocumentObject, updates: DocumentObjectUpdates): TextPosition {
+    const found = this.findObjectById(object.id);
+    if (!found) throw new Error("편집할 개체가 문서에 없습니다.");
+    const current = found.value;
+    const next = { ...current, ...updates };
+    if (current.kind === "picture" && current.preserveAspectRatio !== false
+      && current.naturalWidthPx && current.naturalHeightPx) {
+      const ratio = current.naturalWidthPx / current.naturalHeightPx;
+      if (updates.widthMm !== undefined) next.heightMm = next.widthMm / ratio;
+      else if (updates.heightMm !== undefined) next.widthMm = next.heightMm * ratio;
+    }
+    if (![next.widthMm, next.heightMm].every((value) => Number.isFinite(value) && value >= 1)) throw new Error("개체의 너비와 높이는 1mm 이상이어야 합니다.");
+    if (![next.offsetXmm, next.offsetYmm].every(Number.isFinite)) throw new Error("개체 위치 값을 확인하세요.");
+    const wraps: readonly DocumentObjectTextWrap[] = ["Square", "TopAndBottom", "Tight", "Through", "BehindText", "InFrontOfText"];
+    if (!wraps.includes(next.textWrap)) throw new Error("지원하지 않는 글 배치 방식입니다.");
+    const paragraphIndex = indexOf(found.paragraph);
+    const mutationStarted = clockNow();
+    const before = this.snapshotBlock(paragraphIndex, 1);
+    found.paragraph.objects = found.paragraph.objects.map((entry) => entry.id === current.id ? {
+      ...entry, ...updates, widthMm: next.widthMm, heightMm: next.heightMm,
+      bounds: { ...entry.bounds, x: next.offsetXmm * PX_PER_MM, y: next.offsetYmm * PX_PER_MM, width: next.widthMm * PX_PER_MM, height: next.heightMm * PX_PER_MM },
+    } : entry);
+    this._metrics = { ...this._metrics, modelMutationMs: clockNow() - mutationStarted };
+    this.reflowFrom(paragraphIndex, new Set([found.paragraph.id]));
+    const after = this.snapshotBlock(paragraphIndex, 1);
+    const caret = this.positionAt(paragraphIndex, current.anchorCharOffset);
+    this.recordSnapshot(paragraphIndex, before, after, caret, caret, false);
+    return caret;
+  }
+  deleteObject(object: DocumentObject): TextPosition {
+    const found = this.findObjectById(object.id);
+    if (!found) throw new Error("삭제할 개체가 문서에 없습니다.");
+    const paragraphIndex = indexOf(found.paragraph);
+    const mutationStarted = clockNow();
+    const before = this.snapshotBlock(paragraphIndex, 1);
+    found.paragraph.objects = found.paragraph.objects.filter((entry) => entry.id !== object.id);
+    this._metrics = { ...this._metrics, modelMutationMs: clockNow() - mutationStarted };
+    this.reflowFrom(paragraphIndex, new Set([found.paragraph.id]));
+    const after = this.snapshotBlock(paragraphIndex, 1);
+    const caret = this.positionAt(paragraphIndex, found.value.anchorCharOffset);
+    this.recordSnapshot(paragraphIndex, before, after, caret, caret, false);
+    return caret;
+  }
   setHyperlink(_start: TextPosition, _end: TextPosition, _uri: string): TextPosition { throw unsupported("하이퍼링크"); }
   insertAutoNumber(_position: TextPosition, _kind: "page" | "current" | "total"): TextPosition { throw unsupported("자동 번호"); }
   insertFootnote(_position: TextPosition, _endnote?: boolean): TextPosition { throw unsupported("각주·미주"); }
@@ -709,7 +906,7 @@ export class HanulTextDocumentSession implements DocumentSession {
       const afterParaIndex = aPath[0].cellParaIndex + inserted.length - 1;
       const afterOffset = inserted[inserted.length - 1].text.length - suffix.length;
       const after = this.snapshotBlock(blockIndex, 1);
-      const afterCaret = this.positionAtCell(blockIndex, cellIndex, afterParaIndex, afterOffset);
+      const afterCaret = this.positionAtCell(blockIndex, cellIndex, afterParaIndex, afterOffset, undefined, aPath[0].controlIndex);
       const typing = aPath[0].cellParaIndex === bPath[0].cellParaIndex && a.charOffset === b.charOffset && text.length > 0 && !text.includes("\n");
       this.recordSnapshot(blockIndex, before, after, start, afterCaret, typing);
       return afterCaret;
@@ -776,6 +973,20 @@ export class HanulTextDocumentSession implements DocumentSession {
       } else {
         const haystack = caseSensitive ? p.text : p.text.toLocaleLowerCase(); let offset = 0;
         while ((offset = haystack.indexOf(term, offset)) >= 0) { matches.push({ start: this.positionAt(indexOf(p), offset), end: this.positionAt(indexOf(p), offset + query.length), matchedText: p.text.slice(offset, offset + query.length) }); offset += Math.max(query.length, 1); }
+      }
+      for (const object of p.objects) {
+        if (object.kind !== "textBox") continue;
+        object.textParagraphs?.forEach((paragraph, cellParaIndex) => {
+          const haystack = caseSensitive ? paragraph.text : paragraph.text.toLocaleLowerCase(); let offset = 0;
+          while ((offset = haystack.indexOf(term, offset)) >= 0) {
+            matches.push({
+              start: this.positionAtCell(indexOf(p), 0, cellParaIndex, offset, undefined, object.controlIndex),
+              end: this.positionAtCell(indexOf(p), 0, cellParaIndex, offset + query.length, undefined, object.controlIndex),
+              matchedText: paragraph.text.slice(offset, offset + query.length),
+            });
+            offset += Math.max(query.length, 1);
+          }
+        });
       }
     }
     return matches;
@@ -856,6 +1067,7 @@ export class HanulTextDocumentSession implements DocumentSession {
   }
 
   tableLayout(position: TextPosition): TableLayoutInfo {
+    if (position.cellPath?.[0].controlIndex !== 0) throw new Error("글상자에는 표 크기 설정을 적용할 수 없습니다.");
     const { cell, cellIndex } = this.cellParagraph(position);
     const table = this.blockAt(position.parentParagraphIndex!).table!;
     const origin = table.cells[cellIndex];
@@ -970,6 +1182,51 @@ export class HanulTextDocumentSession implements DocumentSession {
     return this.positionAt(Math.min(first + created.length - 1, this.paragraphCount() - 1), caret.charOffset);
   }
 
+  private newObject(position: TextPosition, kind: DocumentObjectKind, widthMm: number, heightMm: number): PlainTextObject {
+    const paragraphIndex = this.clampPara(position.paragraphIndex);
+    const controlIndex = this.nextObjectControlIndex++;
+    const bounds = {
+      pageIndex: position.cursorRect.pageIndex,
+      x: position.cursorRect.x,
+      y: position.cursorRect.y,
+      width: widthMm * PX_PER_MM,
+      height: heightMm * PX_PER_MM,
+    };
+    return {
+      id: `0:${paragraphIndex}:${controlIndex}:${kind}`,
+      kind, sectionIndex: 0, paragraphIndex, controlIndex,
+      pageIndex: position.cursorRect.pageIndex, bounds, zOrder: this.blockAt(paragraphIndex).objects.length,
+      widthMm, heightMm, offsetXmm: bounds.x / PX_PER_MM, offsetYmm: bounds.y / PX_PER_MM,
+      textWrap: "InFrontOfText", treatAsCharacter: false,
+      description: kind === "picture" ? "" : kind === "ellipse" ? "타원" : kind === "textBox" ? "글상자" : "사각형",
+      anchorCharOffset: Math.max(0, Math.min(this.blockAt(paragraphIndex).text.length, position.charOffset)),
+      properties: {},
+    };
+  }
+
+  private addObject(position: TextPosition, object: PlainTextObject): TextPosition {
+    const paragraphIndex = this.clampPara(position.paragraphIndex);
+    const paragraph = this.blockAt(paragraphIndex);
+    if (paragraph.table) throw new Error("표 블록에 개체를 삽입하는 기능은 아직 지원하지 않습니다.");
+    const mutationStarted = clockNow();
+    const before = this.snapshotBlock(paragraphIndex, 1);
+    paragraph.objects.push(object);
+    this._metrics = { ...this._metrics, modelMutationMs: clockNow() - mutationStarted };
+    this.reflowFrom(paragraphIndex, new Set([paragraph.id]));
+    const after = this.snapshotBlock(paragraphIndex, 1);
+    const caret = this.positionAt(paragraphIndex, object.anchorCharOffset);
+    this.recordSnapshot(paragraphIndex, before, after, position, caret, false);
+    return caret;
+  }
+
+  private findObjectById(id: string): { paragraph: Para; value: PlainTextObject } | null {
+    for (const paragraph of iterate(this.root)) {
+      const value = paragraph.objects.find((object) => object.id === id);
+      if (value) return { paragraph, value };
+    }
+    return null;
+  }
+
   private reflowFrom(index: number, changedIds: Set<number>, startAt?: FlowState, initiallyDirty?: Set<number>): void {
     const start = clockNow(); const first = this.clampPara(index);
     let state = startAt ?? (first === 0 ? { page: 0, line: 0 } : { ...at(this.root, first - 1).endState });
@@ -1001,6 +1258,7 @@ export class HanulTextDocumentSession implements DocumentSession {
         const bucket = this.pageLineIndex.get(state.page) ?? []; bucket.push(placed); this.pageLineIndex.set(state.page, bucket);
         state = { page: state.page, line: state.line + 1 };
       }
+      this.placeObjects(p, state, dirtyPages, placements);
       p.placed = placements; p.endState = { ...state }; refreshUp(p); invalidated++; lastNode = p; changedIds.delete(p.id);
     }
     if (processedToEnd) lastNode = at(this.root, this.paragraphCount() - 1);
@@ -1027,6 +1285,12 @@ export class HanulTextDocumentSession implements DocumentSession {
       const fragments = this.pageTableIndex.get(pageIndex)?.filter((fragment) => fragment.paragraphId !== p.id) ?? [];
       if (fragments.length) this.pageTableIndex.set(pageIndex, fragments); else this.pageTableIndex.delete(pageIndex);
       dirtyPages.add(pageIndex);
+    }
+    for (const [pageIndex, objects] of this.pageObjectIndex) {
+      const kept = objects.filter((object) => object.paragraphId !== p.id);
+      if (kept.length === objects.length) continue;
+      dirtyPages.add(pageIndex);
+      if (kept.length) this.pageObjectIndex.set(pageIndex, kept); else this.pageObjectIndex.delete(pageIndex);
     }
   }
 
@@ -1178,6 +1442,71 @@ export class HanulTextDocumentSession implements DocumentSession {
     return state;
   }
 
+  private placeObjects(p: Para, fallbackState: FlowState, dirtyPages: Set<number>, placements: TextLine[]): void {
+    if (!p.objects.length) return;
+    const bodyLines = placements.filter((line) => line.cellIndex === undefined && line.objectControlIndex === undefined);
+    for (const object of p.objects) {
+      const anchor = bodyLines.find((line) => object.anchorCharOffset >= line.start && object.anchorCharOffset <= line.end)
+        ?? bodyLines[bodyLines.length - 1];
+      const pageIndex = anchor?.pageIndex ?? fallbackState.page;
+      const x = object.offsetXmm * PX_PER_MM;
+      const y = object.offsetYmm * PX_PER_MM;
+      const width = object.widthMm * PX_PER_MM;
+      const height = object.heightMm * PX_PER_MM;
+      object.pageIndex = pageIndex;
+      object.bounds = { pageIndex, x, y, width, height };
+      const paint = object.paint;
+      const href = object.imageData && object.imageExtension
+        ? imageDataUri(object.imageData, object.imageExtension)
+        : undefined;
+      const display: DisplayDocumentObject = {
+        id: object.id, paragraphId: p.id, controlIndex: object.controlIndex,
+        kind: object.kind, pageIndex, zOrder: object.zOrder,
+        x, y, width, height,
+        textWrap: object.textWrap,
+        ...(href ? { href } : {}),
+        ...(paint ? { fillColor: paint.fillColor, strokeColor: paint.strokeColor, strokeWidth: paint.strokeWidth, opacity: paint.opacity } : {}),
+      };
+      const bucket = this.pageObjectIndex.get(pageIndex) ?? [];
+      bucket.push(display);
+      bucket.sort((left, right) => left.zOrder - right.zOrder);
+      this.pageObjectIndex.set(pageIndex, bucket);
+      dirtyPages.add(pageIndex);
+      if (object.kind !== "textBox" || !object.textParagraphs?.length) continue;
+      const margins = object.textMarginsMm ?? { left: 2, right: 2, top: 2, bottom: 2 };
+      const left = margins.left * PX_PER_MM; const right = margins.right * PX_PER_MM;
+      const top = margins.top * PX_PER_MM; const bottom = margins.bottom * PX_PER_MM;
+      const contentWidth = Math.max(4, width - left - right);
+      let lineY = y + top;
+      for (let cellParaIndex = 0; cellParaIndex < object.textParagraphs.length; cellParaIndex += 1) {
+        const paragraph = object.textParagraphs[cellParaIndex];
+        const wrapped = wrapTextParagraph(paragraph, contentWidth);
+        for (const line of wrapped) {
+          if (lineY + line.fontSize > y + height - bottom) break;
+          const format = paragraph.characterFormats.find((run) => line.start >= run.start && line.start < run.end)?.format ?? {};
+          const alignment = paragraph.paragraphFormat.alignment ?? "left";
+          const textWidth = measureText(line.text, line.fontSize);
+          const xOffset = alignment === "center" ? Math.max(0, (contentWidth - textWidth) / 2)
+            : alignment === "right" ? Math.max(0, contentWidth - textWidth) : 0;
+          const placed: TextLine = {
+            paragraphIndex: indexOf(p), paragraphId: p.id, objectControlIndex: object.controlIndex,
+            cellParaIndex, start: line.start, end: line.end, text: line.text,
+            x: x + left + xOffset, y: lineY + line.fontSize,
+            fontSize: line.fontSize, fontFamily: format.fontFamily ?? "함초롬바탕",
+            bold: format.bold ?? false, italic: format.italic ?? false,
+            underline: format.underline ?? false, strikethrough: format.strikethrough ?? false,
+            pageIndex, lineIndex: Math.floor((lineY - this.contentY()) / DEFAULT_LINE_HEIGHT),
+          };
+          placements.push(placed);
+          const lines = this.pageLineIndex.get(pageIndex) ?? [];
+          lines.push(placed); this.pageLineIndex.set(pageIndex, lines);
+          lineY += DEFAULT_LINE_HEIGHT;
+        }
+        lineY += DEFAULT_LINE_HEIGHT * 0.25;
+      }
+    }
+  }
+
   private recordSnapshot(index: number, before: PlainTextParagraph[], after: PlainTextParagraph[], beforeCaret: TextPosition, afterCaret: TextPosition, typing: boolean): void {
     const prior = this.undoStack[this.undoStack.length - 1];
     const sameTypingLocation = prior && (prior.afterCaret.cellPath || beforeCaret.cellPath
@@ -1198,17 +1527,27 @@ export class HanulTextDocumentSession implements DocumentSession {
   private clampPara(index: number): number { return Math.max(0, Math.min(this.paragraphCount() - 1, Math.trunc(index))); }
   private positionAt(paragraphIndex: number, charOffset: number): TextPosition {
     const i = this.clampPara(paragraphIndex); const p = at(this.root, i); const offset = Math.max(0, Math.min(p.text.length, charOffset));
-    const line = p.placed.find((item) => offset >= item.start && offset <= item.end) ?? p.placed[p.placed.length - 1];
+    const bodyLines = p.placed.filter((item) => item.objectControlIndex === undefined && item.cellIndex === undefined);
+    const line = bodyLines.find((item) => offset >= item.start && offset <= item.end) ?? bodyLines[bodyLines.length - 1];
     const x = line ? line.x + measureText(p.text.slice(line.start, offset), line.fontSize) * this.visualScale(line) : this.contentX(p, "", DEFAULT_FONT_SIZE);
     const y = line?.y ?? this.contentY() + DEFAULT_FONT_SIZE;
     return { sectionIndex: 0, paragraphIndex: i, charOffset: offset, cursorRect: { pageIndex: line?.pageIndex ?? p.startState.page, x, y: y - DEFAULT_FONT_SIZE, height: DEFAULT_LINE_HEIGHT } };
   }
-  private positionAtCell(blockIndex: number, cellIndex: number, cellParaIndex: number, charOffset: number, preferredPageIndex?: number): TextPosition {
-    const block = this.blockAt(blockIndex); const cell = block.table?.cells[cellIndex];
-    if (!cell) throw new RangeError("표 셀 위치를 찾을 수 없습니다.");
+  private positionAtCell(blockIndex: number, cellIndex: number, cellParaIndex: number, charOffset: number, preferredPageIndex?: number, controlIndex = 0): TextPosition {
+    const block = this.blockAt(blockIndex);
+    const object = controlIndex === 0 ? undefined : block.objects.find((item) => item.controlIndex === controlIndex && item.kind === "textBox");
+    const cell: EditableCell | undefined = controlIndex === 0
+      ? block.table?.cells[cellIndex]
+      : object?.textParagraphs ? { paragraphs: object.textParagraphs, properties: {
+        paddingLeft: (object.textMarginsMm?.left ?? 2) * HWP_UNITS_PER_MM,
+        paddingRight: (object.textMarginsMm?.right ?? 2) * HWP_UNITS_PER_MM,
+        paddingTop: (object.textMarginsMm?.top ?? 2) * HWP_UNITS_PER_MM,
+        paddingBottom: (object.textMarginsMm?.bottom ?? 2) * HWP_UNITS_PER_MM,
+      } } : undefined;
+    if (!cell) throw new RangeError(controlIndex === 0 ? "표 셀 위치를 찾을 수 없습니다." : "글상자 문단 위치를 찾을 수 없습니다.");
     const paragraph = cell.paragraphs[Math.max(0, Math.min(cell.paragraphs.length - 1, cellParaIndex))] ?? { text: "", paragraphFormat: {}, characterFormats: [], pageBreakBefore: false };
     const offset = Math.max(0, Math.min(paragraph.text.length, charOffset));
-    const cellLines = block.placed.filter((item) => item.cellIndex === cellIndex && item.cellParaIndex === cellParaIndex);
+    const cellLines = block.placed.filter((item) => (controlIndex === 0 ? item.cellIndex === cellIndex : item.objectControlIndex === controlIndex) && item.cellParaIndex === cellParaIndex);
     const preferredLines = preferredPageIndex === undefined ? cellLines : cellLines.filter((item) => item.pageIndex === preferredPageIndex);
     const line = preferredLines.find((item) => item.start === offset)
       ?? preferredLines.find((item) => offset >= item.start && offset <= item.end)
@@ -1216,33 +1555,43 @@ export class HanulTextDocumentSession implements DocumentSession {
       ?? cellLines.find((item) => offset >= item.start && offset <= item.end)
       ?? cellLines[0];
     const pageFragments = preferredPageIndex === undefined ? [] : this.pageTableIndex.get(preferredPageIndex) ?? [];
-    const cellFragment = pageFragments.find((fragment) => fragment.paragraphId === block.id && fragment.cells.some((item) => item.cellIndex === cellIndex))
-      ?? [...this.pageTableIndex.values()].flat().find((fragment) => fragment.paragraphId === block.id && fragment.cells.some((item) => item.cellIndex === cellIndex));
+    const cellFragment = controlIndex === 0 ? pageFragments.find((fragment) => fragment.paragraphId === block.id && fragment.cells.some((item) => item.cellIndex === cellIndex))
+      ?? [...this.pageTableIndex.values()].flat().find((fragment) => fragment.paragraphId === block.id && fragment.cells.some((item) => item.cellIndex === cellIndex)) : undefined;
     const cellBox = cellFragment?.cells.find((item) => item.cellIndex === cellIndex);
+    const paddingLeft = rawCellPaddingToPx(cell.properties.paddingLeft);
+    const paddingTop = rawCellPaddingToPx(cell.properties.paddingTop);
     const x = line ? line.x + measureText(paragraph.text.slice(line.start, offset), line.fontSize) * this.visualScale(line)
-      : (cellBox?.x ?? this.pageDefinitionValue.marginLeft * PX_PER_MM) + rawCellPaddingToPx(cell.properties.paddingLeft);
-    const y = line?.y ?? (cellBox?.y ?? this.contentY()) + rawCellPaddingToPx(cell.properties.paddingTop) + DEFAULT_FONT_SIZE;
-    const pageIndex = line?.pageIndex ?? cellFragment?.pageIndex ?? block.startState.page;
+      : (object?.bounds.x ?? cellBox?.x ?? this.pageDefinitionValue.marginLeft * PX_PER_MM) + paddingLeft;
+    const y = line?.y ?? (object?.bounds.y ?? cellBox?.y ?? this.contentY()) + paddingTop + DEFAULT_FONT_SIZE;
+    const pageIndex = line?.pageIndex ?? object?.pageIndex ?? cellFragment?.pageIndex ?? block.startState.page;
     return {
       sectionIndex: 0,
       paragraphIndex: cellParaIndex,
       parentParagraphIndex: blockIndex,
-      cellPath: [{ controlIndex: 0, cellIndex, cellParaIndex }],
+      cellPath: [{ controlIndex, cellIndex, cellParaIndex }],
       charOffset: offset,
       cursorRect: { pageIndex, x, y: y - DEFAULT_FONT_SIZE, height: DEFAULT_LINE_HEIGHT },
     };
   }
   private blockAt(index: number): Para { return at(this.root, this.clampPara(index)); }
-  private cellParagraph(position: TextPosition): { cell: PlainTextTableCell; cellIndex: number; cellParaIndex: number; paragraph: Omit<PlainTextParagraph, "table"> } {
+  private cellParagraph(position: TextPosition): { cell: EditableCell; cellIndex: number; cellParaIndex: number; paragraph: Omit<PlainTextParagraph, "table" | "objects"> } {
     if (!position.cellPath?.length || position.parentParagraphIndex === undefined) throw new Error("표 셀 위치가 아닙니다.");
     const block = this.blockAt(position.parentParagraphIndex); const segment = position.cellPath[0];
-    const cell = block.table?.cells[segment.cellIndex]; const paragraph = cell?.paragraphs[segment.cellParaIndex];
+    const object = segment.controlIndex === 0 ? undefined : block.objects.find((item) => item.controlIndex === segment.controlIndex && item.kind === "textBox");
+    const cell: EditableCell | undefined = segment.controlIndex === 0 ? block.table?.cells[segment.cellIndex]
+      : object?.textParagraphs ? { paragraphs: object.textParagraphs, properties: {
+        paddingLeft: (object.textMarginsMm?.left ?? 2) * HWP_UNITS_PER_MM,
+        paddingRight: (object.textMarginsMm?.right ?? 2) * HWP_UNITS_PER_MM,
+        paddingTop: (object.textMarginsMm?.top ?? 2) * HWP_UNITS_PER_MM,
+        paddingBottom: (object.textMarginsMm?.bottom ?? 2) * HWP_UNITS_PER_MM,
+      } } : undefined;
+    const paragraph = cell?.paragraphs[segment.cellParaIndex];
     if (!cell || !paragraph) throw new RangeError("표 셀 문단 위치를 찾을 수 없습니다.");
     return { cell, cellIndex: segment.cellIndex, cellParaIndex: segment.cellParaIndex, paragraph };
   }
   private restorePosition(position: TextPosition): TextPosition {
     return position.cellPath && position.parentParagraphIndex !== undefined
-      ? this.positionAtCell(position.parentParagraphIndex, position.cellPath[0].cellIndex, position.cellPath[0].cellParaIndex, position.charOffset)
+      ? this.positionAtCell(position.parentParagraphIndex, position.cellPath[0].cellIndex, position.cellPath[0].cellParaIndex, position.charOffset, undefined, position.cellPath[0].controlIndex)
       : this.positionAt(position.paragraphIndex, position.charOffset);
   }
   private ordered(a: TextPosition, b: TextPosition): [TextPosition, TextPosition] {
@@ -1250,8 +1599,8 @@ export class HanulTextDocumentSession implements DocumentSession {
       if (!sameCell(a, b)) throw new Error("한 셀 안에서만 범위를 선택할 수 있습니다.");
       const ai = a.cellPath[0].cellParaIndex; const bi = b.cellPath[0].cellParaIndex;
       return ai < bi || (ai === bi && a.charOffset <= b.charOffset)
-        ? [this.positionAtCell(a.parentParagraphIndex!, a.cellPath[0].cellIndex, ai, a.charOffset), this.positionAtCell(b.parentParagraphIndex!, b.cellPath[0].cellIndex, bi, b.charOffset)]
-        : [this.positionAtCell(b.parentParagraphIndex!, b.cellPath[0].cellIndex, bi, b.charOffset), this.positionAtCell(a.parentParagraphIndex!, a.cellPath[0].cellIndex, ai, a.charOffset)];
+        ? [this.positionAtCell(a.parentParagraphIndex!, a.cellPath[0].cellIndex, ai, a.charOffset, undefined, a.cellPath[0].controlIndex), this.positionAtCell(b.parentParagraphIndex!, b.cellPath[0].cellIndex, bi, b.charOffset, undefined, b.cellPath[0].controlIndex)]
+        : [this.positionAtCell(b.parentParagraphIndex!, b.cellPath[0].cellIndex, bi, b.charOffset, undefined, b.cellPath[0].controlIndex), this.positionAtCell(a.parentParagraphIndex!, a.cellPath[0].cellIndex, ai, a.charOffset, undefined, a.cellPath[0].controlIndex)];
     }
     const ai = this.clampPara(a.paragraphIndex); const bi = this.clampPara(b.paragraphIndex);
     return ai < bi || (ai === bi && a.charOffset <= b.charOffset) ? [this.positionAt(ai, a.charOffset), this.positionAt(bi, b.charOffset)] : [this.positionAt(bi, b.charOffset), this.positionAt(ai, a.charOffset)];
@@ -1295,6 +1644,7 @@ const HWP_UNITS_PER_MM = 7200 / 25.4;
 function rawCellPaddingToPx(value: unknown): number { return typeof value === "number" ? value * 96 / 7200 : 0; }
 function sameCell(a: TextPosition, b: TextPosition): boolean {
   return !!a.cellPath && !!b.cellPath && a.parentParagraphIndex === b.parentParagraphIndex
+    && a.cellPath[0].controlIndex === b.cellPath[0].controlIndex
     && a.cellPath[0].cellIndex === b.cellPath[0].cellIndex;
 }
 
@@ -1510,6 +1860,19 @@ function measureChar(char: string, fontSize: number): number {
 function measureText(text: string, fontSize: number): number { return Array.from(text).reduce((sum, char) => sum + measureChar(char, fontSize), 0); }
 function fontSizePx(rawSize: number): number { return rawSize > 100 ? rawSize * 96 / 7200 : rawSize; }
 function escapeXml(text: string): string { return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;"); }
+function safeSvgId(value: string): string { return value.replace(/[^a-zA-Z0-9_-]/gu, "-"); }
+function imageDataUri(data: Uint8Array, extension: string): string {
+  const mime = extension === "jpg" || extension === "jpeg" ? "image/jpeg" : extension === "gif" ? "image/gif" : extension === "bmp" ? "image/bmp" : "image/png";
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  for (let index = 0; index < data.length; index += 3) {
+    const a = data[index] ?? 0; const hasB = index + 1 < data.length; const hasC = index + 2 < data.length;
+    const b = hasB ? data[index + 1]! : 0; const c = hasC ? data[index + 2]! : 0;
+    encoded += alphabet[a >> 2] + alphabet[((a & 3) << 4) | (b >> 4)]
+      + (hasB ? alphabet[((b & 15) << 2) | (c >> 6)] : "=") + (hasC ? alphabet[c & 63] : "=");
+  }
+  return `data:${mime};base64,${encoded}`;
+}
 function isLowSurrogate(code: number): boolean { return code >= 0xdc00 && code <= 0xdfff; }
 function isHighSurrogate(code: number): boolean { return code >= 0xd800 && code <= 0xdbff; }
 function unsupported(feature: string): Error { return new Error(`${feature}은 새 문서 엔진에서 아직 지원되지 않습니다. 기존 HWP/HWPX 문서를 열거나 RHWP 호환성 엔진을 사용하세요.`); }

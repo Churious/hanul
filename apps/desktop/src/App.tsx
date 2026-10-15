@@ -298,7 +298,7 @@ type ObjectPointerDrag = {
 };
 
 type PointerGestureMetrics = {
-  kind: "object-drag" | "table-selection" | "text-selection";
+  kind: "object-drag" | "table-selection" | "text-selection" | "text-box-selection";
   startedAt: number;
   rawMoves: number;
   frames: number;
@@ -406,9 +406,21 @@ function DocumentPage({
       const sanitizeStartedAt = performance.now();
       const safeSvg = sanitizeRenderedSvg(DOMPurify, rendered);
       const sanitizeMs = performance.now() - sanitizeStartedAt;
+      if (import.meta.env.DEV) {
+        const metrics = session.performanceMetrics?.();
+        reportAppPerformance("page-svg-render", {
+          page: pageIndex + 1,
+          modelMutationMs: Number((metrics?.modelMutationMs ?? 0).toFixed(2)),
+          incrementalLayoutMs: Number((metrics?.incrementalLayoutMs ?? 0).toFixed(2)),
+          svgMs: Number((metrics?.renderedPageMs ?? renderMs).toFixed(2)),
+          sanitizeMs: Number(sanitizeMs.toFixed(2)),
+          invalidatedParagraphs: metrics?.invalidatedParagraphs ?? 0,
+          invalidatedPages: metrics?.invalidatedPages ?? 0,
+        });
+        pendingSvgCommitStartedAt.current = performance.now();
+      }
       if (measure) {
         reportAppPerformance("first-page-svg", { page: pageIndex + 1, sourceSvgCharacters: rendered.length, renderMs: Number(renderMs.toFixed(1)), sanitizeMs: Number(sanitizeMs.toFixed(1)) });
-        pendingSvgCommitStartedAt.current = performance.now();
       }
       return { svg: safeSvg, error: "" };
     } catch (cause) {
@@ -433,6 +445,19 @@ function DocumentPage({
       const safeSvg = sanitizeRenderedSvg(DOMPurify, rendered);
       const sanitizeMs = performance.now() - sanitizeStartedAt;
       if (active) {
+        if (import.meta.env.DEV) {
+          const metrics = session.performanceMetrics?.();
+          reportAppPerformance("page-svg-render", {
+            page: pageIndex + 1,
+            modelMutationMs: Number((metrics?.modelMutationMs ?? 0).toFixed(2)),
+            incrementalLayoutMs: Number((metrics?.incrementalLayoutMs ?? 0).toFixed(2)),
+            svgMs: Number((metrics?.renderedPageMs ?? renderMs).toFixed(2)),
+            sanitizeMs: Number(sanitizeMs.toFixed(2)),
+            invalidatedParagraphs: metrics?.invalidatedParagraphs ?? 0,
+            invalidatedPages: metrics?.invalidatedPages ?? 0,
+          });
+          pendingSvgCommitStartedAt.current = performance.now();
+        }
         if (measure) {
           reportAppPerformance("first-page-svg", {
             page: pageIndex + 1,
@@ -440,7 +465,6 @@ function DocumentPage({
             renderMs: Number(renderMs.toFixed(1)),
             sanitizeMs: Number(sanitizeMs.toFixed(1)),
           });
-          pendingSvgCommitStartedAt.current = performance.now();
         }
         setSvg(safeSvg);
       }
@@ -458,13 +482,13 @@ function DocumentPage({
   useLayoutEffect(() => {
     const startedAt = pendingSvgCommitStartedAt.current;
     if (displaySvg && startedAt !== null) {
-      reportAppPerformance("first-page-react-commit", {
+      reportAppPerformance("page-react-commit", {
         page: pageIndex + 1,
-        durationMs: Number((performance.now() - startedAt).toFixed(1)),
+        renderToCommitMs: Number((performance.now() - startedAt).toFixed(2)),
       });
       pendingSvgCommitStartedAt.current = null;
     }
-  }, [pageIndex, displaySvg]);
+  }, [pageIndex, displaySvg, pageRenderRevision]);
 
   const pageSvgViewBox = useMemo(() => {
     const match = displaySvg.match(/\bviewBox=["']([^"']+)["']/i);
@@ -1396,6 +1420,23 @@ function App() {
       }
       const object = resizeTarget ?? (point ? session.hitTestObject(pageIndex, point.x, point.y) : null);
       if (point && object) {
+        if (object.kind === "textBox" && selectedObjectId === object.id && !resizeTarget) {
+          const textPosition = session.hitTest(pageIndex, point.x, point.y);
+          if (textPosition.cellPath?.[0]?.controlIndex === object.controlIndex) {
+            const next = { anchor: textPosition, focus: textPosition };
+            pointerSelection.current = next;
+            pointerGestureMetrics.current = {
+              kind: "text-box-selection", startedAt: performance.now(), rawMoves: 0, frames: 0, lastFrameAt: null, maxFrameGapMs: 0,
+            };
+            setSelection(next);
+            setCaretPosition(textPosition);
+            setPendingCharacterFormat({});
+            session.clearTypingFormat();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            editInput.current?.focus();
+            return;
+          }
+        }
         setSelectedObjectId(object.id);
         setCurrentPage(pageIndex + 1);
         setPageInput(String(pageIndex + 1));
@@ -1465,8 +1506,9 @@ function App() {
         if (point) {
           const dxMm = (point.x - drag.startX) * 25.4 / 96;
           const dyMm = (point.y - drag.startY) * 25.4 / 96;
+          const bounds = previewObjectDrag(drag.object, { x: drag.startX, y: drag.startY }, point, drag.resize);
           const updates = drag.resize
-            ? { widthMm: Math.max(1, drag.object.widthMm + dxMm), heightMm: Math.max(1, drag.object.heightMm + dyMm) }
+            ? { widthMm: Math.max(1, bounds.width * 25.4 / 96), heightMm: Math.max(1, bounds.height * 25.4 / 96) }
             : { offsetXmm: drag.object.offsetXmm + dxMm, offsetYmm: drag.object.offsetYmm + dyMm };
           if (dxMm || dyMm) {
             const commitStartedAt = performance.now();
@@ -1501,6 +1543,15 @@ function App() {
   };
 
   const updateAfterEdit = (position: TextPosition) => {
+    const engineMetrics = session?.performanceMetrics?.();
+    if (engineMetrics) {
+      reportAppPerformance("document-edit-model-layout", {
+        modelMutationMs: Number(engineMetrics.modelMutationMs.toFixed(2)),
+        incrementalLayoutMs: Number(engineMetrics.incrementalLayoutMs.toFixed(2)),
+        invalidatedParagraphs: engineMetrics.invalidatedParagraphs,
+        invalidatedPages: engineMetrics.invalidatedPages,
+      });
+    }
     setCaretPosition(position);
     setSelection(null);
     pointerSelection.current = null;
@@ -1864,7 +1915,7 @@ function App() {
     }
   };
 
-  const insertShape = (kind: "rectangle" | "textBox") => {
+  const insertShape = (kind: "rectangle" | "ellipse" | "textBox") => {
     if (!session || !caret || isRangeSelection(selection)) return;
     try {
       const before = new Set(session.listObjects(caret.sectionIndex).map((object) => object.id));
@@ -2609,10 +2660,11 @@ function App() {
             </>}
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
-              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 그림 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 도형 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("rectangle")}>사각형</button>
-              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 도형 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("textBox")}>글상자</button>
-              <span className="ribbon-group-label">그림</span>
+              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("rectangle")}>사각형</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("ellipse")}>타원</button>
+              <button className="ribbon-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath)} onMouseDown={(event) => event.preventDefault()} onClick={() => insertShape("textBox")}>글상자</button>
+              <span className="ribbon-group-label">그림·도형</span>
             </div>
             {documentObjects.length > 0 && <>
               <span className="ribbon-divider" />
@@ -2625,7 +2677,7 @@ function App() {
                   if (object) moveToPage(object.pageIndex + 1);
                 }}>
                   <option value="">개체를 선택하세요</option>
-                  {documentObjects.map((object, index) => <option key={object.id} value={object.id}>{object.kind === "picture" ? "그림" : object.kind === "textBox" ? "글상자" : "사각형"} {index + 1}</option>)}
+                  {documentObjects.map((object, index) => <option key={object.id} value={object.id}>{object.kind === "picture" ? "그림" : object.kind === "textBox" ? "글상자" : object.kind === "ellipse" ? "타원" : "사각형"} {index + 1}</option>)}
                 </select>
                 {selectedObject && objectEditDraft && <>
                   <div className="object-size-fields">
@@ -2635,10 +2687,12 @@ function App() {
                     <label>Y <input aria-label="개체 Y 위치 mm" type="number" min="-500" max="1000" step="0.1" value={objectEditDraft.offsetYmm} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, offsetYmm: event.currentTarget.value } : current)} /></label>
                   </div>
                   <select className="ribbon-select object-wrap-select" aria-label="개체 글 배치" value={objectEditDraft.textWrap} onChange={(event) => setObjectEditDraft((current) => current ? { ...current, textWrap: event.currentTarget.value as DocumentObjectTextWrap } : current)}>
-                    <option value="Square">자리 차지</option>
-                    <option value="TopAndBottom">위아래</option>
-                    <option value="Tight">밀착</option>
-                    <option value="Through">통과</option>
+                    {!isHanulTextEngine && <>
+                      <option value="Square">자리 차지</option>
+                      <option value="TopAndBottom">위아래</option>
+                      <option value="Tight">밀착</option>
+                      <option value="Through">통과</option>
+                    </>}
                     <option value="BehindText">글 뒤</option>
                     <option value="InFrontOfText">글 앞으로</option>
                   </select>

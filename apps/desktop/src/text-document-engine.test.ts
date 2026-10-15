@@ -113,6 +113,71 @@ describe("Hanul paragraph text engine", () => {
     session.dispose();
   });
 
+  it.each([35, 98, 500])("measures independent shape insert and move in a synthetic %i-page document", (pageCount) => {
+    const rssBeforeBytes = readRssBytes();
+    const session = createInMemoryTextSession(Array.from({ length: pageCount * LINES_PER_PAGE }, (_, index) => ({ text: syntheticParagraph(index) })));
+    const rssAfterCreateBytes = readRssBytes();
+    const line = session.displayList(0).lines.find((item) => item.cellIndex === undefined && item.objectControlIndex === undefined);
+    expect(line).toBeDefined();
+    const anchor = session.hitTest(0, line!.x + 1, line!.y);
+
+    const insertStartedAt = performance.now();
+    session.insertShape(anchor, "rectangle", 40, 24);
+    const insertCompletedAt = performance.now();
+    const insertMetrics = { ...session.metrics };
+    const insertSvg = session.renderPage(0);
+    const insertRenderMetrics = { ...session.metrics };
+    const insertRenderedAt = performance.now();
+    const shape = session.listObjects(0).find((object) => object.kind === "rectangle");
+    expect(shape).toBeDefined();
+
+    const moveStartedAt = performance.now();
+    session.updateObject(shape!, { offsetXmm: shape!.offsetXmm + 2, offsetYmm: shape!.offsetYmm + 1 });
+    const moveCompletedAt = performance.now();
+    const moveMetrics = { ...session.metrics };
+    const movedSvg = session.renderPage(0);
+    const moveRenderMetrics = { ...session.metrics };
+    const moveRenderedAt = performance.now();
+    expect(insertSvg).toContain("<rect");
+    expect(movedSvg).toContain("<rect");
+    expect(insertMetrics.invalidatedPages).toBe(1);
+    expect(moveMetrics.invalidatedPages).toBe(1);
+
+    console.log("HANUL_OBJECT_ENGINE_BENCH", JSON.stringify({
+      platform: (globalThis as typeof globalThis & { process?: { platform?: string; version?: string } }).process?.platform ?? "browser-like",
+      runtime: (globalThis as typeof globalThis & { process?: { version?: string } }).process?.version ?? "unknown",
+      pageCount,
+      paragraphs: pageCount * LINES_PER_PAGE,
+      modelRssDeltaBytes: rssBeforeBytes !== null && rssAfterCreateBytes !== null ? rssAfterCreateBytes - rssBeforeBytes : null,
+      insert: {
+        modelMutationMs: insertMetrics.modelMutationMs,
+        incrementalLayoutMs: insertMetrics.incrementalLayoutMs,
+        svgMs: insertRenderMetrics.renderedPageMs,
+        modelToSvgMs: insertRenderedAt - insertStartedAt,
+        layoutElapsedMs: insertCompletedAt - insertStartedAt,
+        invalidatedParagraphs: insertMetrics.invalidatedParagraphs,
+        invalidatedPages: insertMetrics.invalidatedPages,
+        svgCharacters: insertSvg.length,
+      },
+      move: {
+        modelMutationMs: moveMetrics.modelMutationMs,
+        incrementalLayoutMs: moveMetrics.incrementalLayoutMs,
+        svgMs: moveRenderMetrics.renderedPageMs,
+        modelToSvgMs: moveRenderedAt - moveStartedAt,
+        layoutElapsedMs: moveCompletedAt - moveStartedAt,
+        invalidatedParagraphs: moveMetrics.invalidatedParagraphs,
+        invalidatedPages: moveMetrics.invalidatedPages,
+        svgCharacters: movedSvg.length,
+      },
+      measurementScope: "synthetic engine/model/layout/SVG only; excludes React commit and physical UI frame time",
+    }));
+    expect(session.undo()).not.toBeNull();
+    expect(session.listObjects(0)[0]?.offsetXmm).toBeCloseTo(shape!.offsetXmm, 2);
+    expect(session.redo()).not.toBeNull();
+    expect(session.listObjects(0)[0]?.offsetXmm).toBeCloseTo(shape!.offsetXmm + 2, 2);
+    session.dispose();
+  });
+
   it("deletes across paragraph boundaries and supports undo/redo", () => {
     const session = createInMemoryTextSession([{ text: "앞 문단" }, { text: "가운데" }, { text: "뒤 문단" }]);
     const firstLine = session.displayList(0).lines[0];

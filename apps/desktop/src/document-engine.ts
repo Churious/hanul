@@ -112,6 +112,15 @@ export interface ExportResult {
   report: ContentLossReport;
 }
 
+/** Optional stage timings exposed by engines without exposing their internal document model. */
+export interface DocumentPerformanceMetrics {
+  modelMutationMs: number;
+  incrementalLayoutMs: number;
+  invalidatedParagraphs: number;
+  invalidatedPages: number;
+  renderedPageMs: number;
+}
+
 export interface SearchMatch {
   start: TextPosition;
   end: TextPosition;
@@ -133,7 +142,7 @@ export interface HeaderFooterInfo {
   text: string;
 }
 
-export type DocumentObjectKind = "picture" | "rectangle" | "textBox";
+export type DocumentObjectKind = "picture" | "rectangle" | "ellipse" | "textBox";
 export type DocumentObjectTextWrap = "Square" | "TopAndBottom" | "Tight" | "Through" | "BehindText" | "InFrontOfText";
 
 /** A stable, engine-owned handle to an editable object in the document model. */
@@ -213,6 +222,8 @@ export interface DocumentSession {
   readonly sourceFormat: string;
   /** Page-local render invalidation counter; absent on legacy engines. */
   renderRevision?(pageIndex: number): number;
+  /** Latest synchronous stage timings where an engine can measure them. */
+  performanceMetrics?(): Readonly<DocumentPerformanceMetrics>;
   documentInfo(): DocumentInfo;
   pageInfo(pageIndex: number): RenderedPageInfo;
   renderPage(pageIndex: number): string;
@@ -245,7 +256,7 @@ export interface DocumentSession {
   deleteHeaderFooter(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope): TextPosition;
   insertHeaderFooterField(position: TextPosition, kind: HeaderFooterKind, scope: HeaderFooterScope, field: HeaderFooterFieldKind): TextPosition;
   insertPicture(position: TextPosition, imageData: Uint8Array, extension: string, naturalWidthPx: number, naturalHeightPx: number, widthMm: number, heightMm: number): TextPosition;
-  insertShape(position: TextPosition, kind: "rectangle" | "textBox", widthMm: number, heightMm: number): TextPosition;
+  insertShape(position: TextPosition, kind: "rectangle" | "ellipse" | "textBox", widthMm: number, heightMm: number): TextPosition;
   listObjects(sectionIndex: number): DocumentObject[];
   hitTestObject(pageIndex: number, x: number, y: number): DocumentObject | null;
   updateObject(object: DocumentObject, updates: DocumentObjectUpdates): TextPosition;

@@ -4,10 +4,11 @@ import init, { HwpDocument } from "@rhwp/core";
 import { readFile } from "node:fs/promises";
 import {
   createNewHwpDocumentSession,
+  hanulDocumentEngine,
   wrapHwpDocument,
   type TableCommand,
 } from "./hwp-engine";
-import type { DocumentObject, TextPosition } from "./document-engine";
+import type { DocumentObject, DocumentSession, TextPosition } from "./document-engine";
 
 beforeAll(async () => {
   const wasm = new Uint8Array(
@@ -1012,6 +1013,104 @@ describe("RHWP document session", () => {
     } finally {
       reopened.forEach((document) => document.dispose());
       session.dispose();
+    }
+  });
+
+  it("edits pictures, ellipses, rectangles, and text boxes in Hanul's independent model with HWP/HWPX round trips", async () => {
+    const session = await hanulDocumentEngine.createBlank();
+    const reopened: DocumentSession[] = [];
+    try {
+      expect(session.engineId).toBe("hanul-text");
+      const start = session.hitTest(0, 114, 134);
+      const anchor = session.insertText(start, "Object anchor");
+      const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII="), (character) => character.charCodeAt(0));
+      session.insertPicture(anchor, png, "png", 1, 1, 20, 20);
+      const insertedPicture = session.listObjects(0).find((object) => object.kind === "picture")!;
+      session.updateObject(insertedPicture, { widthMm: 28, heightMm: 10 });
+      expect(session.listObjects(0).find((object) => object.kind === "picture")).toMatchObject({ widthMm: 28, heightMm: 28 });
+      session.undo();
+      expect(session.listObjects(0).find((object) => object.kind === "picture")).toMatchObject({ widthMm: 20, heightMm: 20 });
+      session.redo();
+      session.insertShape(anchor, "rectangle", 30, 15);
+      session.insertShape(anchor, "ellipse", 24, 18);
+      session.insertShape(anchor, "textBox", 50, 24);
+      let objects = session.listObjects(0);
+      expect(objects.map((object) => object.kind)).toEqual(["picture", "rectangle", "ellipse", "textBox"]);
+      expect(session.renderPage(0)).toContain("<image");
+      expect(session.renderPage(0)).toContain("<ellipse");
+      const box = objects.find((object) => object.kind === "textBox")!;
+      const textCaret = session.hitTest(0, box.bounds.x + 4, box.bounds.y + 4);
+      expect(textCaret.cellPath?.[0]).toMatchObject({ controlIndex: box.controlIndex, cellIndex: 0 });
+      session.insertText(textCaret, "독립 글상자 내용");
+      expect(session.searchText("글상자 내용")).toHaveLength(1);
+      session.undo();
+      expect(session.searchText("글상자 내용")).toHaveLength(0);
+      session.redo();
+      expect(session.searchText("글상자 내용")).toHaveLength(1);
+      const resized = session.listObjects(0).find((object) => object.kind === "ellipse")!;
+      session.updateObject(resized, { widthMm: 32, heightMm: 22, offsetXmm: resized.offsetXmm + 5, textWrap: "BehindText" });
+      session.undo();
+      expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.widthMm).toBeCloseTo(24, 1);
+      session.redo();
+      expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.textWrap).toBe("BehindText");
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
+        const reopenedSession = await hanulDocumentEngine.open(saved.bytes);
+        reopened.push(reopenedSession);
+        expect(reopenedSession.engineId).toBe("hanul-text");
+        expect(reopenedSession.searchText("독립 글상자 내용")).toHaveLength(1);
+        expect(reopenedSession.listObjects(0).map((object) => object.kind).sort()).toEqual(["ellipse", "picture", "rectangle", "textBox"].sort());
+        expect(reopenedSession.listObjects(0).find((object) => object.kind === "picture")).toMatchObject({ widthMm: 28, heightMm: 28 });
+        const reopenedEllipse = reopenedSession.listObjects(0).find((object) => object.kind === "ellipse")!;
+        expect(reopenedEllipse.widthMm).toBeCloseTo(32, 2);
+        expect(reopenedEllipse.heightMm).toBeCloseTo(22, 2);
+        expect(reopenedEllipse.textWrap).toBe("BehindText");
+        expect(reopenedSession.renderPage(0)).toContain("<image");
+        expect(reopenedSession.renderPage(0)).toContain("base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII=");
+        expect(reopenedSession.renderPage(0)).toContain("<ellipse");
+        const importedTextBox = reopenedSession.listObjects(0).find((object) => object.kind === "textBox")!;
+        const importedTextCaret = reopenedSession.hitTest(0, importedTextBox.bounds.x + 4, importedTextBox.bounds.y + 4);
+        expect(importedTextCaret.cellPath?.[0]?.controlIndex).toBe(importedTextBox.controlIndex);
+        const inserted = reopenedSession.insertText(importedTextCaret, "편집");
+        expect(reopenedSession.searchText("편집")).toHaveLength(1);
+        reopenedSession.undo();
+        expect(reopenedSession.searchText("편집")).toHaveLength(0);
+        reopenedSession.redo();
+        expect(reopenedSession.searchText("편집")).toHaveLength(1);
+        expect(inserted.cellPath?.[0]?.controlIndex).toBe(importedTextBox.controlIndex);
+      }
+    } finally {
+      reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
+  it("keeps cropped pictures on the RHWP compatibility path instead of importing them lossily", async () => {
+    const source = HwpDocument.createEmpty();
+    let session: DocumentSession | null = null;
+    try {
+      source.createBlankDocument();
+      const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII="), (character) => character.charCodeAt(0));
+      const inserted = JSON.parse(source.insertPictureEx(JSON.stringify({
+        sectionIdx: 0, paraIdx: 0, charOffset: 0, width: 7200, height: 7200,
+        naturalWidthPx: 1, naturalHeightPx: 1, extension: "png", paperOffsetXHu: 0, paperOffsetYHu: 0,
+      }), png)) as { ok: boolean; paraIdx: number; controlIdx: number };
+      expect(inserted.ok).toBe(true);
+      expect(JSON.parse(source.setPictureProperties(0, inserted.paraIdx, inserted.controlIdx, JSON.stringify({
+        cropLeft: 100, textWrap: "InFrontOfText", treatAsChar: false,
+      }))).ok).toBe(true);
+      const exported = source.exportHwpWithReport();
+      const bytes = exported.takeBytes();
+      exported.free();
+      session = await hanulDocumentEngine.open(bytes);
+      expect(session.engineId).not.toBe("hanul-text");
+      expect(session.listObjects(0)).toHaveLength(1);
+      expect(session.listObjects(0)[0]).toMatchObject({ kind: "picture" });
+    } finally {
+      session?.dispose();
+      source.free();
     }
   });
 
