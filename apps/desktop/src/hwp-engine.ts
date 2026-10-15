@@ -2235,9 +2235,9 @@ export function serializePlainTextWithRhwp(
 }
 
 /**
- * Builds an HWP textbox compatibility candidate for structural regression tests.
- * The desktop save path intentionally continues to reject this output until it has
- * been opened successfully by Hanword 2024.
+ * Builds a diagnostic HWP textbox candidate for structural regression tests.
+ * This bypass is not used by the desktop save path, which continues to block
+ * textbox HWP until the supported scope is verified end to end in Hanword 2024.
  */
 export function serializePlainTextHwpTextBoxCandidateWithRhwp(
   paragraphs: readonly PlainTextParagraph[],
@@ -2418,9 +2418,10 @@ function serializePlainTextWithRhwpInternal(
 }
 
 /**
- * Freshly-created text boxes lack the HWP5 SHAPE_COMPONENT storage marker that
- * the HWPX importer materializes. Round-trip through HWPX so RHWP's source-format
- * adapter writes the HWP5 textbox bit and the required text-box list envelope.
+ * Produces a diagnostic HWP candidate for structural tests. A pre-margin-fix,
+ * isolated one-textbox Korean candidate opened in Hanword 2024, but the current
+ * margin-preserving output and mixed-content/resized/moved/styled cases remain
+ * unverified. User saves stay blocked until a safe subset is verified end to end.
  */
 function exportHwpTextBoxViaHwpx(document: HwpDocument): DocumentExport {
   const intermediate = document.exportHwpxWithReport();
@@ -2484,6 +2485,12 @@ function serializePlainTextObject(document: HwpDocument, paraIndex: number, obje
     throw new Error("글상자 편집 영역을 문서에 추가하지 못했습니다.");
   }
   const properties: Record<string, unknown> = { ...object.properties, width, height, horzOffset, vertOffset, textWrap: object.textWrap, treatAsChar: false, description: object.description };
+  if (object.kind === "textBox" && object.textMarginsMm) {
+    properties.tbMarginLeft = Math.round(object.textMarginsMm.left * RHWP_PAGE_UNITS_PER_MM);
+    properties.tbMarginRight = Math.round(object.textMarginsMm.right * RHWP_PAGE_UNITS_PER_MM);
+    properties.tbMarginTop = Math.round(object.textMarginsMm.top * RHWP_PAGE_UNITS_PER_MM);
+    properties.tbMarginBottom = Math.round(object.textMarginsMm.bottom * RHWP_PAGE_UNITS_PER_MM);
+  }
   delete properties.instanceId;
   delete properties.scInstId;
   delete properties.zOrder;
