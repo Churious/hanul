@@ -1060,8 +1060,11 @@ describe("RHWP document session", () => {
       session.redo();
       expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.textWrap).toBe("BehindText");
 
-      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: false });
-      expect(() => session.exportWithReport("hwp")).toThrow(/검증된 단일 글상자 문서에서만/u);
+      expect(session.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.mixed_content" }],
+      });
+      expect(() => session.exportWithReport("hwp")).toThrow(/표·그림·다른 개체와 글상자가 함께/u);
       for (const format of ["hwpx"] as const) {
         const saved = session.exportWithReport(format);
         expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
@@ -1126,7 +1129,7 @@ describe("RHWP document session", () => {
       } finally {
         parsedCandidate.free();
       }
-      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
+      expect(session.compatibilityReport("hwp")).toMatchObject({ supported: true, issues: [] });
     } finally {
       reopened?.dispose();
       session.dispose();
@@ -1174,7 +1177,7 @@ describe("RHWP document session", () => {
     let reopened: DocumentSession | null = null;
     try {
       expect(session.engineId).toBe("hanul-text");
-      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
+      expect(session.compatibilityReport("hwp")).toMatchObject({ supported: true, issues: [] });
       const textbox = session.listObjects(0).find((object) => object.kind === "textBox");
       expect(textbox).toBeDefined();
       const caret = session.hitTest(0, textbox!.bounds.x + 4, textbox!.bounds.y + 4);
@@ -1187,7 +1190,7 @@ describe("RHWP document session", () => {
       expect(reopened.engineId).toBe("hanul-text");
       expect(reopened.searchText("본문 앞의 일반 문단입니다.")).toHaveLength(1);
       expect(reopened.searchText("제품 저장 경로 확인")).toHaveLength(1);
-      expect(reopened.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
+      expect(reopened.compatibilityReport("hwp")).toMatchObject({ supported: true, issues: [] });
       const exportedTextbox = reopened.listObjects(0).find((object) => object.kind === "textBox");
       expect(exportedTextbox).toBeDefined();
       expect(exportedTextbox!.widthMm).toBeCloseTo(50, 0);

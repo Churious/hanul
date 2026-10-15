@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rhwp::DocumentCore;
+use serde::Serialize;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -25,6 +26,53 @@ async fn commit_document_save(
     })
     .await
     .map_err(|error| format!("문서 저장 검증을 완료하지 못했습니다. ({error})"))?
+}
+
+#[tauri::command]
+async fn inspect_document_compatibility(
+    document_path: String,
+    output_format: String,
+) -> Result<DocumentCompatibilityReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_document_compatibility_file_blocking(&document_path, &output_format)
+    })
+    .await
+    .map_err(|error| format!("문서 호환성 검사를 완료하지 못했습니다. ({error})"))?
+}
+
+fn inspect_document_compatibility_file_blocking(
+    document_path: &str,
+    output_format: &str,
+) -> Result<DocumentCompatibilityReport, String> {
+    let document_bytes = fs::read(document_path)
+        .map_err(|error| format!("임시 문서를 읽지 못했습니다. ({error})"))?;
+    inspect_document_compatibility_blocking(&document_bytes, output_format)
+}
+
+fn inspect_document_compatibility_blocking(
+    document_bytes: &[u8],
+    output_format: &str,
+) -> Result<DocumentCompatibilityReport, String> {
+    let format = output_format.to_ascii_lowercase();
+    if !matches!(format.as_str(), "hwp" | "hwpx") {
+        return Err("호환성 검사는 HWP 또는 HWPX 문서만 지원합니다.".to_owned());
+    }
+    let expected_signature: &[u8] = if format == "hwp" {
+        &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+    } else {
+        b"PK\x03\x04"
+    };
+    if !document_bytes.starts_with(expected_signature) {
+        return Err(format!(
+            "검사할 파일의 헤더가 {format} 형식과 일치하지 않습니다."
+        ));
+    }
+    let parsed = DocumentCore::from_bytes(document_bytes)
+        .map_err(|error| format!("문서 구조를 다시 읽지 못했습니다. ({error})"))?;
+    if parsed.page_count() == 0 {
+        return Err("문서에 페이지가 없어 호환성 검사를 중단했습니다.".to_owned());
+    }
+    Ok(document_compatibility_report(&parsed, &format))
 }
 
 fn commit_document_save_blocking(
@@ -82,132 +130,316 @@ fn commit_document_save_blocking(
         return Err("임시 문서에 페이지가 없어 저장을 중단했습니다.".to_owned());
     }
 
-    if format == "hwp" {
-        let sections = &parsed.document().sections;
-        if count_hwp_textboxes(sections) > 0 && !hwp_single_plain_textbox_is_supported(sections) {
-            return Err(
-                "검증된 단일 문단 글상자 외의 HWP 개체 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다. 문서 구조를 보존하려면 HWPX로 저장하세요.".to_owned(),
-            );
-        }
+    let compatibility = document_compatibility_report(&parsed, &format);
+    if !compatibility.supported {
+        return Err(compatibility
+            .issues
+            .first()
+            .map(|issue| issue.message.clone())
+            .unwrap_or_else(|| {
+                "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.".to_owned()
+            }));
     }
 
     fs::rename(&temporary, &destination)
         .map_err(|error| format!("검증한 문서로 원본을 교체하지 못했습니다. ({error})"))
 }
 
-/// Product HWP saving is enabled only for the Hanword-verified basic shape:
-/// one section, one plain rectangle textbox, one paragraph inside it, and no
-/// other document controls. This is intentionally stricter than RHWP parsing.
-fn hwp_single_plain_textbox_is_supported(sections: &[rhwp::model::document::Section]) -> bool {
-    use rhwp::model::{control::Control, shape::ShapeObject};
-
-    if sections.len() != 1 {
-        return false;
-    }
-    let mut text_box_count = 0usize;
-    for paragraph in &sections[0].paragraphs {
-        if !paragraph.range_tags.is_empty()
-            || !paragraph.field_ranges.is_empty()
-            || !paragraph.orphan_field_ends.is_empty()
-        {
-            return false;
-        }
-        for control in &paragraph.controls {
-            match control {
-                Control::SectionDef(_) | Control::ColumnDef(_) => {}
-                Control::Shape(shape) => {
-                    let ShapeObject::Rectangle(rectangle) = shape.as_ref() else {
-                        return false;
-                    };
-                    if rectangle.round_rate != 0 || rectangle.drawing.caption.is_some() {
-                        return false;
-                    }
-                    let Some(text_box) = rectangle.drawing.text_box.as_ref() else {
-                        return false;
-                    };
-                    if text_box.paragraphs.len() != 1
-                        || text_box.vertical_all
-                        || !matches!(
-                            text_box.vertical_align,
-                            rhwp::model::table::VerticalAlign::Top
-                        )
-                    {
-                        return false;
-                    }
-                    let inner = &text_box.paragraphs[0];
-                    if !inner.controls.is_empty()
-                        || !inner.range_tags.is_empty()
-                        || !inner.field_ranges.is_empty()
-                        || !inner.orphan_field_ends.is_empty()
-                    {
-                        return false;
-                    }
-                    text_box_count += 1;
-                }
-                _ => return false,
-            }
-        }
-    }
-    text_box_count == 1
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentCompatibilityReport {
+    schema_version: u8,
+    format: String,
+    supported: bool,
+    structure: CompatibilityStructure,
+    issues: Vec<CompatibilityIssue>,
 }
 
-fn count_hwp_textboxes(sections: &[rhwp::model::document::Section]) -> usize {
-    use rhwp::model::{control::Control, paragraph::Paragraph, shape::ShapeObject};
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatibilityStructure {
+    section_count: usize,
+    paragraph_count: usize,
+    table_count: usize,
+    object_counts: CompatibilityObjectCounts,
+    text_box_paragraph_counts: Vec<usize>,
+    text_box_shape_types: Vec<String>,
+    text_box_unsupported_properties: Vec<bool>,
+    text_box_has_nested_content: Vec<bool>,
+    has_fields: bool,
+    has_range_tags: bool,
+    unsupported_control_count: usize,
+}
 
-    fn count_shape(shape: &ShapeObject) -> usize {
-        let mut count = shape
-            .drawing()
-            .and_then(|drawing| drawing.text_box.as_ref())
-            .map_or(0, |text_box| {
-                text_box
-                    .paragraphs
-                    .iter()
-                    .map(count_paragraph)
-                    .sum::<usize>()
-                    + 1
-            });
-        if let ShapeObject::Group(group) = shape {
-            count += group.children.iter().map(count_shape).sum::<usize>();
-            if let Some(caption) = &group.caption {
-                count += caption
-                    .paragraphs
-                    .iter()
-                    .map(count_paragraph)
-                    .sum::<usize>();
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatibilityObjectCounts {
+    picture: usize,
+    rectangle: usize,
+    ellipse: usize,
+    text_box: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatibilityIssue {
+    code: String,
+    feature: String,
+    message: String,
+}
+
+fn document_compatibility_report(
+    document: &DocumentCore,
+    format: &str,
+) -> DocumentCompatibilityReport {
+    let sections = &document.document().sections;
+    let mut structure = CompatibilityStructure {
+        section_count: sections.len(),
+        ..CompatibilityStructure::default()
+    };
+    for section in sections {
+        for paragraph in &section.paragraphs {
+            collect_compatibility_paragraph(paragraph, &mut structure, false);
+        }
+    }
+    let issues = if format == "hwp" {
+        hwp_textbox_compatibility_issue(&structure)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    DocumentCompatibilityReport {
+        schema_version: 1,
+        format: format.to_owned(),
+        supported: issues.is_empty(),
+        structure,
+        issues,
+    }
+}
+
+fn hwp_textbox_compatibility_issue(
+    structure: &CompatibilityStructure,
+) -> Option<CompatibilityIssue> {
+    let text_box_count = structure.object_counts.text_box;
+    if text_box_count == 0 {
+        return None;
+    }
+    let total_object_count = structure.object_counts.picture
+        + structure.object_counts.rectangle
+        + structure.object_counts.ellipse
+        + text_box_count;
+    let (code, feature, message) = if text_box_count > 1 {
+        (
+            "hwp.textbox.count",
+            "textBox",
+            "여러 글상자가 포함된 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else if structure.section_count != 1 {
+        (
+            "hwp.textbox.multiple_sections",
+            "structure",
+            "여러 구역이 포함된 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else if structure.has_fields || structure.has_range_tags {
+        (
+            "hwp.textbox.fields_or_ranges",
+            "textBox",
+            "필드 또는 범위 태그가 포함된 글상자 HWP는 데이터 보존을 확인하지 못해 저장을 차단했습니다.",
+        )
+    } else if structure
+        .text_box_shape_types
+        .first()
+        .is_none_or(|shape| shape != "rectangle")
+        || structure
+            .text_box_unsupported_properties
+            .first()
+            .copied()
+            .unwrap_or(true)
+    {
+        (
+            "hwp.textbox.unsupported_shape",
+            "textBox",
+            "단순한 사각형이 아닌 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else if structure.text_box_paragraph_counts.first().copied() != Some(1) {
+        (
+            "hwp.textbox.paragraph_count",
+            "textBox",
+            "여러 문단 또는 비어 있는 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else if structure
+        .text_box_has_nested_content
+        .first()
+        .copied()
+        .unwrap_or(true)
+    {
+        (
+            "hwp.textbox.nested_content",
+            "textBox",
+            "표·개체·필드 등 내부 구조가 포함된 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else if structure.table_count > 0
+        || total_object_count != 1
+        || structure.unsupported_control_count > 0
+    {
+        (
+            "hwp.textbox.mixed_content",
+            "textBox",
+            "표·그림·다른 개체와 글상자가 함께 있는 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+        )
+    } else {
+        return None;
+    };
+    Some(CompatibilityIssue {
+        code: code.to_owned(),
+        feature: feature.to_owned(),
+        message: message.to_owned(),
+    })
+}
+
+fn collect_compatibility_paragraph(
+    paragraph: &rhwp::model::paragraph::Paragraph,
+    structure: &mut CompatibilityStructure,
+    inside_text_box: bool,
+) {
+    use rhwp::model::control::Control;
+
+    structure.paragraph_count += 1;
+    structure.has_range_tags |= !paragraph.range_tags.is_empty();
+    structure.has_fields |=
+        !paragraph.field_ranges.is_empty() || !paragraph.orphan_field_ends.is_empty();
+    for control in &paragraph.controls {
+        match control {
+            Control::SectionDef(_) | Control::ColumnDef(_) => {}
+            Control::Shape(shape) => collect_compatibility_shape(shape, structure, inside_text_box),
+            Control::Table(table) => {
+                structure.table_count += 1;
+                if inside_text_box {
+                    structure.unsupported_control_count += 1;
+                }
+                for cell in &table.cells {
+                    for inner in &cell.paragraphs {
+                        collect_compatibility_paragraph(inner, structure, inside_text_box);
+                    }
+                }
+            }
+            Control::Picture(_) => {
+                structure.object_counts.picture += 1;
+                structure.unsupported_control_count += 1;
+            }
+            Control::Field(_) => {
+                structure.has_fields = true;
+                structure.unsupported_control_count += 1;
+            }
+            Control::Header(header) => {
+                structure.unsupported_control_count += 1;
+                for inner in &header.paragraphs {
+                    collect_compatibility_paragraph(inner, structure, inside_text_box);
+                }
+            }
+            Control::Footer(footer) => {
+                structure.unsupported_control_count += 1;
+                for inner in &footer.paragraphs {
+                    collect_compatibility_paragraph(inner, structure, inside_text_box);
+                }
+            }
+            Control::Footnote(note) => {
+                structure.unsupported_control_count += 1;
+                for inner in &note.paragraphs {
+                    collect_compatibility_paragraph(inner, structure, inside_text_box);
+                }
+            }
+            Control::Endnote(note) => {
+                structure.unsupported_control_count += 1;
+                for inner in &note.paragraphs {
+                    collect_compatibility_paragraph(inner, structure, inside_text_box);
+                }
+            }
+            Control::HiddenComment(comment) => {
+                structure.unsupported_control_count += 1;
+                for inner in &comment.paragraphs {
+                    collect_compatibility_paragraph(inner, structure, inside_text_box);
+                }
+            }
+            _ => {
+                structure.unsupported_control_count += 1;
             }
         }
-        count
     }
+}
 
-    fn count_paragraph(paragraph: &Paragraph) -> usize {
-        paragraph
-            .controls
-            .iter()
-            .map(|control| match control {
-                Control::Shape(shape) => count_shape(shape),
-                Control::Table(table) => table
-                    .cells
-                    .iter()
-                    .flat_map(|cell| &cell.paragraphs)
-                    .map(count_paragraph)
-                    .sum(),
-                Control::Header(header) => header.paragraphs.iter().map(count_paragraph).sum(),
-                Control::Footer(footer) => footer.paragraphs.iter().map(count_paragraph).sum(),
-                Control::Footnote(note) => note.paragraphs.iter().map(count_paragraph).sum(),
-                Control::Endnote(note) => note.paragraphs.iter().map(count_paragraph).sum(),
-                Control::HiddenComment(comment) => {
-                    comment.paragraphs.iter().map(count_paragraph).sum()
+fn collect_compatibility_shape(
+    shape: &rhwp::model::shape::ShapeObject,
+    structure: &mut CompatibilityStructure,
+    inside_text_box: bool,
+) {
+    use rhwp::model::shape::ShapeObject;
+    use rhwp::model::table::VerticalAlign;
+
+    match shape {
+        ShapeObject::Rectangle(rectangle) => {
+            if let Some(text_box) = rectangle.drawing.text_box.as_ref() {
+                structure.object_counts.text_box += 1;
+                structure.text_box_shape_types.push("rectangle".to_owned());
+                structure
+                    .text_box_paragraph_counts
+                    .push(text_box.paragraphs.len());
+                structure.text_box_unsupported_properties.push(
+                    rectangle.round_rate != 0
+                        || rectangle.drawing.caption.is_some()
+                        || text_box.vertical_all
+                        || !matches!(text_box.vertical_align, VerticalAlign::Top),
+                );
+                let nested = text_box.paragraphs.iter().any(|paragraph| {
+                    !paragraph.controls.is_empty()
+                        || !paragraph.range_tags.is_empty()
+                        || !paragraph.field_ranges.is_empty()
+                        || !paragraph.orphan_field_ends.is_empty()
+                });
+                structure.text_box_has_nested_content.push(nested);
+                if inside_text_box {
+                    structure.unsupported_control_count += 1;
                 }
-                _ => 0,
-            })
-            .sum()
+                for paragraph in &text_box.paragraphs {
+                    collect_compatibility_paragraph(paragraph, structure, true);
+                }
+            } else {
+                structure.object_counts.rectangle += 1;
+                structure.unsupported_control_count += 1;
+            }
+        }
+        ShapeObject::Ellipse(ellipse) => {
+            if let Some(text_box) = ellipse.drawing.text_box.as_ref() {
+                structure.object_counts.text_box += 1;
+                structure.text_box_shape_types.push("ellipse".to_owned());
+                structure
+                    .text_box_paragraph_counts
+                    .push(text_box.paragraphs.len());
+                structure.text_box_unsupported_properties.push(true);
+                structure
+                    .text_box_has_nested_content
+                    .push(text_box.paragraphs.iter().any(|p| !p.controls.is_empty()));
+                for paragraph in &text_box.paragraphs {
+                    collect_compatibility_paragraph(paragraph, structure, true);
+                }
+            } else {
+                structure.object_counts.ellipse += 1;
+                structure.unsupported_control_count += 1;
+            }
+        }
+        ShapeObject::Picture(_) => {
+            structure.object_counts.picture += 1;
+            structure.unsupported_control_count += 1;
+        }
+        ShapeObject::Group(group) => {
+            structure.unsupported_control_count += 1;
+            for child in &group.children {
+                collect_compatibility_shape(child, structure, inside_text_box);
+            }
+        }
+        _ => structure.unsupported_control_count += 1,
     }
-
-    sections
-        .iter()
-        .flat_map(|section| &section.paragraphs)
-        .map(count_paragraph)
-        .sum()
 }
 
 fn export_pdf_blocking(document_bytes: &[u8], output_path: &str) -> Result<u32, String> {
@@ -311,7 +543,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![export_pdf, commit_document_save])
+        .invoke_handler(tauri::generate_handler![
+            export_pdf,
+            commit_document_save,
+            inspect_document_compatibility
+        ])
         .setup(|_app| {
             #[cfg(target_os = "linux")]
             {
@@ -338,7 +574,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_document_save_blocking, export_pdf_blocking, pdf_page_count, write_atomically,
+        CompatibilityStructure, commit_document_save_blocking, document_compatibility_report,
+        export_pdf_blocking, hwp_textbox_compatibility_issue,
+        inspect_document_compatibility_file_blocking, pdf_page_count, write_atomically,
     };
     use rhwp::DocumentCore;
 
@@ -392,6 +630,11 @@ mod tests {
             )
             .expect("create second textbox");
         let staged_bytes = source.export_hwp_native().expect("serialize staged HWP");
+        let staged = DocumentCore::from_bytes(&staged_bytes).expect("reopen staged HWP");
+        let report = document_compatibility_report(&staged, "hwp");
+        assert_eq!(report.structure.object_counts.text_box, 1, "{report:?}");
+        assert_eq!(report.structure.object_counts.rectangle, 1, "{report:?}");
+        assert_eq!(report.issues[0].code, "hwp.textbox.unsupported_shape");
         std::fs::write(&temporary, &staged_bytes).expect("write staged HWP");
         std::fs::write(&destination, b"original HWP").expect("seed existing HWP");
 
@@ -402,12 +645,32 @@ mod tests {
         )
         .expect_err("unverified text-box HWP must stay blocked");
 
-        assert!(error.contains("호환성 검증이 끝나지 않아 저장을 차단"));
+        assert!(error.contains("단순한 사각형이 아닌 글상자 HWP"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"original HWP");
         assert!(DocumentCore::from_bytes(&staged_bytes).is_ok());
         assert!(temporary.exists());
         std::fs::remove_file(temporary).unwrap();
         std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn reports_a_specific_reason_for_multiple_textboxes() {
+        let structure = CompatibilityStructure {
+            section_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                text_box: 2,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            text_box_paragraph_counts: vec![1, 1],
+            text_box_shape_types: vec!["rectangle".to_owned(), "rectangle".to_owned()],
+            text_box_unsupported_properties: vec![false, false],
+            text_box_has_nested_content: vec![false, false],
+            ..CompatibilityStructure::default()
+        };
+        let issue =
+            hwp_textbox_compatibility_issue(&structure).expect("multiple textboxes are blocked");
+        assert_eq!(issue.code, "hwp.textbox.count");
+        assert!(issue.message.contains("여러 글상자가 포함된 HWP"));
     }
 
     #[test]
@@ -425,7 +688,17 @@ mod tests {
             include_bytes!("../../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp");
         assert!(DocumentCore::from_bytes(bytes).is_ok());
         std::fs::write(&temporary, bytes).expect("write staged golden HWP");
-
+        let report =
+            inspect_document_compatibility_file_blocking(temporary.to_str().unwrap(), "hwp")
+                .expect("inspect the staged Hanword-verified textbox golden");
+        assert!(report.supported, "{:?}", report.issues);
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.structure.section_count, 1);
+        assert_eq!(report.structure.object_counts.text_box, 1);
+        assert_eq!(report.structure.text_box_shape_types, ["rectangle"]);
+        assert_eq!(report.structure.text_box_paragraph_counts, [1]);
+        assert_eq!(report.structure.text_box_unsupported_properties, [false]);
+        assert_eq!(report.structure.text_box_has_nested_content, [false]);
         commit_document_save_blocking(
             temporary.to_str().unwrap(),
             destination.to_str().unwrap(),

@@ -112,6 +112,37 @@ export interface ExportResult {
   report: ContentLossReport;
 }
 
+export type DocumentExportFormat = "hwp" | "hwpx";
+
+export interface CompatibilityStructure {
+  sectionCount: number;
+  paragraphCount: number;
+  tableCount: number;
+  objectCounts: Record<DocumentObjectKind, number>;
+  textBoxParagraphCounts: number[];
+  textBoxShapeTypes: Array<"rectangle" | "ellipse" | "other">;
+  textBoxUnsupportedProperties: boolean[];
+  textBoxHasNestedContent: boolean[];
+  hasFields: boolean;
+  hasRangeTags: boolean;
+  unsupportedControlCount: number;
+}
+
+export interface CompatibilityIssue {
+  code: string;
+  feature: "textBox" | "structure";
+  message: string;
+}
+
+/** Structural eligibility only; ExportResult.report separately records known serializer loss. */
+export interface DocumentCompatibilityReport {
+  schemaVersion: 1;
+  format: DocumentExportFormat;
+  supported: boolean;
+  structure: CompatibilityStructure;
+  issues: CompatibilityIssue[];
+}
+
 /** Optional stage timings exposed by engines without exposing their internal document model. */
 export interface DocumentPerformanceMetrics {
   modelMutationMs: number;
@@ -220,8 +251,8 @@ export interface DocumentSession {
   readonly engineId?: string;
   readonly pageCount: number;
   readonly sourceFormat: string;
-  /** Whether this session can safely export its current textbox structure to HWP. */
-  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string };
+  /** Format-specific structural eligibility and reasons for the current document. */
+  compatibilityReport(format: DocumentExportFormat): DocumentCompatibilityReport;
   /** Page-local render invalidation counter; absent on legacy engines. */
   renderRevision?(pageIndex: number): number;
   /** Latest synchronous stage timings where an engine can measure them. */

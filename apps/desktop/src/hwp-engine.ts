@@ -6,6 +6,7 @@ import type {
   ContentLossReport,
   CursorRectangle,
   DocumentEngine,
+  DocumentCompatibilityReport,
   DocumentInfo,
   DocumentObject,
   DocumentObjectKind,
@@ -28,7 +29,8 @@ import type {
   TableUpdates,
   TextPosition,
 } from "./document-engine";
-import { HanulTextDocumentSession, plainTextHwpTextboxSaveEligibility, type ImportedPlainTextDocument, type PlainTextObject, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
+import { HanulTextDocumentSession, plainTextCompatibilityReport, type ImportedPlainTextDocument, type PlainTextObject, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
+import { emptyCompatibilityObjectCounts, evaluateDocumentCompatibility } from "./document-compatibility";
 
 export type {
   CellPathSegment,
@@ -250,17 +252,51 @@ class RhwpDocumentSession implements DocumentSession {
     return this.document.pageCount();
   }
 
-  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string } {
+  compatibilityReport(format: "hwp" | "hwpx"): DocumentCompatibilityReport {
     const sectionIndexes = new Set<number>();
     for (let pageIndex = 0; pageIndex < this.pageCount; pageIndex += 1) {
       sectionIndexes.add(this.pageInfo(pageIndex).sectionIndex);
     }
-    const hasTextBox = [...sectionIndexes].some((sectionIndex) =>
-      this.listObjects(sectionIndex).some((object) => object.kind === "textBox"),
-    );
-    return hasTextBox
-      ? { supported: false, reason: "RHWP 호환 세션의 글상자 HWP 저장은 아직 제품 경로에서 검증되지 않았습니다." }
-      : { supported: true };
+    const structure = {
+      sectionCount: Math.max(sectionIndexes.size, 1),
+      paragraphCount: 0,
+      tableCount: 0,
+      objectCounts: { ...emptyCompatibilityObjectCounts() },
+      textBoxParagraphCounts: [] as number[],
+      textBoxShapeTypes: [] as Array<"rectangle" | "ellipse" | "other">,
+      textBoxUnsupportedProperties: [] as boolean[],
+      textBoxHasNestedContent: [] as boolean[],
+      hasFields: false,
+      hasRangeTags: false,
+      unsupportedControlCount: 0,
+    };
+    for (const sectionIndex of sectionIndexes) {
+      structure.paragraphCount += this.document.getParagraphCount(sectionIndex);
+      for (const object of this.listObjects(sectionIndex)) structure.objectCounts[object.kind] += 1;
+    }
+    const textBoxes = Array.from({ length: structure.objectCounts.textBox }, () => ({
+      shapeType: "other" as const,
+      paragraphCount: 0,
+      hasNestedContent: true,
+      hasUnsupportedShapeProperties: true,
+    }));
+    structure.textBoxParagraphCounts = textBoxes.map((box) => box.paragraphCount);
+    structure.textBoxShapeTypes = textBoxes.map((box) => box.shapeType);
+    structure.textBoxUnsupportedProperties = textBoxes.map((box) => box.hasUnsupportedShapeProperties);
+    structure.textBoxHasNestedContent = textBoxes.map((box) => box.hasNestedContent);
+    return evaluateDocumentCompatibility(format, {
+      structure,
+      textBoxes,
+      hasFields: false,
+      hasRangeTags: false,
+      ...(format === "hwp" && textBoxes.length > 0 ? {
+        forcedIssue: {
+          code: "hwp.textbox.rhwp_session",
+          feature: "textBox" as const,
+          message: "RHWP 호환 세션의 글상자 구조는 독립 엔진 제품 저장으로 검증되지 않아 HWP 저장을 차단했습니다.",
+        },
+      } : {}),
+    });
   }
 
   documentInfo() {
@@ -2253,9 +2289,9 @@ function serializePlainTextWithRhwpInternal(
   pageDefinition: PageDefinition,
 ): ExportResult {
   const hasTextBox = paragraphs.some((paragraph) => paragraph.objects?.some((object) => object.kind === "textBox"));
-  const textboxEligibility = format === "hwp" ? plainTextHwpTextboxSaveEligibility(paragraphs) : { supported: true };
-  if (format === "hwp" && hasTextBox && !textboxEligibility.supported) {
-    throw new Error(textboxEligibility.reason ?? "이 글상자 HWP 구조는 아직 저장할 수 없습니다. HWPX로 저장하세요.");
+  const compatibility = plainTextCompatibilityReport(paragraphs, format);
+  if (!compatibility.supported) {
+    throw new Error(compatibility.issues[0]?.message ?? "이 HWP 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.");
   }
   if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
   const document = HwpDocument.createEmpty();

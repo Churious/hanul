@@ -1,27 +1,54 @@
 import { describe, expect, it } from "vitest";
 import { ImeInputGate } from "./ime-input";
-import { createInMemoryTextSession, plainTextHwpTextboxSaveEligibility } from "./text-document-engine";
+import { createInMemoryTextSession, plainTextCompatibilityReport } from "./text-document-engine";
 
 const LINES_PER_PAGE = 44;
 const syntheticParagraph = (index: number) => `한글 문서 편집 조판 성능과 문단별 증분 배치를 검증합니다. ${String(index).padStart(4, "0")}`;
 
 describe("Hanul paragraph text engine", () => {
-  it("limits product HWP textbox export to one plain one-paragraph textbox", () => {
+  it("returns format-specific compatibility reasons for textbox structures", () => {
     const session = createInMemoryTextSession([{ text: "본문" }]);
     try {
       const anchor = session.hitTest(0, 100, 100);
       session.insertShape(anchor, "textBox", 50, 24);
-      const singleTextbox = session.paragraphs();
-      expect(plainTextHwpTextboxSaveEligibility(singleTextbox)).toMatchObject({ supported: true });
+      const textbox = session.listObjects(0).find((object) => object.kind === "textBox")!;
+      session.updateObject(textbox, { widthMm: 63, heightMm: 31, offsetXmm: 12, offsetYmm: 15 });
+      expect(session.compatibilityReport("hwp")).toMatchObject({
+        schemaVersion: 1,
+        format: "hwp",
+        supported: true,
+        structure: { sectionCount: 1, objectCounts: { textBox: 1 }, textBoxParagraphCounts: [1] },
+        issues: [],
+      });
+      expect(session.compatibilityReport("hwpx")).toMatchObject({ format: "hwpx", supported: true });
 
-      const multipleParagraphs = structuredClone(singleTextbox);
+      const multipleParagraphs = session.paragraphs();
       multipleParagraphs[0]!.objects![0]!.textParagraphs = [
         { text: "첫 문단", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] },
         { text: "둘째 문단", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] },
       ];
-      expect(plainTextHwpTextboxSaveEligibility(multipleParagraphs)).toMatchObject({ supported: false });
+      const multipleParagraphSession = createInMemoryTextSession(multipleParagraphs);
+      expect(multipleParagraphSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.paragraph_count", feature: "textBox" }],
+      });
+      expect(multipleParagraphSession.compatibilityReport("hwpx")).toMatchObject({
+        format: "hwpx",
+        supported: true,
+        issues: [],
+      });
+      multipleParagraphSession.dispose();
 
-      const tableAndTextbox = structuredClone(singleTextbox);
+      const multipleBoxes = session.paragraphs();
+      multipleBoxes[0]!.objects!.push({ ...multipleBoxes[0]!.objects![0]!, id: "second-box", controlIndex: 2002 });
+      const multipleBoxesSession = createInMemoryTextSession(multipleBoxes);
+      expect(multipleBoxesSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.count" }],
+      });
+      multipleBoxesSession.dispose();
+
+      const tableAndTextbox = session.paragraphs();
       tableAndTextbox.push({
         text: "",
         pageBreakBefore: false,
@@ -44,11 +71,47 @@ describe("Hanul paragraph text engine", () => {
           }],
         },
       });
-      expect(plainTextHwpTextboxSaveEligibility(tableAndTextbox)).toMatchObject({ supported: false });
+      const tableSession = createInMemoryTextSession(tableAndTextbox);
+      expect(tableSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.mixed_content" }],
+      });
+      tableSession.dispose();
 
-      const pictureAndTextbox = structuredClone(singleTextbox);
+      const pictureAndTextbox = session.paragraphs();
       pictureAndTextbox[0]!.objects!.push({ ...pictureAndTextbox[0]!.objects![0]!, id: "picture", kind: "picture" });
-      expect(plainTextHwpTextboxSaveEligibility(pictureAndTextbox)).toMatchObject({ supported: false });
+      const pictureSession = createInMemoryTextSession(pictureAndTextbox);
+      expect(pictureSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.mixed_content" }],
+      });
+      pictureSession.dispose();
+
+      const transformedTextbox = session.paragraphs();
+      transformedTextbox[0]!.objects![0]!.properties.rotationAngle = 15;
+      const transformedSession = createInMemoryTextSession(transformedTextbox);
+      expect(transformedSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.unsupported_shape" }],
+      });
+      transformedSession.dispose();
+
+      const nestedTextbox = session.paragraphs();
+      const innerParagraph = nestedTextbox[0]!.objects![0]!.textParagraphs![0]! as unknown as { objects?: unknown[] };
+      innerParagraph.objects = [{ kind: "picture" }];
+      expect(plainTextCompatibilityReport(nestedTextbox, "hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.nested_content" }],
+      });
+
+      const fieldTextbox = session.paragraphs();
+      fieldTextbox[0]!.objects![0]!.textParagraphs![0]!.text = "필드\u0013내용";
+      const fieldSession = createInMemoryTextSession(fieldTextbox);
+      expect(fieldSession.compatibilityReport("hwp")).toMatchObject({
+        supported: false,
+        issues: [{ code: "hwp.textbox.fields_or_ranges" }],
+      });
+      fieldSession.dispose();
     } finally {
       session.dispose();
     }

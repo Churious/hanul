@@ -25,6 +25,7 @@ import { hanulDocumentEngine } from "./hwp-engine";
 import type {
   DocumentSession,
   DocumentInfo,
+  DocumentCompatibilityReport,
   CharacterFormat,
   DocumentObject,
   DocumentObjectTextWrap,
@@ -1094,6 +1095,13 @@ function App() {
           const temporaryPath = `${destinationPath}.hanul-${crypto.randomUUID()}.tmp`;
           try {
             await writeFile(temporaryPath, result.bytes);
+            const compatibility = await invoke<DocumentCompatibilityReport>("inspect_document_compatibility", {
+              documentPath: temporaryPath,
+              outputFormat: result.report.outputFormat,
+            });
+            if (!compatibility.supported) {
+              throw new Error(compatibility.issues[0]?.message ?? "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.");
+            }
             await invoke("commit_document_save", {
               temporaryPath,
               outputPath: destinationPath,
@@ -1165,11 +1173,9 @@ function App() {
         destinationPath = null;
       }
 
-      if (format === "hwp" && documentHasTextBox(session)) {
-        const eligibility = session.hwpTextboxSaveEligibility();
-        if (!eligibility.supported) {
-          throw new Error(eligibility.reason ?? "이 글상자 HWP 구조는 아직 저장할 수 없습니다. HWPX로 저장하세요.");
-        }
+      const compatibility = session.compatibilityReport(format);
+      if (!compatibility.supported) {
+        throw new Error(compatibility.issues[0]?.message ?? `이 ${format.toUpperCase()} 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.`);
       }
       const result = session.exportWithReport(format);
       if (result.report.count > 0) {
@@ -3270,17 +3276,6 @@ function App() {
       )}
     </main>
   );
-}
-
-function documentHasTextBox(session: DocumentSession): boolean {
-  const sectionIndexes = new Set<number>();
-  for (let pageIndex = 0; pageIndex < session.pageCount; pageIndex += 1) {
-    sectionIndexes.add(session.pageInfo(pageIndex).sectionIndex);
-  }
-  for (const sectionIndex of sectionIndexes) {
-    if (session.listObjects(sectionIndex).some((object) => object.kind === "textBox")) return true;
-  }
-  return false;
 }
 
 function traceImeEvent(type: string, event: Event, valueLength: number) {

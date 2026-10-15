@@ -25,6 +25,7 @@ import type {
   TableUpdates,
   TextPosition,
 } from "./document-engine";
+import { emptyCompatibilityObjectCounts, evaluateDocumentCompatibility } from "./document-compatibility";
 
 export interface PlainTextParagraph {
   text: string;
@@ -75,32 +76,76 @@ export interface PlainTextSerializer {
   serialize(paragraphs: readonly PlainTextParagraph[], format: "hwp" | "hwpx", pageDefinition: PageDefinition): ExportResult;
 }
 
-/**
- * HWP textbox export is intentionally limited to the one structure verified in
- * Hanword 2024: one simple rectangle textbox with one plain text paragraph.
- * Mixed objects, tables, and multi-paragraph textboxes remain on the guarded
- * compatibility path until they have their own product-save validation.
- */
-export function plainTextHwpTextboxSaveEligibility(
-  paragraphs: readonly PlainTextParagraph[],
-): { supported: boolean; reason?: string } {
-  const objects = paragraphs.flatMap((paragraph) => paragraph.objects ?? []);
-  const textBoxes = objects.filter((object) => object.kind === "textBox");
-  if (textBoxes.length === 0) return { supported: true };
-  if (objects.length !== 1 || textBoxes.length !== 1) {
-    return { supported: false, reason: "HWP 글상자 저장은 검증된 단일 글상자 문서에서만 지원합니다." };
-  }
-  if (paragraphs.some((paragraph) => paragraph.table)) {
-    return { supported: false, reason: "표와 글상자가 함께 있는 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
-  }
-  const [textBox] = textBoxes;
-  if (textBox!.textParagraphs?.length !== 1) {
-    return { supported: false, reason: "여러 문단 또는 비어 있는 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
-  }
-  if (textBox!.shapeType !== undefined && textBox!.shapeType !== "rectangle") {
-    return { supported: false, reason: "사각형이 아닌 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
-  }
-  return { supported: true };
+function compatibilityFacts(paragraphs: readonly PlainTextParagraph[]) {
+  const structure = {
+    sectionCount: 1,
+    paragraphCount: 0,
+    tableCount: 0,
+    objectCounts: { ...emptyCompatibilityObjectCounts() },
+    textBoxParagraphCounts: [] as number[],
+    textBoxShapeTypes: [] as Array<"rectangle" | "ellipse" | "other">,
+    textBoxUnsupportedProperties: [] as boolean[],
+    textBoxHasNestedContent: [] as boolean[],
+    hasFields: false,
+    hasRangeTags: false,
+    unsupportedControlCount: 0,
+  };
+  const textBoxes: Array<{
+    shapeType: "rectangle" | "ellipse" | "other";
+    paragraphCount: number;
+    hasNestedContent: boolean;
+    hasUnsupportedShapeProperties: boolean;
+  }> = [];
+  const unsupportedTextboxPropertyKeys = new Set([
+    "rotationAngle", "rotation", "horzFlip", "vertFlip", "flip", "roundRate", "hasCaption", "caption",
+    "tbVerticalAlign", "verticalAlign", "verticalAll", "shapeType", "cropLeft", "cropTop", "cropRight", "cropBottom",
+  ]);
+  const visitParagraph = (paragraph: PlainTextParagraph | Omit<PlainTextParagraph, "table">, inTextBox = false) => {
+    structure.paragraphCount += 1;
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(paragraph.text)) structure.hasFields = true;
+    if (inTextBox && paragraph.pageBreakBefore) structure.unsupportedControlCount += 1;
+    if ("table" in paragraph && paragraph.table) {
+      structure.tableCount += 1;
+      for (const cell of paragraph.table.cells) for (const cellParagraph of cell.paragraphs) visitParagraph(cellParagraph);
+    }
+    for (const object of paragraph.objects ?? []) {
+      structure.objectCounts[object.kind] += 1;
+      if (object.kind !== "textBox") continue;
+      const shapeType = object.shapeType ?? "rectangle";
+      const normalizedShape: "rectangle" | "ellipse" | "other" = shapeType === "rectangle" || shapeType === "ellipse" ? shapeType : "other";
+      const nestedParagraphs = object.textParagraphs ?? [];
+      const properties = object.properties ?? {};
+      const unsupportedProperty = Object.keys(properties).some((key) => unsupportedTextboxPropertyKeys.has(key)
+        && ((key === "roundRate" && Number(properties[key]) !== 0)
+          || (key === "hasCaption" && properties[key] !== false)
+          || (key === "tbVerticalAlign" && properties[key] !== "Top")
+          || (key === "verticalAlign" && properties[key] !== "Top")
+          || (key === "verticalAll" && properties[key] === true)
+          || (key === "rotationAngle" && Number(properties[key]) !== 0)
+          || (["rotation", "flip", "horzFlip", "vertFlip"].includes(key) && properties[key] !== false && properties[key] !== 0)
+          || (key === "caption" && properties[key] != null)
+          || (key === "shapeType" && properties[key] !== "rectangle")
+          || key.startsWith("crop")));
+      const paragraphCount = nestedParagraphs.length;
+      const hasNestedContent = nestedParagraphs.some((inner) => {
+        const runtime = inner as Omit<PlainTextParagraph, "table" | "objects"> & { table?: unknown; objects?: unknown[] };
+        return Boolean(runtime.table || runtime.objects?.length || inner.pageBreakBefore
+          || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(inner.text));
+      });
+      structure.textBoxParagraphCounts.push(paragraphCount);
+      structure.textBoxShapeTypes.push(normalizedShape);
+      structure.textBoxUnsupportedProperties.push(unsupportedProperty);
+      structure.textBoxHasNestedContent.push(hasNestedContent);
+      textBoxes.push({ shapeType: normalizedShape, paragraphCount, hasNestedContent, hasUnsupportedShapeProperties: unsupportedProperty });
+      for (const inner of nestedParagraphs) visitParagraph(inner, true);
+    }
+  };
+  for (const paragraph of paragraphs) visitParagraph(paragraph);
+  return { structure, textBoxes, hasFields: structure.hasFields, hasRangeTags: structure.hasRangeTags };
+}
+
+export function plainTextCompatibilityReport(paragraphs: readonly PlainTextParagraph[], format: "hwp" | "hwpx") {
+  return evaluateDocumentCompatibility(format, compatibilityFacts(paragraphs));
 }
 
 export interface ImportedPlainTextDocument {
@@ -434,8 +479,8 @@ export class HanulTextDocumentSession implements DocumentSession {
   renderRevision(pageIndex: number): number { return this.pageRevisions.get(pageIndex) ?? 0; }
   get canUndo(): boolean { return this.undoStack.length > 0; }
   get canRedo(): boolean { return this.redoStack.length > 0; }
-  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string } {
-    return plainTextHwpTextboxSaveEligibility(this.paragraphs());
+  compatibilityReport(format: "hwp" | "hwpx") {
+    return evaluateDocumentCompatibility(format, compatibilityFacts(this.paragraphs()));
   }
   get metrics(): Readonly<TextEngineMetrics> { return this._metrics; }
   performanceMetrics(): Readonly<TextEngineMetrics> { return { ...this._metrics }; }
