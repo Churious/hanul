@@ -19,13 +19,13 @@ UNKNOWN이 0인 이유는 기능이 미확인일 때 소스/테스트의 작동 
 
 | ID | Hanul 상태 | 확인된 Hanul 범위와 한계 |
 | --- | --- | --- |
-| FIL-01, FIL-04, FIL-07 | PARTIAL | 새 문서, HWP/HWPX 열기, 저장/다른 이름으로 저장 명령이 연결됨. V1-02a의 열기 generation gate에 더해 V1-02b가 저장 중 열기/새 문서/닫기/끝내기를 막고 저장 시점 이후 편집을 dirty로 유지한다. Windows Tauri 네이티브 대화상자 상호작용은 Computer Use 대상 전달 오류로 미검증이다. Linux WSLg에서 Tauri 창과 GTK 파일 열기 대화상자 표시는 확인했으나 파일 선택·열기는 미검증이다. 가져오기는 지원 구조 게이트를 거치며 형식 전반의 무손실 호환성은 검증되지 않음. |
+| FIL-01, FIL-04, FIL-07 | PARTIAL | 새 문서, HWP/HWPX 열기, 저장/다른 이름 저장 명령이 연결됨. V1-02a의 열기 generation gate와 V1-02b의 저장 중 문서 전환 방지·저장 snapshot 이후 edit revision 보호가 있다. Windows 11 Tauri GUI E2E는 16개 시나리오/38개 단언을 통과했다. WSLg GTK/portal의 AT-SPI로 실제 HWP/HWPX 파일을 선택해 열고 페이지 내용을 확인했으며, 취소·읽기 권한 오류 후 기존 문서 유지, 최신 열기 결과 우선도 GUI에서 확인했다. Linux 저장 ACL 실패/commit gate는 미검증이다. 일반 X11/Wayland는 별도 V1-15 검증 대상이다. 가져오기와 저장은 지원 구조 게이트를 거치며 형식 전반의 무손실 호환성은 검증되지 않음. |
 | FIL-02, FIL-03, FIL-05, FIL-06, FIL-08, FIL-10, FIL-11, FIL-12 | NOT_IMPLEMENTED | 템플릿·문서 도우미, 상호 변환, XML 도구, DAISY, 라이선스/점자, 외부 전송 기능의 제품 경로를 확인하지 못함. |
-| FIL-09, FIL-13 | PARTIAL | 문서 정보 대화상자는 파일명·경로·형식·크기·쪽/구역·엔진 버전·보안 여부·글꼴을 표시하지만 제목/작성자 메타데이터 편집과 저장은 없다. 용지 설정 대화상자와 일부 페이지 설정 모델 테스트가 있음. Hanword의 모든 메타데이터/용지 옵션은 구현되지 않음. |
+| FIL-09, FIL-13 | PARTIAL | 문서 정보 대화상자는 파일명·경로·형식·크기·쪽/구역·엔진 버전·암호화 정보·사용 글꼴을 표시한다. WSLg에서 native-open한 HWP/HWPX에서 이 기본 필드 표시를 확인했다. 문서 모델/UI에서 제목·작성자·생성·수정 시각 필드를 확인하지 못했으며 편집·포맷별 round-trip은 없다. 해당 값을 채워 넣지 않는다. Hanword의 모든 메타데이터/용지 옵션은 구현되지 않음. 용지 설정 대화상자와 일부 페이지 설정 모델 테스트가 있음. |
 | FIL-14 | PARTIAL | 앱 내부 인쇄 미리보기와 WebView 시스템 인쇄 경로가 있음. 실제 프린터와 PDF 가상 프린터별 출력 정확도는 폭넓게 검증되지 않음. |
-| FIL-15 | PARTIAL | 최근 경로 저장·중복 제거·끊어진 경로 정리에는 자동화 테스트가 있음. 미저장 저장/폐기/취소 정책, 최신 열기 요청 버전, 저장 잠금 및 저장 후 편집 revision 검사를 자동화했다. Windows Tauri Computer Use는 창 첫 화면 뒤 WebView 대상 전달 오류로 상호작용에 실패했다. Linux WSLg는 창/GTK 열기 대화상자만 표시했으며 최근 경로 재열기와 창 종료 Save/Discard/Cancel은 미검증이다. |
+| FIL-15 | PARTIAL | 최근 경로 저장·중복 제거·끊어진 경로 정리에는 자동화 테스트가 있다. Windows Tauri GUI E2E에서 최근 파일, dirty close/exit, Save/Discard/Cancel, 저장·파싱 경합을 확인했다. WSLg에서는 native Open과 최근 메뉴에서 HWP/HWPX 재열기, dirty 최근 열기 Cancel/Discard, dirty 종료 Cancel/Discard를 확인했다. Linux 종료 Save, actual save permission denial 및 반복 가능한 native-dialog E2E는 미검증이다. |
 
-V1-02b는 저장 중 작업 직렬화와 저장 스냅샷 이후의 추가 편집 보호를 자동화했다. WSLg에서 네이티브 열기 대화상자 표시까지 확인했지만 실제 파일 수명주기 GUI 시나리오는 확인하지 못했으므로 위 기능의 상태는 PARTIAL에 머문다. 자세한 검증 기록은 [V1-02b](v1-milestones.md#v1-02b--저장-트랜잭션-강화)를 참조한다.
+V1-02a–V1-02e의 상세 플랫폼 증거와 미검증 경계는 [마일스톤 기록](v1-milestones.md#v1-02-진행-기록)과 [데스크톱 파일 수명주기 테스트](../testing/desktop-file-lifecycle-e2e.md)를 참조한다. WSLg는 일반 Linux 데스크톱을 대표하지 않는다.
 | EDT-01, EDT-02, EDT-03, EDT-05, EDT-09 | PARTIAL | 실행 취소/다시 실행, 기본 텍스트 클립보드, 일부 선택/정렬 작업이 있음. 서식이 포함된 복사, 임의 범위·개체·문단 동작과 플랫폼 클립보드 동등성은 제한됨. |
 | EDT-04, EDT-07, EDT-08, EDT-10 | NOT_IMPLEMENTED | 메뉴의 레이아웃 표시/제거, 범용 찾아가기, 문자 체계 변환, OLE 연결 관리 등은 제품 명령 경로가 없음. |
 | EDT-06 | COMPLETED | 지원 문단 텍스트의 찾기/바꾸기, 대소문자 옵션, 다음/이전 및 모두 바꾸기 흐름에 UI와 모델 테스트가 있음. 한글 전체 기능의 범위 검색/필드/주석까지 완료했다는 뜻은 아님. |
