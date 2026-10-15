@@ -22,7 +22,7 @@ import { ImeInputGate } from "./ime-input";
 import { previewObjectDrag } from "./object-drag";
 import { LatestFrame } from "./pointer-frame";
 import { hanulDocumentEngine } from "./hwp-engine";
-import { commitLatestDocumentLoad, LatestDocumentLoad, resolveUnsavedChoice, type PendingDocumentAction } from "./document-lifecycle";
+import { canContinueAfterSave, commitLatestDocumentLoad, DocumentSaveLock, LatestDocumentLoad, resolveUnsavedChoice, type PendingDocumentAction } from "./document-lifecycle";
 import type {
   DocumentSession,
   DocumentInfo,
@@ -173,6 +173,7 @@ interface PdfExportCandidate {
 interface SaveExportCandidate {
   result: ExportResult;
   sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector">;
+  editRevision: number;
 }
 
 function getBaseName(path: string) {
@@ -633,6 +634,9 @@ function App() {
   const reader = useRef<VirtuosoHandle>(null);
   const activeSession = useRef<DocumentSession | null>(null);
   const documentLoads = useRef(new LatestDocumentLoad());
+  const documentSaveLock = useRef(new DocumentSaveLock());
+  const documentLoadInProgress = useRef(false);
+  const documentEditRevision = useRef(0);
   const allowWindowClose = useRef(false);
   const originalPrintTitle = useRef<string | null>(null);
   const imeInputGate = useRef(new ImeInputGate());
@@ -666,6 +670,7 @@ function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
   const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("");
   const [message, setMessage] = useState("");
   const editMode = Boolean(session);
@@ -845,7 +850,13 @@ function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested((event) => {
-      if (!active || allowWindowClose.current || !dirty) return;
+      if (!active || allowWindowClose.current) return;
+      if (documentSaveLock.current.isLocked) {
+        event.preventDefault();
+        setMessage("저장이 끝날 때까지 창을 닫을 수 없습니다.");
+        return;
+      }
+      if (!dirty) return;
       event.preventDefault();
       setPendingAction({ kind: "exit" });
       setDialogState("unsaved");
@@ -895,6 +906,7 @@ function App() {
 
     const loadRevision = documentLoads.current.begin();
     const openStartedAt = performance.now();
+    documentLoadInProgress.current = true;
     setIsLoading(true);
     setLoadingStatus(pending.createNew ? "새 문서를 구성하는 중…" : "파일을 읽는 중…");
     setMessage("");
@@ -957,6 +969,7 @@ function App() {
       if (pending.path) rememberRecent(pending.path, pending.name);
       setFileSize(pending.createNew ? 0 : bytes.byteLength);
       setDirty(false);
+      documentEditRevision.current = 0;
       setCaret(initialCaret);
       setImePreedit("");
       setSelection(null);
@@ -990,6 +1003,7 @@ function App() {
       }
     } finally {
       if (documentLoads.current.isCurrent(loadRevision)) {
+        documentLoadInProgress.current = false;
         setIsLoading(false);
         setLoadingStatus("");
         if (fileInput.current) fileInput.current.value = "";
@@ -999,6 +1013,10 @@ function App() {
 
   const openDocument = useCallback(
     async (pending: PendingDocument) => {
+      if (documentSaveLock.current.isLocked) {
+        setMessage("저장이 끝난 뒤 문서를 열거나 바꿀 수 있습니다.");
+        return;
+      }
       if (!pending.createNew) {
         const validation = validateDocumentFile(pending.name, pending.size);
         if (!validation.ok) {
@@ -1017,6 +1035,10 @@ function App() {
   );
 
   const chooseDocument = useCallback(async () => {
+    if (documentSaveLock.current.isLocked) {
+      setMessage("저장이 끝난 뒤 문서를 열거나 바꿀 수 있습니다.");
+      return;
+    }
     setMessage("");
     if (!isTauri()) {
       fileInput.current?.click();
@@ -1037,12 +1059,17 @@ function App() {
   }, [openDocument]);
 
   const chooseNewDocument = useCallback(async () => {
+    if (documentSaveLock.current.isLocked) {
+      setMessage("저장이 끝난 뒤 새 문서를 만들 수 있습니다.");
+      return;
+    }
     setMessage("");
     await openDocument({ name: "새 문서.hwp", size: 0, createNew: true });
   }, [openDocument]);
 
   const clearDocument = useCallback(() => {
     documentLoads.current.invalidate();
+    documentLoadInProgress.current = false;
     activeSession.current?.dispose();
     activeSession.current = null;
     setSession(null);
@@ -1054,6 +1081,7 @@ function App() {
     setPrintPreviewOpen(false);
     setPrintRequest(null);
     setDirty(false);
+    documentEditRevision.current = 0;
     setIsLoading(false);
     setLoadingStatus("");
     setCaret(null);
@@ -1092,6 +1120,10 @@ function App() {
   }, [clearDocument, exitApp, loadPendingDocument, pendingAction]);
 
   const requestCloseDocument = useCallback(() => {
+    if (documentSaveLock.current.isLocked) {
+      setMessage("저장이 끝난 뒤 문서를 닫을 수 있습니다.");
+      return;
+    }
     if (!session) return;
     if (dirty) {
       setPendingAction({ kind: "close" });
@@ -1102,6 +1134,10 @@ function App() {
   }, [clearDocument, dirty, session]);
 
   const requestExitApp = useCallback(() => {
+    if (documentSaveLock.current.isLocked) {
+      setMessage("저장이 끝날 때까지 앱을 종료할 수 없습니다.");
+      return;
+    }
     if (dirty) {
       setPendingAction({ kind: "exit" });
       setDialogState("unsaved");
@@ -1116,6 +1152,7 @@ function App() {
       destinationPath: string | null,
       sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector">,
       allowLossy: boolean,
+      expectedEditRevision: number,
     ) => {
       try {
         let savedPath = "";
@@ -1164,7 +1201,7 @@ function App() {
         setFileFormat(result.report.outputFormat);
         if (savedPath) rememberRecent(savedPath, getBaseName(savedPath));
         setFileSize(result.bytes.byteLength);
-        setDirty(false);
+        setDirty(documentEditRevision.current !== expectedEditRevision);
         setSaveCandidate(null);
         setSaveDestination(null);
         setDialogState(null);
@@ -1178,8 +1215,27 @@ function App() {
     [fileName, filePath, rememberRecent],
   );
 
+  const beginSaveTransaction = useCallback(() => {
+    if (documentSaveLock.current.acquire()) {
+      setIsSaving(true);
+      return true;
+    }
+    setMessage("이미 저장 작업이 진행 중입니다.");
+    return false;
+  }, []);
+
+  const endSaveTransaction = useCallback(() => {
+    documentSaveLock.current.release();
+    setIsSaving(false);
+  }, []);
+
   const saveCurrent = useCallback(async (saveAs = false) => {
     if (!session) return;
+    if (documentLoadInProgress.current) {
+      setMessage("문서를 여는 동안에는 저장할 수 없습니다.");
+      return;
+    }
+    if (!beginSaveTransaction()) return;
     try {
       const sourceFormat = fileFormat || session.sourceFormat;
       if (sourceFormat !== "hwp" && sourceFormat !== "hwpx") throw new Error("현재 저장할 수 없는 문서 형식입니다.");
@@ -1216,23 +1272,47 @@ function App() {
       const sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector"> =
         session.engineId === "hanul-text" ? "hanul-text" : "rhwp-compat";
       if (!canSaveWithCompatibility(exportCompatibility, false)) {
-        setSaveCandidate({ result, sourceEngine });
+        setSaveCandidate({ result, sourceEngine, editRevision: documentEditRevision.current });
         setSaveDestination(destinationPath);
         setDialogState("loss");
         return;
       }
-      const saved = await saveExport(result, destinationPath, sourceEngine, false);
-      if (saved && pendingAction) await continuePendingAction();
+      const editRevision = documentEditRevision.current;
+      const saved = await saveExport(result, destinationPath, sourceEngine, false, editRevision);
+      if (saved && pendingAction) {
+        if (canContinueAfterSave(editRevision, documentEditRevision.current)) await continuePendingAction();
+        else {
+          setDialogState("unsaved");
+          setMessage("저장하는 동안 새 변경 사항이 생겨 문서를 유지했습니다. 계속하려면 다시 저장하거나 취소하세요.");
+        }
+      }
     } catch (cause) {
       setMessage(cause instanceof Error ? `저장을 준비하지 못했습니다. (${cause.message})` : "저장을 준비하지 못했습니다.");
+    } finally {
+      endSaveTransaction();
     }
-  }, [continuePendingAction, fileFormat, fileName, filePath, pendingAction, saveExport, session]);
+  }, [beginSaveTransaction, continuePendingAction, endSaveTransaction, fileFormat, fileName, filePath, pendingAction, saveExport, session]);
 
   const confirmLossSave = useCallback(async () => {
     if (!saveCandidate) return;
-    const saved = await saveExport(saveCandidate.result, saveDestination, saveCandidate.sourceEngine, true);
-    if (saved && pendingAction) await continuePendingAction();
-  }, [continuePendingAction, pendingAction, saveCandidate, saveDestination, saveExport]);
+    if (documentLoadInProgress.current) {
+      setMessage("문서를 여는 동안에는 저장할 수 없습니다.");
+      return;
+    }
+    if (!beginSaveTransaction()) return;
+    try {
+      const saved = await saveExport(saveCandidate.result, saveDestination, saveCandidate.sourceEngine, true, saveCandidate.editRevision);
+      if (saved && pendingAction) {
+        if (canContinueAfterSave(saveCandidate.editRevision, documentEditRevision.current)) await continuePendingAction();
+        else {
+          setDialogState("unsaved");
+          setMessage("저장하는 동안 새 변경 사항이 생겨 문서를 유지했습니다. 계속하려면 다시 저장하거나 취소하세요.");
+        }
+      }
+    } finally {
+      endSaveTransaction();
+    }
+  }, [beginSaveTransaction, continuePendingAction, endSaveTransaction, pendingAction, saveCandidate, saveDestination, saveExport]);
 
   const writePdfExport = useCallback(async ({ result, outputPath }: PdfExportCandidate) => {
     try {
@@ -1326,8 +1406,8 @@ function App() {
 
   const fileMenuItems = useMemo(() => createFileMenuItems(
     recentDocuments,
-    { hasDocument: Boolean(session), canEditPage: Boolean(session && caret), canExit: isTauri(), canExportPdf: isTauri() },
-  ), [recentDocuments, session, caret]);
+    { hasDocument: Boolean(session), canEditPage: Boolean(session && caret), canExit: isTauri(), canExportPdf: isTauri(), isSaving },
+  ), [isSaving, recentDocuments, session, caret]);
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
@@ -1620,6 +1700,7 @@ function App() {
   };
 
   const updateAfterEdit = (position: TextPosition) => {
+    documentEditRevision.current += 1;
     const engineMetrics = session?.performanceMetrics?.();
     if (engineMetrics) {
       reportAppPerformance("document-edit-model-layout", {
@@ -2172,6 +2253,7 @@ function App() {
     try {
       const position = session.undo();
       if (position) {
+        documentEditRevision.current += 1;
         setSelection(null);
         setCaretPosition(position);
         setRenderVersion((value) => value + 1);
@@ -2187,6 +2269,7 @@ function App() {
     try {
       const position = session.redo();
       if (position) {
+        documentEditRevision.current += 1;
         setSelection(null);
         setCaretPosition(position);
         setRenderVersion((value) => value + 1);
@@ -2626,12 +2709,12 @@ function App() {
           <span className="brand-caption">문서</span>
         </div>
         <div className="header-divider" />
-        <button className="header-action" type="button" onClick={() => void chooseDocument()} disabled={isLoading}>
+        <button className="header-action" type="button" onClick={() => void chooseDocument()} disabled={isLoading || isSaving}>
           <Icon name="open" />
           <span>열기</span>
           <kbd>Ctrl O</kbd>
         </button>
-        <button className="header-action new-document-action" type="button" onClick={() => void chooseNewDocument()} disabled={isLoading}>
+        <button className="header-action new-document-action" type="button" onClick={() => void chooseNewDocument()} disabled={isLoading || isSaving}>
           <Icon name="file" />
           <span>새 문서</span>
           <kbd>Ctrl N</kbd>
@@ -2649,8 +2732,8 @@ function App() {
             <button className="header-action compact-action" type="button" onClick={redo} disabled={!session.canRedo} title="다시 실행 (Ctrl Y)">
               <Icon name="redo" size={16} /><span>다시 실행</span>
             </button>
-            <button className="header-action save-action" type="button" onClick={() => void saveCurrent()} disabled={!dirty} title="저장 (Ctrl S)">
-              <Icon name="save" size={16} /><span>저장</span>
+            <button className="header-action save-action" type="button" onClick={() => void saveCurrent()} disabled={!dirty || isSaving || isLoading} title="저장 (Ctrl S)">
+              <Icon name="save" size={16} /><span>{isSaving ? "저장 중…" : "저장"}</span>
             </button>
           </>
         )}
@@ -3027,10 +3110,10 @@ function App() {
             <p className="eyebrow">HANUL DOCUMENT</p>
             <h1>한글 문서를 열어보세요</h1>
             <p className="welcome-copy">HWP와 HWPX 파일을 확인하고 본문을 편집하거나 새 HWP 문서를 만들 수 있습니다.</p>
-            <button className="open-primary" type="button" onClick={() => void chooseDocument()} disabled={isLoading}>
+            <button className="open-primary" type="button" onClick={() => void chooseDocument()} disabled={isLoading || isSaving}>
               <Icon name="open" size={17} />{isLoading ? "문서를 여는 중…" : "문서 열기"}
             </button>
-            <button className="welcome-new" type="button" onClick={() => void chooseNewDocument()} disabled={isLoading}>새 HWP 문서 만들기</button>
+            <button className="welcome-new" type="button" onClick={() => void chooseNewDocument()} disabled={isLoading || isSaving}>새 HWP 문서 만들기</button>
             <span className="shortcut-hint">또는 Ctrl + O</span>
           </div>
         )}
@@ -3273,9 +3356,9 @@ function App() {
                       : pendingAction?.kind === "close" ? "문서를 닫기 전에 저장할까요?" : "앱을 종료하기 전에 저장할까요?"}
                   </p>
                 <div className="dialog-actions">
-                  <button className="secondary-button" type="button" onClick={() => resolvePendingFileAction("cancel")}>취소</button>
-                    <button className="secondary-button discard-button" type="button" onClick={() => resolvePendingFileAction("discard")}>저장 안 함</button>
-                    <button className="primary-button" type="button" onClick={() => resolvePendingFileAction("save")}>저장</button>
+                  <button className="secondary-button" type="button" disabled={isSaving} onClick={() => resolvePendingFileAction("cancel")}>취소</button>
+                    <button className="secondary-button discard-button" type="button" disabled={isSaving} onClick={() => resolvePendingFileAction("discard")}>저장 안 함</button>
+                    <button className="primary-button" type="button" disabled={isSaving} onClick={() => resolvePendingFileAction("save")}>{isSaving ? "저장 중…" : "저장"}</button>
                 </div>
               </>
             ) : dialogState === "loss" ? (
@@ -3293,8 +3376,8 @@ function App() {
                   {(saveCandidate?.result.report.count ?? 0) > 8 && <li>그 외 {((saveCandidate?.result.report.count ?? 0) - 8)}개 항목</li>}
                 </ul>
                 <div className="dialog-actions">
-                  <button className="secondary-button" type="button" onClick={cancelDialog}>저장 취소</button>
-                  <button className="primary-button warning-button" type="button" onClick={() => void confirmLossSave()}>손실 가능성을 알고 저장</button>
+                  <button className="secondary-button" type="button" disabled={isSaving} onClick={cancelDialog}>저장 취소</button>
+                  <button className="primary-button warning-button" type="button" disabled={isSaving} onClick={() => void confirmLossSave()}>{isSaving ? "저장 중…" : "손실 가능성을 알고 저장"}</button>
                 </div>
               </>
             ) : (

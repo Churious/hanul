@@ -53,8 +53,9 @@ function isSupported(feature: keyof typeof FILE_MENU_SUPPORT) {
 
 export function createFileMenuItems(
   recentDocuments: RecentFileMenuItem[],
-  state: { hasDocument: boolean; canEditPage: boolean; canExit: boolean; canExportPdf: boolean },
+  state: { hasDocument: boolean; canEditPage: boolean; canExit: boolean; canExportPdf: boolean; isSaving?: boolean },
 ): FileMenuEntry[] {
+  const isSaving = Boolean(state.isSaving);
   const recentChildren: FileMenuItem[] = recentDocuments.length
     ? recentDocuments.map((recent, index) => ({
         id: `recent-${index}`,
@@ -62,6 +63,7 @@ export function createFileMenuItems(
         icon: "recent",
         command: "open-recent",
         argument: recent.path,
+        disabled: isSaving,
         disabledReason: recent.path,
       }))
     : [{
@@ -74,12 +76,12 @@ export function createFileMenuItems(
   const separator = (id: string): FileMenuEntry => ({ id, kind: "separator" });
 
   return [
-    { id: "new-document", label: "새 문서", shortcut: "Ctrl+N", icon: "new", command: "new-document", disabled: !isSupported("newDocument") },
+    { id: "new-document", label: "새 문서", shortcut: "Ctrl+N", icon: "new", command: "new-document", disabled: !isSupported("newDocument") || isSaving },
     separator("before-open"),
-    { id: "open-document", label: "불러오기", shortcut: "Ctrl+O", icon: "open", command: "open-document", disabled: !isSupported("openDocument") },
+    { id: "open-document", label: "불러오기", shortcut: "Ctrl+O", icon: "open", command: "open-document", disabled: !isSupported("openDocument") || isSaving },
     separator("before-save"),
-    { id: "save-document", label: "저장하기", shortcut: "Ctrl+S", icon: "save", command: "save-document", disabled: !isSupported("saveDocument") || !state.hasDocument },
-    { id: "save-as", label: "다른 이름으로 저장하기", shortcut: "Ctrl+Shift+S", icon: "save-as", command: "save-as", disabled: !isSupported("saveAs") || !state.hasDocument },
+    { id: "save-document", label: "저장하기", shortcut: "Ctrl+S", icon: "save", command: "save-document", disabled: !isSupported("saveDocument") || !state.hasDocument || isSaving },
+    { id: "save-as", label: "다른 이름으로 저장하기", shortcut: "Ctrl+Shift+S", icon: "save-as", command: "save-as", disabled: !isSupported("saveAs") || !state.hasDocument || isSaving },
     { id: "export-pdf", label: "PDF로 내보내기", icon: "pdf", command: "export-pdf", disabled: !isSupported("exportPdf") || !state.hasDocument || !state.canExportPdf, disabledReason: !state.canExportPdf ? "PDF 파일 내보내기는 데스크톱 앱에서 사용할 수 있습니다." : undefined },
     separator("before-info"),
     { id: "document-info", label: "문서 정보", icon: "info", command: "document-info", disabled: !isSupported("documentInfo") || !state.hasDocument },
@@ -93,11 +95,11 @@ export function createFileMenuItems(
       label: "최근 문서",
       icon: "recent",
       children: recentChildren,
-      disabled: !isSupported("recentDocuments") || recentDocuments.length === 0,
+      disabled: !isSupported("recentDocuments") || recentDocuments.length === 0 || isSaving,
       disabledReason: recentDocuments.length === 0 ? "문서를 열거나 저장하면 최근 문서에 표시됩니다." : undefined,
     },
     separator("before-close"),
-    { id: "close-document", label: "문서 닫기", icon: "close", command: "close-document", disabled: !isSupported("closeDocument") || !state.hasDocument },
-    { id: "exit", label: "끝", icon: "exit", command: "exit-app", disabled: !isSupported("exit") || !state.canExit },
+    { id: "close-document", label: "문서 닫기", icon: "close", command: "close-document", disabled: !isSupported("closeDocument") || !state.hasDocument || isSaving },
+    { id: "exit", label: "끝", icon: "exit", command: "exit-app", disabled: !isSupported("exit") || !state.canExit || isSaving },
   ];
 }

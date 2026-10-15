@@ -1,7 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
-import { commitLatestDocumentLoad, LatestDocumentLoad, resolveUnsavedChoice, type PendingDocumentAction } from "./document-lifecycle";
+import { canContinueAfterSave, commitLatestDocumentLoad, DocumentSaveLock, LatestDocumentLoad, resolveUnsavedChoice, type PendingDocumentAction } from "./document-lifecycle";
 
 describe("document lifecycle", () => {
+  it("allows only one save transaction until it releases the document transition lock", () => {
+    const lock = new DocumentSaveLock();
+
+    expect(lock.isLocked).toBe(false);
+    expect(lock.acquire()).toBe(true);
+    expect(lock.isLocked).toBe(true);
+    expect(lock.acquire()).toBe(false);
+
+    lock.release();
+
+    expect(lock.isLocked).toBe(false);
+    expect(lock.acquire()).toBe(true);
+  });
+
+  it("keeps the current document when edits happen after the exported snapshot", () => {
+    expect(canContinueAfterSave(7, 7)).toBe(true);
+    expect(canContinueAfterSave(7, 8)).toBe(false);
+  });
+
   it("does not let an older asynchronous open replace the latest request", () => {
     const loads = new LatestDocumentLoad();
     const first = loads.begin();

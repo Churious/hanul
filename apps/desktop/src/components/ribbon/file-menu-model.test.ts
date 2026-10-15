@@ -50,6 +50,16 @@ describe("file ribbon menu model", () => {
     expect(itemById(items, "page-setup")?.disabledReason).toContain("편집 위치");
   });
 
+  it("disables document replacement and close commands during a save transaction", () => {
+    const items = createFileMenuItems(
+      [{ path: "C:/docs/report.hwp", label: "report.hwp" }],
+      { hasDocument: true, canEditPage: true, canExit: true, canExportPdf: true, isSaving: true },
+    );
+    for (const id of ["new-document", "open-document", "save-document", "save-as", "recent-documents", "close-document", "exit"]) {
+      expect(itemById(items, id)?.disabled, id).toBe(true);
+    }
+  });
+
   it("does not advertise PDF export as available outside the desktop app", () => {
     const items = createFileMenuItems([], { hasDocument: true, canEditPage: true, canExit: false, canExportPdf: false });
     expect(itemById(items, "export-pdf")?.disabled).toBe(true);

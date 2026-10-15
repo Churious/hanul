@@ -20,6 +20,30 @@ export class LatestDocumentLoad {
   }
 }
 
+/** Prevent overlapping save transactions from racing a document transition. */
+export class DocumentSaveLock {
+  private locked = false;
+
+  acquire(): boolean {
+    if (this.locked) return false;
+    this.locked = true;
+    return true;
+  }
+
+  release(): void {
+    this.locked = false;
+  }
+
+  get isLocked(): boolean {
+    return this.locked;
+  }
+}
+
+/** A pending close/open/exit may continue only if no edits followed the saved snapshot. */
+export function canContinueAfterSave(savedRevision: number, currentRevision: number): boolean {
+  return savedRevision === currentRevision;
+}
+
 /** Commit a parsed session only if it still corresponds to the latest request. */
 export function commitLatestDocumentLoad<T extends { dispose(): void }>(
   loads: LatestDocumentLoad,
