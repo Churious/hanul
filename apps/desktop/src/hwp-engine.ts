@@ -232,6 +232,7 @@ function initializeEngine() {
 }
 
 class RhwpDocumentSession implements DocumentSession {
+  readonly engineId = "rhwp-compat";
   private readonly document: HwpDocument;
   private readonly renderedPages = new Map<number, string>();
   private readonly undoStack: EditOperation[] = [];
@@ -253,24 +254,25 @@ class RhwpDocumentSession implements DocumentSession {
   }
 
   compatibilityReport(format: "hwp" | "hwpx"): DocumentCompatibilityReport {
-    const sectionIndexes = new Set<number>();
-    for (let pageIndex = 0; pageIndex < this.pageCount; pageIndex += 1) {
-      sectionIndexes.add(this.pageInfo(pageIndex).sectionIndex);
-    }
+    const controls = parseJson<RawDocumentControl[]>(this.document.getControls(), "문서 컨트롤");
+    const controlIds = new Set(["secd", "cold", "tbl", "gso", "eqed", "head", "foot", "fn", "en", "atno", "nwno", "pgnp", "pghd", "bokm", "tcmt"]);
+    const unsupportedIds = new Set(["eqed", "fn", "en", "nwno", "pgnp", "pghd", "bokm", "tcmt"]);
+    const fields = parseJson<unknown[]>(this.document.getFieldList(), "문서 필드");
     const structure = {
-      sectionCount: Math.max(sectionIndexes.size, 1),
+      sectionCount: this.document.getSectionCount(),
       paragraphCount: 0,
-      tableCount: 0,
+      tableCount: controls.filter((control) => control.ctrlId === "tbl").length,
       objectCounts: { ...emptyCompatibilityObjectCounts() },
       textBoxParagraphCounts: [] as number[],
       textBoxShapeTypes: [] as Array<"rectangle" | "ellipse" | "other">,
       textBoxUnsupportedProperties: [] as boolean[],
       textBoxHasNestedContent: [] as boolean[],
-      hasFields: false,
+      hasFields: fields.length > 0 || controls.some((control) => control.ctrlId === "atno"),
       hasRangeTags: false,
-      unsupportedControlCount: 0,
+      unsupportedControlCount: controls.filter((control) => control.ctrlId && unsupportedIds.has(control.ctrlId)).length,
+      unknownControlCount: controls.filter((control) => !control.ctrlId || !controlIds.has(control.ctrlId)).length,
     };
-    for (const sectionIndex of sectionIndexes) {
+    for (let sectionIndex = 0; sectionIndex < structure.sectionCount; sectionIndex += 1) {
       structure.paragraphCount += this.document.getParagraphCount(sectionIndex);
       for (const object of this.listObjects(sectionIndex)) structure.objectCounts[object.kind] += 1;
     }
@@ -287,16 +289,9 @@ class RhwpDocumentSession implements DocumentSession {
     return evaluateDocumentCompatibility(format, {
       structure,
       textBoxes,
-      hasFields: false,
+      hasFields: structure.hasFields,
       hasRangeTags: false,
-      ...(format === "hwp" && textBoxes.length > 0 ? {
-        forcedIssue: {
-          code: "hwp.textbox.rhwp_session",
-          feature: "textBox" as const,
-          message: "RHWP 호환 세션의 글상자 구조는 독립 엔진 제품 저장으로 검증되지 않아 HWP 저장을 차단했습니다.",
-        },
-      } : {}),
-    });
+    }, this.engineId);
   }
 
   documentInfo() {

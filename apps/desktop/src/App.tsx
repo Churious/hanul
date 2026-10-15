@@ -25,6 +25,7 @@ import { hanulDocumentEngine } from "./hwp-engine";
 import type {
   DocumentSession,
   DocumentInfo,
+  CompatibilityEngine,
   DocumentCompatibilityReport,
   CharacterFormat,
   DocumentObject,
@@ -49,6 +50,7 @@ import {
   sanitizeRenderedSvg,
   validateDocumentFile,
 } from "./document-utils";
+import { canSaveWithCompatibility, compatibilityIssueMessage, withSerializerLosses } from "./document-compatibility";
 import { FileMenu } from "./components/ribbon/FileMenu";
 import { createFileMenuItems, type FileMenuCommand } from "./components/ribbon/file-menu-model";
 import { forgetRecentDocument, readRecentDocuments, rememberRecentDocument } from "./recent-documents";
@@ -170,6 +172,11 @@ type PrintRequest = "print";
 interface PdfExportCandidate {
   result: ExportResult;
   outputPath: string;
+}
+
+interface SaveExportCandidate {
+  result: ExportResult;
+  sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector">;
 }
 
 function getBaseName(path: string) {
@@ -704,7 +711,7 @@ function App() {
   const [renderVersion, setRenderVersion] = useState(0);
   const [pendingAction, setPendingAction] = useState<PendingFileAction | null>(null);
   const [dialogState, setDialogState] = useState<DialogState>(null);
-  const [saveCandidate, setSaveCandidate] = useState<ExportResult | null>(null);
+  const [saveCandidate, setSaveCandidate] = useState<SaveExportCandidate | null>(null);
   const [saveDestination, setSaveDestination] = useState<string | null>(null);
   const [pdfCandidate, setPdfCandidate] = useState<PdfExportCandidate | null>(null);
   const [recentDocuments, setRecentDocuments] = useState(() => {
@@ -1087,7 +1094,12 @@ function App() {
   }, [dirty, exitApp]);
 
   const saveExport = useCallback(
-    async (result: ExportResult, destinationPath: string | null) => {
+    async (
+      result: ExportResult,
+      destinationPath: string | null,
+      sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector">,
+      allowLossy: boolean,
+    ) => {
       try {
         let savedPath = "";
         if (isTauri()) {
@@ -1098,14 +1110,19 @@ function App() {
             const compatibility = await invoke<DocumentCompatibilityReport>("inspect_document_compatibility", {
               documentPath: temporaryPath,
               outputFormat: result.report.outputFormat,
+              sourceEngine,
+              knownLossCount: result.report.count,
             });
-            if (!compatibility.supported) {
-              throw new Error(compatibility.issues[0]?.message ?? "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.");
+            if (!canSaveWithCompatibility(compatibility, allowLossy)) {
+              throw new Error(compatibilityIssueMessage(compatibility, "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다."));
             }
             await invoke("commit_document_save", {
               temporaryPath,
               outputPath: destinationPath,
               outputFormat: result.report.outputFormat,
+              sourceEngine,
+              knownLossCount: result.report.count,
+              allowLossy,
             });
           } finally {
             try {
@@ -1174,17 +1191,20 @@ function App() {
       }
 
       const compatibility = session.compatibilityReport(format);
-      if (!compatibility.supported) {
-        throw new Error(compatibility.issues[0]?.message ?? `이 ${format.toUpperCase()} 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.`);
+      if (!canSaveWithCompatibility(compatibility, false)) {
+        throw new Error(compatibilityIssueMessage(compatibility, "이 " + format.toUpperCase() + " 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다."));
       }
       const result = session.exportWithReport(format);
-      if (result.report.count > 0) {
-        setSaveCandidate(result);
+      const exportCompatibility = withSerializerLosses(compatibility, result.report);
+      const sourceEngine: Exclude<CompatibilityEngine, "rhwp-inspector"> =
+        session.engineId === "hanul-text" ? "hanul-text" : "rhwp-compat";
+      if (!canSaveWithCompatibility(exportCompatibility, false)) {
+        setSaveCandidate({ result, sourceEngine });
         setSaveDestination(destinationPath);
         setDialogState("loss");
         return;
       }
-      const saved = await saveExport(result, destinationPath);
+      const saved = await saveExport(result, destinationPath, sourceEngine, false);
       if (saved && pendingAction) await continuePendingAction();
     } catch (cause) {
       setMessage(cause instanceof Error ? `저장을 준비하지 못했습니다. (${cause.message})` : "저장을 준비하지 못했습니다.");
@@ -1193,7 +1213,7 @@ function App() {
 
   const confirmLossSave = useCallback(async () => {
     if (!saveCandidate) return;
-    const saved = await saveExport(saveCandidate, saveDestination);
+    const saved = await saveExport(saveCandidate.result, saveDestination, saveCandidate.sourceEngine, true);
     if (saved && pendingAction) await continuePendingAction();
   }, [continuePendingAction, pendingAction, saveCandidate, saveDestination, saveExport]);
 
@@ -3231,15 +3251,15 @@ function App() {
               <>
                 <p className="eyebrow warning-eyebrow">저장 형식 확인</p>
                 <h2 id="confirm-title">일부 내용을 저장하지 못할 수 있습니다</h2>
-                <p>변환 보고서에 {saveCandidate?.report.count ?? 0}개의 손실 항목이 있습니다. 내용을 확인하고 계속 저장할지 선택하세요.</p>
+                <p>변환 보고서에 {saveCandidate?.result.report.count ?? 0}개의 손실 항목이 있습니다. 내용을 확인하고 계속 저장할지 선택하세요.</p>
                 <ul className="loss-list">
-                  {saveCandidate?.report.losses.slice(0, 8).map((loss, index) => (
+                  {saveCandidate?.result.report.losses.slice(0, 8).map((loss, index) => (
                     <li key={`${loss.code ?? "loss"}-${index}`}>
                       <strong>{String(loss.subject ?? loss.code ?? `항목 ${index + 1}`)}</strong>
                       <span>{String(loss.message ?? loss.reason ?? "이 형식에서 보존되지 않을 수 있습니다.")}</span>
                     </li>
                   ))}
-                  {(saveCandidate?.report.count ?? 0) > 8 && <li>그 외 {((saveCandidate?.report.count ?? 0) - 8)}개 항목</li>}
+                  {(saveCandidate?.result.report.count ?? 0) > 8 && <li>그 외 {((saveCandidate?.result.report.count ?? 0) - 8)}개 항목</li>}
                 </ul>
                 <div className="dialog-actions">
                   <button className="secondary-button" type="button" onClick={cancelDialog}>저장 취소</button>

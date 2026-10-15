@@ -691,6 +691,31 @@ describe("RHWP document session", () => {
     }
   });
 
+  it("round-trips a standalone ellipse through HWP and HWPX", async () => {
+    const session = await createNewHwpDocumentSession();
+    const reopened: ReturnType<typeof wrapHwpDocument>[] = [];
+    try {
+      const start = session.hitTest(0, 113, 132);
+      session.insertShape(start, "ellipse", 28, 14);
+      expect(session.compatibilityReport("hwp").status).toBe("SUPPORTED");
+      expect(session.compatibilityReport("hwpx").status).toBe("SUPPORTED");
+
+      for (const format of ["hwp", "hwpx"] as const) {
+        const saved = session.exportWithReport(format);
+        expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
+        const reopenedSession = wrapHwpDocument(new HwpDocument(saved.bytes));
+        reopened.push(reopenedSession);
+        const ellipse = reopenedSession.listObjects(0)[0];
+        expect(ellipse).toMatchObject({ kind: "ellipse", widthMm: 28 });
+        expect(ellipse!.heightMm).toBeCloseTo(14, 1);
+        expect(reopenedSession.renderPage(0)).toContain("<ellipse");
+      }
+    } finally {
+      reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
   it("edits page-scoped headers and footers with page fields through HWP/HWPX round trips", async () => {
     const session = await createNewHwpDocumentSession();
     const reopened: ReturnType<typeof wrapHwpDocument>[] = [];

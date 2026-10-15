@@ -89,6 +89,7 @@ function compatibilityFacts(paragraphs: readonly PlainTextParagraph[]) {
     hasFields: false,
     hasRangeTags: false,
     unsupportedControlCount: 0,
+    unknownControlCount: 0,
   };
   const textBoxes: Array<{
     shapeType: "rectangle" | "ellipse" | "other";
@@ -480,7 +481,7 @@ export class HanulTextDocumentSession implements DocumentSession {
   get canUndo(): boolean { return this.undoStack.length > 0; }
   get canRedo(): boolean { return this.redoStack.length > 0; }
   compatibilityReport(format: "hwp" | "hwpx") {
-    return evaluateDocumentCompatibility(format, compatibilityFacts(this.paragraphs()));
+    return evaluateDocumentCompatibility(format, compatibilityFacts(this.paragraphs()), this.engineId);
   }
   get metrics(): Readonly<TextEngineMetrics> { return this._metrics; }
   performanceMetrics(): Readonly<TextEngineMetrics> { return { ...this._metrics }; }

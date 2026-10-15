@@ -14,7 +14,10 @@ describe("Hanul paragraph text engine", () => {
       const textbox = session.listObjects(0).find((object) => object.kind === "textBox")!;
       session.updateObject(textbox, { widthMm: 63, heightMm: 31, offsetXmm: 12, offsetYmm: 15 });
       expect(session.compatibilityReport("hwp")).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
+        engine: "hanul-text",
+        validator: "hanul-policy",
+        status: "SUPPORTED",
         format: "hwp",
         supported: true,
         structure: { sectionCount: 1, objectCounts: { textBox: 1 }, textBoxParagraphCounts: [1] },
@@ -34,8 +37,9 @@ describe("Hanul paragraph text engine", () => {
       });
       expect(multipleParagraphSession.compatibilityReport("hwpx")).toMatchObject({
         format: "hwpx",
-        supported: true,
-        issues: [],
+        status: "UNKNOWN",
+        supported: false,
+        issues: [{ code: "hwpx.textbox.unverified_structure", affectedElements: [{ kind: "textBox", count: 1 }] }],
       });
       multipleParagraphSession.dispose();
 
@@ -45,6 +49,11 @@ describe("Hanul paragraph text engine", () => {
       expect(multipleBoxesSession.compatibilityReport("hwp")).toMatchObject({
         supported: false,
         issues: [{ code: "hwp.textbox.count" }],
+      });
+      expect(multipleBoxesSession.compatibilityReport("hwpx")).toMatchObject({
+        status: "UNKNOWN",
+        supported: false,
+        issues: [{ code: "hwpx.textbox.unverified_structure" }],
       });
       multipleBoxesSession.dispose();
 

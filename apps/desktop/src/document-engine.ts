@@ -126,18 +126,37 @@ export interface CompatibilityStructure {
   hasFields: boolean;
   hasRangeTags: boolean;
   unsupportedControlCount: number;
+  unknownControlCount: number;
+}
+
+export type CompatibilityStatus = "SUPPORTED" | "UNSUPPORTED" | "LOSSY" | "UNKNOWN";
+export type CompatibilityEngine = "hanul-text" | "rhwp-compat" | "rhwp-inspector";
+
+export interface CompatibilityAffectedElement {
+  kind: string;
+  count: number;
 }
 
 export interface CompatibilityIssue {
   code: string;
-  feature: "textBox" | "structure";
+  status: Exclude<CompatibilityStatus, "SUPPORTED">;
+  feature: "textBox" | "structure" | "document" | "table" | "picture" | "shape" | "field" | "section" | "control";
   message: string;
+  affectedElements: CompatibilityAffectedElement[];
 }
 
-/** Structural eligibility only; ExportResult.report separately records known serializer loss. */
+/**
+ * Save eligibility for a specific engine path and output format. SUPPORTED
+ * describes Hanul's structural and internal round-trip profile; it does not
+ * imply Hanword 2024 interoperability unless that is separately documented.
+ */
 export interface DocumentCompatibilityReport {
-  schemaVersion: 1;
+  schemaVersion: 2;
   format: DocumentExportFormat;
+  engine: CompatibilityEngine;
+  validator: "hanul-policy" | "rhwp-parser";
+  validationScope: "internal-structure";
+  status: CompatibilityStatus;
   supported: boolean;
   structure: CompatibilityStructure;
   issues: CompatibilityIssue[];

@@ -322,7 +322,7 @@ describe("Hanul text engine serialization bridge", () => {
     }
     const opened = await hanulDocumentEngine.open(bytes!);
     try {
-      expect(opened.engineId).toBeUndefined();
+      expect(opened.engineId).toBe("rhwp-compat");
       expect(opened.renderPage(0)).toContain("<svg");
     } finally {
       opened.dispose();

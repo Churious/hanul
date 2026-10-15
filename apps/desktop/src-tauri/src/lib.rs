@@ -20,9 +20,19 @@ async fn commit_document_save(
     temporary_path: String,
     output_path: String,
     output_format: String,
+    source_engine: String,
+    known_loss_count: u32,
+    allow_lossy: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        commit_document_save_blocking(&temporary_path, &output_path, &output_format)
+        commit_document_save_with_policy_blocking(
+            &temporary_path,
+            &output_path,
+            &output_format,
+            &source_engine,
+            known_loss_count,
+            allow_lossy,
+        )
     })
     .await
     .map_err(|error| format!("문서 저장 검증을 완료하지 못했습니다. ({error})"))?
@@ -32,31 +42,48 @@ async fn commit_document_save(
 async fn inspect_document_compatibility(
     document_path: String,
     output_format: String,
+    source_engine: String,
+    known_loss_count: u32,
 ) -> Result<DocumentCompatibilityReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        inspect_document_compatibility_file_blocking(&document_path, &output_format)
+        inspect_document_compatibility_file_with_context_blocking(
+            &document_path,
+            &output_format,
+            &source_engine,
+            known_loss_count,
+        )
     })
     .await
     .map_err(|error| format!("문서 호환성 검사를 완료하지 못했습니다. ({error})"))?
 }
 
-fn inspect_document_compatibility_file_blocking(
+fn inspect_document_compatibility_file_with_context_blocking(
     document_path: &str,
     output_format: &str,
+    source_engine: &str,
+    known_loss_count: u32,
 ) -> Result<DocumentCompatibilityReport, String> {
     let document_bytes = fs::read(document_path)
         .map_err(|error| format!("임시 문서를 읽지 못했습니다. ({error})"))?;
-    inspect_document_compatibility_blocking(&document_bytes, output_format)
+    inspect_document_compatibility_with_context_blocking(
+        &document_bytes,
+        output_format,
+        source_engine,
+        known_loss_count,
+    )
 }
 
-fn inspect_document_compatibility_blocking(
+fn inspect_document_compatibility_with_context_blocking(
     document_bytes: &[u8],
     output_format: &str,
+    source_engine: &str,
+    known_loss_count: u32,
 ) -> Result<DocumentCompatibilityReport, String> {
     let format = output_format.to_ascii_lowercase();
     if !matches!(format.as_str(), "hwp" | "hwpx") {
         return Err("호환성 검사는 HWP 또는 HWPX 문서만 지원합니다.".to_owned());
     }
+    validate_source_engine(source_engine)?;
     let expected_signature: &[u8] = if format == "hwp" {
         &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
     } else {
@@ -72,13 +99,37 @@ fn inspect_document_compatibility_blocking(
     if parsed.page_count() == 0 {
         return Err("문서에 페이지가 없어 호환성 검사를 중단했습니다.".to_owned());
     }
-    Ok(document_compatibility_report(&parsed, &format))
+    Ok(document_compatibility_report_with_context(
+        &parsed,
+        &format,
+        source_engine,
+        known_loss_count,
+    ))
 }
 
+#[cfg(test)]
 fn commit_document_save_blocking(
     temporary_path: &str,
     output_path: &str,
     output_format: &str,
+) -> Result<(), String> {
+    commit_document_save_with_policy_blocking(
+        temporary_path,
+        output_path,
+        output_format,
+        "rhwp-compat",
+        0,
+        false,
+    )
+}
+
+fn commit_document_save_with_policy_blocking(
+    temporary_path: &str,
+    output_path: &str,
+    output_format: &str,
+    source_engine: &str,
+    known_loss_count: u32,
+    allow_lossy: bool,
 ) -> Result<(), String> {
     let temporary = PathBuf::from(temporary_path);
     let destination = PathBuf::from(output_path);
@@ -91,6 +142,7 @@ fn commit_document_save_blocking(
     {
         return Err("HWP 또는 HWPX 확장자와 저장 형식이 일치하지 않습니다.".to_owned());
     }
+    validate_source_engine(source_engine)?;
     if temporary == destination {
         return Err("검증용 임시 파일과 원본 저장 경로가 같습니다.".to_owned());
     }
@@ -130,12 +182,17 @@ fn commit_document_save_blocking(
         return Err("임시 문서에 페이지가 없어 저장을 중단했습니다.".to_owned());
     }
 
-    let compatibility = document_compatibility_report(&parsed, &format);
-    if !compatibility.supported {
+    let compatibility = document_compatibility_report_with_context(
+        &parsed,
+        &format,
+        source_engine,
+        known_loss_count,
+    );
+    if !compatibility.can_save(allow_lossy) {
         return Err(compatibility
             .issues
             .first()
-            .map(|issue| issue.message.clone())
+            .map(CompatibilityIssue::message_with_affected_elements)
             .unwrap_or_else(|| {
                 "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.".to_owned()
             }));
@@ -145,14 +202,51 @@ fn commit_document_save_blocking(
         .map_err(|error| format!("검증한 문서로 원본을 교체하지 못했습니다. ({error})"))
 }
 
+fn validate_source_engine(source_engine: &str) -> Result<(), String> {
+    if matches!(source_engine, "hanul-text" | "rhwp-compat") {
+        Ok(())
+    } else {
+        Err("문서 저장 엔진 정보가 올바르지 않습니다.".to_owned())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DocumentCompatibilityReport {
     schema_version: u8,
     format: String,
+    engine: String,
+    validator: String,
+    validation_scope: String,
+    status: CompatibilityStatus,
     supported: bool,
     structure: CompatibilityStructure,
     issues: Vec<CompatibilityIssue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum CompatibilityStatus {
+    #[serde(rename = "SUPPORTED")]
+    Supported,
+    #[serde(rename = "UNSUPPORTED")]
+    Unsupported,
+    #[serde(rename = "LOSSY")]
+    Lossy,
+    #[serde(rename = "UNKNOWN")]
+    Unknown,
+}
+
+impl CompatibilityStatus {
+    fn can_save(self, allow_lossy: bool) -> bool {
+        matches!(self, Self::Supported) || (self == Self::Lossy && allow_lossy)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompatibilityAffectedElement {
+    kind: String,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -169,6 +263,7 @@ struct CompatibilityStructure {
     has_fields: bool,
     has_range_tags: bool,
     unsupported_control_count: usize,
+    unknown_control_count: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -184,13 +279,46 @@ struct CompatibilityObjectCounts {
 #[serde(rename_all = "camelCase")]
 struct CompatibilityIssue {
     code: String,
+    status: CompatibilityStatus,
     feature: String,
     message: String,
+    affected_elements: Vec<CompatibilityAffectedElement>,
 }
 
+impl DocumentCompatibilityReport {
+    fn can_save(&self, allow_lossy: bool) -> bool {
+        self.status.can_save(allow_lossy)
+    }
+}
+
+impl CompatibilityIssue {
+    fn message_with_affected_elements(&self) -> String {
+        if self.affected_elements.is_empty() {
+            return self.message.clone();
+        }
+        let affected = self
+            .affected_elements
+            .iter()
+            .map(|element| format!("{} {}개", element.kind, element.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} (영향 요소: {})", self.message, affected)
+    }
+}
+
+#[cfg(test)]
 fn document_compatibility_report(
     document: &DocumentCore,
     format: &str,
+) -> DocumentCompatibilityReport {
+    document_compatibility_report_with_context(document, format, "rhwp-compat", 0)
+}
+
+fn document_compatibility_report_with_context(
+    document: &DocumentCore,
+    format: &str,
+    source_engine: &str,
+    known_loss_count: u32,
 ) -> DocumentCompatibilityReport {
     let sections = &document.document().sections;
     let mut structure = CompatibilityStructure {
@@ -202,20 +330,151 @@ fn document_compatibility_report(
             collect_compatibility_paragraph(paragraph, &mut structure, false);
         }
     }
-    let issues = if format == "hwp" {
-        hwp_textbox_compatibility_issue(&structure)
-            .into_iter()
-            .collect()
+    let structural_issue =
+        document_structural_compatibility_issue(&structure, format, source_engine);
+    let mut issues = structural_issue.into_iter().collect::<Vec<_>>();
+    let status = if let Some(issue) = issues.first() {
+        issue.status
+    } else if known_loss_count > 0 {
+        issues.push(CompatibilityIssue {
+            code: "serializer.known_loss".to_owned(),
+            status: CompatibilityStatus::Lossy,
+            feature: "document".to_owned(),
+            message: format!(
+                "{known_loss_count}개의 직렬화 손실 항목이 보고되었습니다. 명시적 사용자 승인이 필요합니다."
+            ),
+            affected_elements: vec![CompatibilityAffectedElement {
+                kind: "serializerLoss".to_owned(),
+                count: known_loss_count as usize,
+            }],
+        });
+        CompatibilityStatus::Lossy
     } else {
-        Vec::new()
+        CompatibilityStatus::Supported
     };
     DocumentCompatibilityReport {
-        schema_version: 1,
+        schema_version: 2,
         format: format.to_owned(),
-        supported: issues.is_empty(),
+        engine: source_engine.to_owned(),
+        validator: "rhwp-parser".to_owned(),
+        validation_scope: "internal-structure".to_owned(),
+        status,
+        supported: matches!(
+            status,
+            CompatibilityStatus::Supported | CompatibilityStatus::Lossy
+        ),
         structure,
         issues,
     }
+}
+
+fn affected(kind: &str, count: usize) -> Vec<CompatibilityAffectedElement> {
+    if count == 0 {
+        Vec::new()
+    } else {
+        vec![CompatibilityAffectedElement {
+            kind: kind.to_owned(),
+            count,
+        }]
+    }
+}
+
+fn compatibility_issue(
+    code: &str,
+    status: CompatibilityStatus,
+    feature: &str,
+    message: &str,
+    affected_elements: Vec<CompatibilityAffectedElement>,
+) -> CompatibilityIssue {
+    CompatibilityIssue {
+        code: code.to_owned(),
+        status,
+        feature: feature.to_owned(),
+        message: message.to_owned(),
+        affected_elements,
+    }
+}
+
+fn document_structural_compatibility_issue(
+    structure: &CompatibilityStructure,
+    format: &str,
+    source_engine: &str,
+) -> Option<CompatibilityIssue> {
+    if structure.unknown_control_count > 0 {
+        return Some(compatibility_issue(
+            "document.unknown_control",
+            CompatibilityStatus::Unknown,
+            "control",
+            "문서에 저장 호환성을 판정하지 못한 컨트롤이 있습니다. 내용을 보존할 수 있는지 확인할 수 없어 저장을 차단했습니다.",
+            affected("unknownControl", structure.unknown_control_count),
+        ));
+    }
+    if structure.unsupported_control_count > 0 {
+        return Some(compatibility_issue(
+            "document.unsupported_control",
+            CompatibilityStatus::Unsupported,
+            "control",
+            "현재 저장 경로에서 안전하게 기록할 수 없는 문서 컨트롤이 있습니다.",
+            affected("unsupportedControl", structure.unsupported_control_count),
+        ));
+    }
+
+    let text_box_count = structure.object_counts.text_box;
+    if structure.section_count != 1 {
+        return Some(compatibility_issue(
+            "document.multiple_sections",
+            CompatibilityStatus::Unknown,
+            "section",
+            "다중 구역 문서의 저장·재열기 보존을 검증하지 않아 저장을 차단했습니다.",
+            affected("section", structure.section_count),
+        ));
+    }
+
+    if format == "hwp" && text_box_count > 0 {
+        if source_engine == "rhwp-compat" {
+            return Some(compatibility_issue(
+                "hwp.textbox.rhwp_session",
+                CompatibilityStatus::Unsupported,
+                "textBox",
+                "RHWP 호환 세션의 글상자 구조는 제품 저장 경로에서 검증되지 않아 HWP 저장을 차단했습니다.",
+                affected("textBox", text_box_count),
+            ));
+        }
+        return hwp_textbox_compatibility_issue(structure);
+    }
+
+    if format == "hwpx" && text_box_count > 0 {
+        let unverified_text_box = text_box_count > 1
+            || structure
+                .text_box_paragraph_counts
+                .iter()
+                .any(|count| *count != 1)
+            || structure
+                .text_box_has_nested_content
+                .iter()
+                .any(|has_nested| *has_nested);
+        if unverified_text_box {
+            return Some(compatibility_issue(
+                "hwpx.textbox.unverified_structure",
+                CompatibilityStatus::Unknown,
+                "textBox",
+                "여러 글상자, 여러 문단 또는 중첩 구조가 있는 HWPX 글상자는 저장 왕복 범위를 검증하지 않아 저장을 차단했습니다.",
+                affected("textBox", text_box_count),
+            ));
+        }
+    }
+
+    if structure.has_range_tags {
+        return Some(compatibility_issue(
+            "document.range_tags.unverified",
+            CompatibilityStatus::Unknown,
+            "document",
+            "범위 태그가 포함된 문서의 저장·재열기 보존을 검증하지 않아 저장을 차단했습니다.",
+            affected("rangeTag", 1),
+        ));
+    }
+
+    None
 }
 
 fn hwp_textbox_compatibility_issue(
@@ -229,23 +488,26 @@ fn hwp_textbox_compatibility_issue(
         + structure.object_counts.rectangle
         + structure.object_counts.ellipse
         + text_box_count;
-    let (code, feature, message) = if text_box_count > 1 {
+    let (code, feature, message, elements) = if text_box_count > 1 {
         (
             "hwp.textbox.count",
             "textBox",
             "여러 글상자가 포함된 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            affected("textBox", text_box_count),
         )
     } else if structure.section_count != 1 {
         (
             "hwp.textbox.multiple_sections",
             "structure",
             "여러 구역이 포함된 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            affected("section", structure.section_count),
         )
     } else if structure.has_fields || structure.has_range_tags {
         (
             "hwp.textbox.fields_or_ranges",
             "textBox",
             "필드 또는 범위 태그가 포함된 글상자 HWP는 데이터 보존을 확인하지 못해 저장을 차단했습니다.",
+            affected("textBox", text_box_count),
         )
     } else if structure
         .text_box_shape_types
@@ -261,12 +523,14 @@ fn hwp_textbox_compatibility_issue(
             "hwp.textbox.unsupported_shape",
             "textBox",
             "단순한 사각형이 아닌 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            affected("textBox", text_box_count),
         )
     } else if structure.text_box_paragraph_counts.first().copied() != Some(1) {
         (
             "hwp.textbox.paragraph_count",
             "textBox",
             "여러 문단 또는 비어 있는 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            affected("textBox", text_box_count),
         )
     } else if structure
         .text_box_has_nested_content
@@ -278,6 +542,7 @@ fn hwp_textbox_compatibility_issue(
             "hwp.textbox.nested_content",
             "textBox",
             "표·개체·필드 등 내부 구조가 포함된 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            affected("textBox", text_box_count),
         )
     } else if structure.table_count > 0
         || total_object_count != 1
@@ -287,15 +552,25 @@ fn hwp_textbox_compatibility_issue(
             "hwp.textbox.mixed_content",
             "textBox",
             "표·그림·다른 개체와 글상자가 함께 있는 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다.",
+            {
+                let mut elements = affected("textBox", text_box_count);
+                elements.extend(affected("table", structure.table_count));
+                elements.extend(affected("picture", structure.object_counts.picture));
+                elements.extend(affected("rectangle", structure.object_counts.rectangle));
+                elements.extend(affected("ellipse", structure.object_counts.ellipse));
+                elements
+            },
         )
     } else {
         return None;
     };
-    Some(CompatibilityIssue {
-        code: code.to_owned(),
-        feature: feature.to_owned(),
-        message: message.to_owned(),
-    })
+    Some(compatibility_issue(
+        code,
+        CompatibilityStatus::Unsupported,
+        feature,
+        message,
+        elements,
+    ))
 }
 
 fn collect_compatibility_paragraph(
@@ -326,23 +601,22 @@ fn collect_compatibility_paragraph(
             }
             Control::Picture(_) => {
                 structure.object_counts.picture += 1;
-                structure.unsupported_control_count += 1;
             }
             Control::Field(_) => {
                 structure.has_fields = true;
-                structure.unsupported_control_count += 1;
             }
             Control::Header(header) => {
-                structure.unsupported_control_count += 1;
                 for inner in &header.paragraphs {
                     collect_compatibility_paragraph(inner, structure, inside_text_box);
                 }
             }
             Control::Footer(footer) => {
-                structure.unsupported_control_count += 1;
                 for inner in &footer.paragraphs {
                     collect_compatibility_paragraph(inner, structure, inside_text_box);
                 }
+            }
+            Control::AutoNumber(_) => {
+                structure.has_fields = true;
             }
             Control::Footnote(note) => {
                 structure.unsupported_control_count += 1;
@@ -362,8 +636,15 @@ fn collect_compatibility_paragraph(
                     collect_compatibility_paragraph(inner, structure, inside_text_box);
                 }
             }
-            _ => {
+            Control::Equation(_)
+            | Control::NewNumber(_)
+            | Control::PageNumberPos(_)
+            | Control::PageHide(_)
+            | Control::Bookmark(_) => {
                 structure.unsupported_control_count += 1;
+            }
+            _ => {
+                structure.unknown_control_count += 1;
             }
         }
     }
@@ -406,7 +687,6 @@ fn collect_compatibility_shape(
                 }
             } else {
                 structure.object_counts.rectangle += 1;
-                structure.unsupported_control_count += 1;
             }
         }
         ShapeObject::Ellipse(ellipse) => {
@@ -425,12 +705,10 @@ fn collect_compatibility_shape(
                 }
             } else {
                 structure.object_counts.ellipse += 1;
-                structure.unsupported_control_count += 1;
             }
         }
         ShapeObject::Picture(_) => {
             structure.object_counts.picture += 1;
-            structure.unsupported_control_count += 1;
         }
         ShapeObject::Group(group) => {
             structure.unsupported_control_count += 1;
@@ -438,7 +716,7 @@ fn collect_compatibility_shape(
                 collect_compatibility_shape(child, structure, inside_text_box);
             }
         }
-        _ => structure.unsupported_control_count += 1,
+        _ => structure.unknown_control_count += 1,
     }
 }
 
@@ -574,9 +852,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompatibilityStructure, commit_document_save_blocking, document_compatibility_report,
-        export_pdf_blocking, hwp_textbox_compatibility_issue,
-        inspect_document_compatibility_file_blocking, pdf_page_count, write_atomically,
+        CompatibilityAffectedElement, CompatibilityStatus, CompatibilityStructure,
+        commit_document_save_blocking, commit_document_save_with_policy_blocking,
+        document_compatibility_report, document_compatibility_report_with_context,
+        document_structural_compatibility_issue, export_pdf_blocking,
+        hwp_textbox_compatibility_issue, inspect_document_compatibility_file_with_context_blocking,
+        pdf_page_count, write_atomically,
     };
     use rhwp::DocumentCore;
 
@@ -634,7 +915,7 @@ mod tests {
         let report = document_compatibility_report(&staged, "hwp");
         assert_eq!(report.structure.object_counts.text_box, 1, "{report:?}");
         assert_eq!(report.structure.object_counts.rectangle, 1, "{report:?}");
-        assert_eq!(report.issues[0].code, "hwp.textbox.unsupported_shape");
+        assert_eq!(report.issues[0].code, "hwp.textbox.rhwp_session");
         std::fs::write(&temporary, &staged_bytes).expect("write staged HWP");
         std::fs::write(&destination, b"original HWP").expect("seed existing HWP");
 
@@ -645,7 +926,8 @@ mod tests {
         )
         .expect_err("unverified text-box HWP must stay blocked");
 
-        assert!(error.contains("단순한 사각형이 아닌 글상자 HWP"));
+        assert!(error.contains("RHWP 호환 세션의 글상자"));
+        assert!(error.contains("textBox 1개"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"original HWP");
         assert!(DocumentCore::from_bytes(&staged_bytes).is_ok());
         assert!(temporary.exists());
@@ -674,6 +956,246 @@ mod tests {
     }
 
     #[test]
+    fn reports_unknown_sections_and_controls_with_affected_elements() {
+        let unknown_control_structure = CompatibilityStructure {
+            section_count: 1,
+            unknown_control_count: 2,
+            ..CompatibilityStructure::default()
+        };
+        let unknown = document_structural_compatibility_issue(
+            &unknown_control_structure,
+            "hwpx",
+            "hanul-text",
+        )
+        .expect("unknown controls must not be treated as supported");
+        assert_eq!(unknown.status, CompatibilityStatus::Unknown);
+        assert_eq!(unknown.code, "document.unknown_control");
+        assert_eq!(
+            unknown.affected_elements,
+            [CompatibilityAffectedElement {
+                kind: "unknownControl".to_owned(),
+                count: 2,
+            }]
+        );
+
+        let multiple_sections = CompatibilityStructure {
+            section_count: 2,
+            ..CompatibilityStructure::default()
+        };
+        let report =
+            document_structural_compatibility_issue(&multiple_sections, "hwp", "hanul-text")
+                .expect("multiple sections remain unverified");
+        assert_eq!(report.status, CompatibilityStatus::Unknown);
+        assert_eq!(report.code, "document.multiple_sections");
+        assert_eq!(
+            report.affected_elements,
+            [CompatibilityAffectedElement {
+                kind: "section".to_owned(),
+                count: 2,
+            }]
+        );
+
+        let range_tag = CompatibilityStructure {
+            section_count: 1,
+            has_range_tags: true,
+            ..CompatibilityStructure::default()
+        };
+        let range_tag_issue =
+            document_structural_compatibility_issue(&range_tag, "hwpx", "hanul-text")
+                .expect("unverified range tags must be blocked");
+        assert_eq!(range_tag_issue.status, CompatibilityStatus::Unknown);
+        assert_eq!(range_tag_issue.code, "document.range_tags.unverified");
+        assert_eq!(
+            range_tag_issue.affected_elements,
+            [CompatibilityAffectedElement {
+                kind: "rangeTag".to_owned(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn structural_policy_matrix_keeps_formats_and_engines_distinct() {
+        let plain = CompatibilityStructure {
+            section_count: 1,
+            paragraph_count: 2,
+            ..CompatibilityStructure::default()
+        };
+        let table = CompatibilityStructure {
+            section_count: 1,
+            table_count: 1,
+            ..CompatibilityStructure::default()
+        };
+        let picture = CompatibilityStructure {
+            section_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                picture: 1,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            ..CompatibilityStructure::default()
+        };
+        let rectangle = CompatibilityStructure {
+            section_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                rectangle: 1,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            ..CompatibilityStructure::default()
+        };
+        let ellipse = CompatibilityStructure {
+            section_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                ellipse: 1,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            ..CompatibilityStructure::default()
+        };
+        let textbox = CompatibilityStructure {
+            section_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                text_box: 1,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            text_box_paragraph_counts: vec![1],
+            text_box_shape_types: vec!["rectangle".to_owned()],
+            text_box_unsupported_properties: vec![false],
+            text_box_has_nested_content: vec![false],
+            ..CompatibilityStructure::default()
+        };
+        let multi_paragraph_textbox = CompatibilityStructure {
+            text_box_paragraph_counts: vec![2],
+            ..textbox.clone()
+        };
+        let mixed = CompatibilityStructure {
+            table_count: 1,
+            object_counts: super::CompatibilityObjectCounts {
+                picture: 1,
+                text_box: 1,
+                ..super::CompatibilityObjectCounts::default()
+            },
+            ..textbox.clone()
+        };
+        let multiple_sections = CompatibilityStructure {
+            section_count: 2,
+            ..CompatibilityStructure::default()
+        };
+        let with_fields = CompatibilityStructure {
+            section_count: 1,
+            has_fields: true,
+            ..CompatibilityStructure::default()
+        };
+
+        let profiles = [
+            ("plain text and formatting", plain, "SUPPORTED", "SUPPORTED"),
+            (
+                "table including merged-cell profile",
+                table,
+                "SUPPORTED",
+                "SUPPORTED",
+            ),
+            ("picture", picture, "SUPPORTED", "SUPPORTED"),
+            ("rectangle", rectangle, "SUPPORTED", "SUPPORTED"),
+            ("ellipse", ellipse, "SUPPORTED", "SUPPORTED"),
+            (
+                "single paragraph textbox",
+                textbox.clone(),
+                "SUPPORTED",
+                "SUPPORTED",
+            ),
+            (
+                "multiple paragraph textbox",
+                multi_paragraph_textbox,
+                "UNSUPPORTED",
+                "UNKNOWN",
+            ),
+            (
+                "table, picture and textbox mixture",
+                mixed,
+                "UNSUPPORTED",
+                "SUPPORTED",
+            ),
+            (
+                "header/footer field profile",
+                with_fields,
+                "SUPPORTED",
+                "SUPPORTED",
+            ),
+            ("multiple sections", multiple_sections, "UNKNOWN", "UNKNOWN"),
+        ];
+
+        for (label, structure, expected_hwp, expected_hwpx) in profiles {
+            for (format, expected) in [("hwp", expected_hwp), ("hwpx", expected_hwpx)] {
+                let issue =
+                    document_structural_compatibility_issue(&structure, format, "hanul-text");
+                let actual = issue.map_or("SUPPORTED", |issue| match issue.status {
+                    CompatibilityStatus::Supported => "SUPPORTED",
+                    CompatibilityStatus::Unsupported => "UNSUPPORTED",
+                    CompatibilityStatus::Lossy => "LOSSY",
+                    CompatibilityStatus::Unknown => "UNKNOWN",
+                });
+                assert_eq!(actual, expected, "{label} / {format}");
+            }
+        }
+
+        assert_eq!(
+            document_structural_compatibility_issue(&textbox, "hwp", "rhwp-compat")
+                .expect("RHWP textbox policy remains stricter")
+                .code,
+            "hwp.textbox.rhwp_session"
+        );
+    }
+
+    #[test]
+    fn known_serializer_loss_requires_confirmation_at_the_atomic_save_boundary() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-lossy-save-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-lossy-save-{}-{sequence}.hwp",
+            std::process::id()
+        ));
+        let mut source = DocumentCore::new_empty();
+        source
+            .create_blank_document_native()
+            .expect("create blank HWP");
+        let bytes = source.export_hwp_native().expect("serialize HWP");
+        let parsed = DocumentCore::from_bytes(&bytes).expect("parse staged HWP");
+        let report = document_compatibility_report_with_context(&parsed, "hwp", "hanul-text", 1);
+        assert_eq!(report.status, CompatibilityStatus::Lossy);
+        assert!(report.can_save(false) == false);
+        assert!(report.can_save(true));
+        assert_eq!(report.issues[0].code, "serializer.known_loss");
+
+        std::fs::write(&temporary, &bytes).expect("write staged HWP");
+        std::fs::write(&destination, b"original contents").expect("seed original");
+        let error = commit_document_save_with_policy_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+            "hanul-text",
+            1,
+            false,
+        )
+        .expect_err("lossy save must require confirmation");
+        assert!(error.contains("직렬화 손실"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original contents");
+
+        commit_document_save_with_policy_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+            "hanul-text",
+            1,
+            true,
+        )
+        .expect("explicit confirmation allows the existing known-loss path");
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
     fn saves_the_hanword_verified_single_textbox_golden_through_atomic_product_commit() {
         let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
         let temporary = std::env::temp_dir().join(format!(
@@ -688,21 +1210,30 @@ mod tests {
             include_bytes!("../../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp");
         assert!(DocumentCore::from_bytes(bytes).is_ok());
         std::fs::write(&temporary, bytes).expect("write staged golden HWP");
-        let report =
-            inspect_document_compatibility_file_blocking(temporary.to_str().unwrap(), "hwp")
-                .expect("inspect the staged Hanword-verified textbox golden");
+        let report = inspect_document_compatibility_file_with_context_blocking(
+            temporary.to_str().unwrap(),
+            "hwp",
+            "hanul-text",
+            0,
+        )
+        .expect("inspect the staged Hanword-verified textbox golden");
         assert!(report.supported, "{:?}", report.issues);
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.status, super::CompatibilityStatus::Supported);
+        assert_eq!(report.engine, "hanul-text");
         assert_eq!(report.structure.section_count, 1);
         assert_eq!(report.structure.object_counts.text_box, 1);
         assert_eq!(report.structure.text_box_shape_types, ["rectangle"]);
         assert_eq!(report.structure.text_box_paragraph_counts, [1]);
         assert_eq!(report.structure.text_box_unsupported_properties, [false]);
         assert_eq!(report.structure.text_box_has_nested_content, [false]);
-        commit_document_save_blocking(
+        commit_document_save_with_policy_blocking(
             temporary.to_str().unwrap(),
             destination.to_str().unwrap(),
             "hwp",
+            "hanul-text",
+            0,
+            false,
         )
         .expect("the Hanword-verified simple textbox structure is supported");
 
@@ -734,10 +1265,13 @@ mod tests {
         let input_bytes = std::fs::read(input).expect("read frontend product export");
         std::fs::write(&temporary, &input_bytes).expect("stage frontend product export");
 
-        commit_document_save_blocking(
+        commit_document_save_with_policy_blocking(
             temporary.to_str().unwrap(),
             destination.to_str().unwrap(),
             "hwp",
+            "hanul-text",
+            0,
+            false,
         )
         .expect("run the normal format, parse, textbox-policy and atomic-rename pipeline");
 
