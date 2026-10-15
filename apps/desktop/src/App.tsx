@@ -16,7 +16,7 @@ import DOMPurify from "dompurify";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
+import { readFile, remove, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ImeInputGate } from "./ime-input";
 import { previewObjectDrag } from "./object-drag";
@@ -1091,7 +1091,21 @@ function App() {
         let savedPath = "";
         if (isTauri()) {
           if (!destinationPath) throw new Error("저장 경로를 선택하지 않았습니다.");
-          await writeFile(destinationPath, result.bytes);
+          const temporaryPath = `${destinationPath}.hanul-${crypto.randomUUID()}.tmp`;
+          try {
+            await writeFile(temporaryPath, result.bytes);
+            await invoke("commit_document_save", {
+              temporaryPath,
+              outputPath: destinationPath,
+              outputFormat: result.report.outputFormat,
+            });
+          } finally {
+            try {
+              await remove(temporaryPath);
+            } catch {
+              // The staged file may already have been atomically moved into place.
+            }
+          }
           savedPath = destinationPath;
         } else {
           const blob = new Blob([new Uint8Array(result.bytes)], { type: "application/octet-stream" });
@@ -1151,6 +1165,9 @@ function App() {
         destinationPath = null;
       }
 
+      if (format === "hwp" && documentHasTextBox(session)) {
+        throw new Error("글상자 포함 HWP는 한글 2024 호환성을 확인 중이라 저장을 차단했습니다. HWPX로 저장하세요.");
+      }
       const result = session.exportWithReport(format);
       if (result.report.count > 0) {
         setSaveCandidate(result);
@@ -3250,6 +3267,17 @@ function App() {
       )}
     </main>
   );
+}
+
+function documentHasTextBox(session: DocumentSession): boolean {
+  const sectionIndexes = new Set<number>();
+  for (let pageIndex = 0; pageIndex < session.pageCount; pageIndex += 1) {
+    sectionIndexes.add(session.pageInfo(pageIndex).sectionIndex);
+  }
+  for (const sectionIndex of sectionIndexes) {
+    if (session.listObjects(sectionIndex).some((object) => object.kind === "textBox")) return true;
+  }
+  return false;
 }
 
 function traceImeEvent(type: string, event: Event, valueLength: number) {

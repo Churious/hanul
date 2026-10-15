@@ -2231,8 +2231,30 @@ export function serializePlainTextWithRhwp(
   format: "hwp" | "hwpx",
   pageDefinition: PageDefinition,
 ): ExportResult {
-  if (format === "hwp" && paragraphs.some((paragraph) => paragraph.objects?.some((object) => object.kind === "textBox"))) {
-    throw new Error("글상자가 포함된 HWP 파일은 한글 2024에서 손상 오류가 발생해 저장을 중단했습니다. 글상자를 보존하려면 HWPX로 저장하세요.");
+  return serializePlainTextWithRhwpInternal(paragraphs, format, pageDefinition, false);
+}
+
+/**
+ * Builds an HWP textbox compatibility candidate for structural regression tests.
+ * The desktop save path intentionally continues to reject this output until it has
+ * been opened successfully by Hanword 2024.
+ */
+export function serializePlainTextHwpTextBoxCandidateWithRhwp(
+  paragraphs: readonly PlainTextParagraph[],
+  pageDefinition: PageDefinition,
+): ExportResult {
+  return serializePlainTextWithRhwpInternal(paragraphs, "hwp", pageDefinition, true);
+}
+
+function serializePlainTextWithRhwpInternal(
+  paragraphs: readonly PlainTextParagraph[],
+  format: "hwp" | "hwpx",
+  pageDefinition: PageDefinition,
+  allowTextboxHwpCandidate: boolean,
+): ExportResult {
+  const hasTextBox = paragraphs.some((paragraph) => paragraph.objects?.some((object) => object.kind === "textBox"));
+  if (format === "hwp" && hasTextBox && !allowTextboxHwpCandidate) {
+    throw new Error("글상자가 포함된 HWP는 한글 2024 호환성을 확인 중이라 저장을 차단했습니다. 글상자를 보존하려면 HWPX로 저장하세요.");
   }
   if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
   const document = HwpDocument.createEmpty();
@@ -2368,7 +2390,11 @@ export function serializePlainTextWithRhwp(
       }
     }
     document.endBatch();
-    const exported = format === "hwp" ? document.exportHwpWithReport() : document.exportHwpxWithReport();
+    const exported = format === "hwp" && hasTextBox
+      ? exportHwpTextBoxViaHwpx(document)
+      : format === "hwp"
+        ? document.exportHwpWithReport()
+        : document.exportHwpxWithReport();
     try {
       const report = parseJson<ContentLossReport>(exported.contentLoss(), "내용 손실 보고서");
       if (
@@ -2388,6 +2414,36 @@ export function serializePlainTextWithRhwp(
     }
   } finally {
     document.free();
+  }
+}
+
+/**
+ * Freshly-created text boxes lack the HWP5 SHAPE_COMPONENT storage marker that
+ * the HWPX importer materializes. Round-trip through HWPX so RHWP's source-format
+ * adapter writes the HWP5 textbox bit and the required text-box list envelope.
+ */
+function exportHwpTextBoxViaHwpx(document: HwpDocument): DocumentExport {
+  const intermediate = document.exportHwpxWithReport();
+  let intermediateBytes: Uint8Array;
+  try {
+    const report = parseJson<ContentLossReport>(intermediate.contentLoss(), "HWP 글상자 변환 중간 검사");
+    if (
+      !Number.isInteger(report.schemaVersion) || report.schemaVersion < 1 ||
+      report.outputFormat !== "hwpx" || !Number.isInteger(report.count) || report.count !== 0 ||
+      !Array.isArray(report.losses) || report.losses.length !== 0
+    ) {
+      throw new Error("HWPX 중간 변환에서 내용 손실이 감지되어 HWP 저장을 중단했습니다.");
+    }
+    intermediateBytes = intermediate.takeBytes();
+  } finally {
+    intermediate.free();
+  }
+
+  const hwpxDocument = new HwpDocument(intermediateBytes);
+  try {
+    return hwpxDocument.exportHwpWithReport();
+  } finally {
+    hwpxDocument.free();
   }
 }
 

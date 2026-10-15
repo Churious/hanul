@@ -14,6 +14,145 @@ async fn export_pdf(document_bytes: Vec<u8>, output_path: String) -> Result<u32,
         .map_err(|error| format!("PDF 내보내기 작업을 완료하지 못했습니다. ({error})"))?
 }
 
+#[tauri::command]
+async fn commit_document_save(
+    temporary_path: String,
+    output_path: String,
+    output_format: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_document_save_blocking(&temporary_path, &output_path, &output_format)
+    })
+    .await
+    .map_err(|error| format!("문서 저장 검증을 완료하지 못했습니다. ({error})"))?
+}
+
+fn commit_document_save_blocking(
+    temporary_path: &str,
+    output_path: &str,
+    output_format: &str,
+) -> Result<(), String> {
+    let temporary = PathBuf::from(temporary_path);
+    let destination = PathBuf::from(output_path);
+    let format = output_format.to_ascii_lowercase();
+    if !matches!(format.as_str(), "hwp" | "hwpx")
+        || !destination
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(&format))
+    {
+        return Err("HWP 또는 HWPX 확장자와 저장 형식이 일치하지 않습니다.".to_owned());
+    }
+    if temporary == destination {
+        return Err("검증용 임시 파일과 원본 저장 경로가 같습니다.".to_owned());
+    }
+    let temporary_parent = temporary
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let destination_parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary_parent = fs::canonicalize(temporary_parent)
+        .map_err(|error| format!("임시 저장 폴더에 접근하지 못했습니다. ({error})"))?;
+    let destination_parent = fs::canonicalize(destination_parent)
+        .map_err(|error| format!("저장 폴더에 접근하지 못했습니다. ({error})"))?;
+    if temporary_parent != destination_parent {
+        return Err(
+            "원본 보호를 위해 임시 파일과 저장 파일은 같은 폴더에 있어야 합니다.".to_owned(),
+        );
+    }
+
+    let bytes =
+        fs::read(&temporary).map_err(|error| format!("임시 문서를 읽지 못했습니다. ({error})"))?;
+    let expected_signature: &[u8] = if format == "hwp" {
+        &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+    } else {
+        b"PK\x03\x04"
+    };
+    if !bytes.starts_with(expected_signature) {
+        return Err(format!(
+            "임시 파일의 헤더가 {format} 형식과 일치하지 않습니다."
+        ));
+    }
+    let parsed = DocumentCore::from_bytes(&bytes)
+        .map_err(|error| format!("임시 문서를 다시 열어 구조를 확인하지 못했습니다. ({error})"))?;
+    if parsed.page_count() == 0 {
+        return Err("임시 문서에 페이지가 없어 저장을 중단했습니다.".to_owned());
+    }
+
+    if format == "hwp" {
+        if count_hwp_textboxes(&parsed.document().sections) > 0 {
+            return Err(
+                "글상자 포함 HWP는 한글 2024 호환 검증이 끝날 때까지 저장을 차단했습니다. 문서 구조를 보존하려면 HWPX로 저장하세요.".to_owned(),
+            );
+        }
+    }
+
+    fs::rename(&temporary, &destination)
+        .map_err(|error| format!("검증한 문서로 원본을 교체하지 못했습니다. ({error})"))
+}
+
+fn count_hwp_textboxes(sections: &[rhwp::model::document::Section]) -> usize {
+    use rhwp::model::{control::Control, paragraph::Paragraph, shape::ShapeObject};
+
+    fn count_shape(shape: &ShapeObject) -> usize {
+        let mut count = shape
+            .drawing()
+            .and_then(|drawing| drawing.text_box.as_ref())
+            .map_or(0, |text_box| {
+                text_box
+                    .paragraphs
+                    .iter()
+                    .map(count_paragraph)
+                    .sum::<usize>()
+                    + 1
+            });
+        if let ShapeObject::Group(group) = shape {
+            count += group.children.iter().map(count_shape).sum::<usize>();
+            if let Some(caption) = &group.caption {
+                count += caption
+                    .paragraphs
+                    .iter()
+                    .map(count_paragraph)
+                    .sum::<usize>();
+            }
+        }
+        count
+    }
+
+    fn count_paragraph(paragraph: &Paragraph) -> usize {
+        paragraph
+            .controls
+            .iter()
+            .map(|control| match control {
+                Control::Shape(shape) => count_shape(shape),
+                Control::Table(table) => table
+                    .cells
+                    .iter()
+                    .flat_map(|cell| &cell.paragraphs)
+                    .map(count_paragraph)
+                    .sum(),
+                Control::Header(header) => header.paragraphs.iter().map(count_paragraph).sum(),
+                Control::Footer(footer) => footer.paragraphs.iter().map(count_paragraph).sum(),
+                Control::Footnote(note) => note.paragraphs.iter().map(count_paragraph).sum(),
+                Control::Endnote(note) => note.paragraphs.iter().map(count_paragraph).sum(),
+                Control::HiddenComment(comment) => {
+                    comment.paragraphs.iter().map(count_paragraph).sum()
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    sections
+        .iter()
+        .flat_map(|section| &section.paragraphs)
+        .map(count_paragraph)
+        .sum()
+}
+
 fn export_pdf_blocking(document_bytes: &[u8], output_path: &str) -> Result<u32, String> {
     let destination = PathBuf::from(output_path);
     if !destination
@@ -115,7 +254,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![export_pdf])
+        .invoke_handler(tauri::generate_handler![export_pdf, commit_document_save])
         .setup(|_app| {
             #[cfg(target_os = "linux")]
             {
@@ -141,7 +280,157 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_pdf_blocking, pdf_page_count, write_atomically};
+    use super::{
+        commit_document_save_blocking, export_pdf_blocking, pdf_page_count, write_atomically,
+    };
+    use rhwp::DocumentCore;
+
+    #[test]
+    fn blocks_unverified_hwp_textbox_save_and_preserves_original() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-textbox-save-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-textbox-save-{}-{sequence}.hwp",
+            std::process::id()
+        ));
+        let mut source = DocumentCore::new_empty();
+        source
+            .create_blank_document_native()
+            .expect("create blank HWP");
+        source
+            .create_shape_control_native(
+                0,
+                0,
+                0,
+                7200,
+                3600,
+                0,
+                0,
+                false,
+                "InFrontOfText",
+                "textbox",
+                false,
+                false,
+                &[],
+            )
+            .expect("create textbox");
+        let staged_bytes = source.export_hwp_native().expect("serialize staged HWP");
+        std::fs::write(&temporary, &staged_bytes).expect("write staged HWP");
+        std::fs::write(&destination, b"original HWP").expect("seed existing HWP");
+
+        let error = commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+        )
+        .expect_err("unverified text-box HWP must stay blocked");
+
+        assert!(error.contains("글상자 포함 HWP"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original HWP");
+        assert!(DocumentCore::from_bytes(&staged_bytes).is_ok());
+        assert!(temporary.exists());
+        std::fs::remove_file(temporary).unwrap();
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn validates_hwp_before_atomically_replacing_existing_document() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-document-save-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-document-save-{}-{sequence}.hwp",
+            std::process::id()
+        ));
+        let mut source = DocumentCore::new_empty();
+        source
+            .create_blank_document_native()
+            .expect("create blank HWP");
+        let bytes = source.export_hwp_native().expect("serialize blank HWP");
+        std::fs::write(&temporary, &bytes).expect("write staged HWP");
+        std::fs::write(&destination, b"old HWP").expect("seed original HWP");
+
+        commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+        )
+        .expect("validate and replace HWP");
+
+        let saved = std::fs::read(&destination).expect("read replaced HWP");
+        assert_eq!(saved, bytes);
+        assert!(DocumentCore::from_bytes(&saved).is_ok());
+        assert!(!temporary.exists());
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn validates_hwpx_before_atomically_replacing_existing_document() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-document-save-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-document-save-{}-{sequence}.hwpx",
+            std::process::id()
+        ));
+        let mut source = DocumentCore::new_empty();
+        source
+            .create_blank_document_native()
+            .expect("create blank document");
+        let bytes = source.export_hwpx_native().expect("serialize blank HWPX");
+        std::fs::write(&temporary, &bytes).expect("write staged HWPX");
+        std::fs::write(&destination, b"old HWPX").expect("seed original HWPX");
+
+        commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwpx",
+        )
+        .expect("validate and replace HWPX");
+
+        let saved = std::fs::read(&destination).expect("read replaced HWPX");
+        assert_eq!(saved, bytes);
+        assert!(DocumentCore::from_bytes(&saved).is_ok());
+        assert!(!temporary.exists());
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn failed_document_validation_leaves_original_untouched() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-document-invalid-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-document-invalid-{}-{sequence}.hwp",
+            std::process::id()
+        ));
+        std::fs::write(&temporary, b"not an HWP").expect("write invalid staged file");
+        std::fs::write(&destination, b"original HWP contents").expect("seed original HWP");
+
+        let error = commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+        )
+        .expect_err("invalid HWP must not replace original");
+        assert!(error.contains("헤더가 hwp 형식과 일치하지 않습니다"));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"original HWP contents"
+        );
+        assert!(temporary.exists());
+        std::fs::remove_file(temporary).unwrap();
+        std::fs::remove_file(destination).unwrap();
+    }
 
     #[test]
     fn counts_page_objects_without_counting_page_tree() {

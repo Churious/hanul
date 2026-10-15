@@ -5,10 +5,12 @@ import { readFile } from "node:fs/promises";
 import {
   createNewHwpDocumentSession,
   hanulDocumentEngine,
+  serializePlainTextHwpTextBoxCandidateWithRhwp,
   wrapHwpDocument,
   type TableCommand,
 } from "./hwp-engine";
 import type { DocumentObject, DocumentSession, TextPosition } from "./document-engine";
+import { HanulTextDocumentSession } from "./text-document-engine";
 
 beforeAll(async () => {
   const wasm = new Uint8Array(
@@ -1060,7 +1062,7 @@ describe("RHWP document session", () => {
       session.redo();
       expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.textWrap).toBe("BehindText");
 
-      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP 파일.*HWPX로 저장/u);
+      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP는 한글 2024 호환성을 확인 중.*HWPX로 저장/u);
       for (const format of ["hwpx"] as const) {
         const saved = session.exportWithReport(format);
         expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
@@ -1090,6 +1092,33 @@ describe("RHWP document session", () => {
       }
     } finally {
       reopened.forEach((item) => item.dispose());
+      session.dispose();
+    }
+  });
+
+  it("materializes the HWP5 text-box storage marker through the HWPX adapter while keeping user HWP export blocked", async () => {
+    const session = await hanulDocumentEngine.createBlank();
+    let reopened: DocumentSession | null = null;
+    try {
+      const start = session.hitTest(0, 114, 134);
+      session.insertShape(start, "textBox", 50, 24);
+      const textBox = session.listObjects(0).find((object) => object.kind === "textBox");
+      expect(textBox).toBeDefined();
+      const caret = session.hitTest(0, textBox!.bounds.x + 4, textBox!.bounds.y + 4);
+      session.insertText(caret, "HWP5 글상자 구조 후보");
+
+      const textSession = session as HanulTextDocumentSession;
+      const candidate = serializePlainTextHwpTextBoxCandidateWithRhwp(
+        textSession.paragraphs(),
+        session.pageDefinition(0),
+      );
+      expect(candidate.report).toMatchObject({ outputFormat: "hwp", count: 0 });
+      reopened = wrapHwpDocument(new HwpDocument(candidate.bytes));
+      expect(reopened.searchText("HWP5 글상자 구조 후보")).toHaveLength(1);
+      expect(reopened.listObjects(0).map((object) => object.kind)).toContain("textBox");
+      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP는 한글 2024 호환성을 확인 중/u);
+    } finally {
+      reopened?.dispose();
       session.dispose();
     }
   });
