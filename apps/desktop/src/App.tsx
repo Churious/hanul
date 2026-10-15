@@ -22,6 +22,7 @@ import { ImeInputGate } from "./ime-input";
 import { previewObjectDrag } from "./object-drag";
 import { LatestFrame } from "./pointer-frame";
 import { hanulDocumentEngine } from "./hwp-engine";
+import { commitLatestDocumentLoad, LatestDocumentLoad, resolveUnsavedChoice, type PendingDocumentAction } from "./document-lifecycle";
 import type {
   DocumentSession,
   DocumentInfo,
@@ -153,11 +154,6 @@ interface PendingDocument {
 }
 
 type DialogState = "unsaved" | "loss" | "pdf-loss" | null;
-
-type PendingFileAction =
-  | { kind: "open"; pending: PendingDocument }
-  | { kind: "close" }
-  | { kind: "exit" };
 
 type DocumentInfoDialogState = {
   fileName: string;
@@ -636,6 +632,7 @@ function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const reader = useRef<VirtuosoHandle>(null);
   const activeSession = useRef<DocumentSession | null>(null);
+  const documentLoads = useRef(new LatestDocumentLoad());
   const allowWindowClose = useRef(false);
   const originalPrintTitle = useRef<string | null>(null);
   const imeInputGate = useRef(new ImeInputGate());
@@ -709,7 +706,7 @@ function App() {
   const [searchMatches, setSearchMatches] = useState<SearchMatch[]>([]);
   const [searchMatchIndex, setSearchMatchIndex] = useState(-1);
   const [renderVersion, setRenderVersion] = useState(0);
-  const [pendingAction, setPendingAction] = useState<PendingFileAction | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingDocumentAction | null>(null);
   const [dialogState, setDialogState] = useState<DialogState>(null);
   const [saveCandidate, setSaveCandidate] = useState<SaveExportCandidate | null>(null);
   const [saveDestination, setSaveDestination] = useState<string | null>(null);
@@ -786,6 +783,7 @@ function App() {
 
   useEffect(
     () => () => {
+      documentLoads.current.invalidate();
       activeSession.current?.dispose();
     },
     [],
@@ -895,13 +893,14 @@ function App() {
       }
     }
 
+    const loadRevision = documentLoads.current.begin();
     const openStartedAt = performance.now();
     setIsLoading(true);
     setLoadingStatus(pending.createNew ? "새 문서를 구성하는 중…" : "파일을 읽는 중…");
     setMessage("");
+    let nextSession: DocumentSession | null = null;
     try {
       let bytes = new Uint8Array();
-      let nextSession: DocumentSession;
       if (pending.createNew) {
         await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
         setLoadingStatus("새 문서의 쪽을 구성하는 중…");
@@ -928,22 +927,30 @@ function App() {
         // the RHWP compatibility session without UI-specific engine branching.
         nextSession = await hanulDocumentEngine.open(bytes);
       }
+      if (!nextSession) throw new Error("문서 엔진이 편집 세션을 만들지 않았습니다.");
+      const loadedSession = nextSession;
+      if (!commitLatestDocumentLoad(documentLoads.current, loadRevision, loadedSession, (candidate) => {
+        activeSession.current?.dispose();
+        activeSession.current = candidate;
+      })) {
+        nextSession = null;
+        return;
+      }
+      nextSession = null;
       let initialCaret: TextPosition | null = null;
       const hitTestStartedAt = performance.now();
       try {
-        initialCaret = nextSession.hitTest(0, 113, 132);
+        initialCaret = loadedSession.hitTest(0, 113, 132);
       } catch {
         // Keep opening readable when the first body position is not editable.
       }
       reportAppPerformance("initial-hit-test", {
         durationMs: Number((performance.now() - hitTestStartedAt).toFixed(1)),
       });
-      activeSession.current?.dispose();
-      activeSession.current = nextSession;
-      setSession(nextSession);
+      setSession(loadedSession);
       setFileName(pending.name);
       setFilePath(pending.path ?? "");
-      setFileFormat(nextSession.sourceFormat === "hwpx" ? "hwpx" : "hwp");
+      setFileFormat(loadedSession.sourceFormat === "hwpx" ? "hwpx" : "hwp");
       setDocumentInfoDialog(null);
       setPrintPreviewOpen(false);
       setPrintRequest(null);
@@ -962,24 +969,31 @@ function App() {
       reader.current?.scrollToIndex({ index: 0, align: "start" });
       if (initialCaret) {
         window.requestAnimationFrame(() => {
-          if (activeSession.current === nextSession) editInput.current?.focus();
+          if (activeSession.current === loadedSession) editInput.current?.focus();
         });
       }
       reportAppPerformance("document-session-ready", {
         totalMs: Number((performance.now() - openStartedAt).toFixed(1)),
         bytes: bytes.byteLength,
-        pages: nextSession.pageCount,
+        pages: loadedSession.pageCount,
       });
     } catch (cause) {
-      setMessage(
-        cause instanceof Error
-          ? `문서를 열지 못했습니다. 파일 형식이나 손상 여부를 확인해 주세요. (${cause.message})`
-          : "문서를 열지 못했습니다. 파일 형식이나 손상 여부를 확인해 주세요.",
-      );
+      if (documentLoads.current.isCurrent(loadRevision)) {
+        nextSession?.dispose();
+        setMessage(
+          cause instanceof Error
+            ? `문서를 열지 못했습니다. 파일 형식이나 손상 여부를 확인해 주세요. (${cause.message})`
+            : "문서를 열지 못했습니다. 파일 형식이나 손상 여부를 확인해 주세요.",
+        );
+      } else {
+        nextSession?.dispose();
+      }
     } finally {
-      setIsLoading(false);
-      setLoadingStatus("");
-      if (fileInput.current) fileInput.current.value = "";
+      if (documentLoads.current.isCurrent(loadRevision)) {
+        setIsLoading(false);
+        setLoadingStatus("");
+        if (fileInput.current) fileInput.current.value = "";
+      }
     }
   }, [rememberRecent]);
 
@@ -1028,6 +1042,7 @@ function App() {
   }, [openDocument]);
 
   const clearDocument = useCallback(() => {
+    documentLoads.current.invalidate();
     activeSession.current?.dispose();
     activeSession.current = null;
     setSession(null);
@@ -1039,6 +1054,8 @@ function App() {
     setPrintPreviewOpen(false);
     setPrintRequest(null);
     setDirty(false);
+    setIsLoading(false);
+    setLoadingStatus("");
     setCaret(null);
     setSelection(null);
     setPendingCharacterFormat({});
@@ -1275,13 +1292,27 @@ function App() {
     await continuePendingAction();
   }, [continuePendingAction]);
 
-  const cancelDialog = () => {
+  const cancelDialog = useCallback(() => {
     setDialogState(null);
     setPendingAction(null);
     setSaveCandidate(null);
     setSaveDestination(null);
     setPdfCandidate(null);
-  };
+  }, []);
+
+  const resolvePendingFileAction = useCallback((choice: "save" | "discard" | "cancel") => {
+    const resolution = resolveUnsavedChoice(pendingAction, choice);
+    if (resolution.kind === "cancel") {
+      cancelDialog();
+    } else if (resolution.kind === "continue-without-saving") {
+      void discardPendingAction();
+    } else {
+      // `saveCurrent` resumes the exact pending action only after the save
+      // pipeline has completed successfully. A cancelled/failed save keeps
+      // the current document and confirmation open.
+      void saveCurrent();
+    }
+  }, [cancelDialog, discardPendingAction, pendingAction, saveCurrent]);
 
   const openRecentDocument = useCallback(async (path: string) => {
     try {
@@ -3242,9 +3273,9 @@ function App() {
                       : pendingAction?.kind === "close" ? "문서를 닫기 전에 저장할까요?" : "앱을 종료하기 전에 저장할까요?"}
                   </p>
                 <div className="dialog-actions">
-                  <button className="secondary-button" type="button" onClick={cancelDialog}>취소</button>
-                    <button className="secondary-button discard-button" type="button" onClick={() => void discardPendingAction()}>저장 안 함</button>
-                    <button className="primary-button" type="button" onClick={() => void saveCurrent()}>저장</button>
+                  <button className="secondary-button" type="button" onClick={() => resolvePendingFileAction("cancel")}>취소</button>
+                    <button className="secondary-button discard-button" type="button" onClick={() => resolvePendingFileAction("discard")}>저장 안 함</button>
+                    <button className="primary-button" type="button" onClick={() => resolvePendingFileAction("save")}>저장</button>
                 </div>
               </>
             ) : dialogState === "loss" ? (
