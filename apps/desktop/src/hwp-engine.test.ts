@@ -1,16 +1,14 @@
 // @vitest-environment node
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import init, { HwpDocument } from "@rhwp/core";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import {
   createNewHwpDocumentSession,
   hanulDocumentEngine,
-  serializePlainTextHwpTextBoxCandidateWithRhwp,
   wrapHwpDocument,
   type TableCommand,
 } from "./hwp-engine";
 import type { DocumentObject, DocumentSession, TextPosition } from "./document-engine";
-import { HanulTextDocumentSession } from "./text-document-engine";
 
 beforeAll(async () => {
   const wasm = new Uint8Array(
@@ -1018,7 +1016,7 @@ describe("RHWP document session", () => {
     }
   });
 
-  it("blocks HWP export of text boxes and preserves all independent objects through HWPX round trips", async () => {
+  it("keeps mixed HWP object export guarded and preserves all independent objects through HWPX round trips", async () => {
     const session = await hanulDocumentEngine.createBlank();
     const reopened: DocumentSession[] = [];
     try {
@@ -1062,7 +1060,8 @@ describe("RHWP document session", () => {
       session.redo();
       expect(session.listObjects(0).find((object) => object.kind === "ellipse")?.textWrap).toBe("BehindText");
 
-      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP는 한글 2024 호환성을 확인 중.*HWPX로 저장/u);
+      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: false });
+      expect(() => session.exportWithReport("hwp")).toThrow(/검증된 단일 글상자 문서에서만/u);
       for (const format of ["hwpx"] as const) {
         const saved = session.exportWithReport(format);
         expect(saved.report).toMatchObject({ outputFormat: format, count: 0 });
@@ -1096,7 +1095,7 @@ describe("RHWP document session", () => {
     }
   });
 
-  it("preserves text-box margins through the HWPX adapter while keeping user HWP export blocked", async () => {
+  it("preserves text-box margins through the product HWP adapter", async () => {
     const session = await hanulDocumentEngine.createBlank();
     let reopened: DocumentSession | null = null;
     try {
@@ -1107,17 +1106,13 @@ describe("RHWP document session", () => {
       const caret = session.hitTest(0, textBox!.bounds.x + 4, textBox!.bounds.y + 4);
       session.insertText(caret, "HWP5 글상자 구조 후보");
 
-      const textSession = session as HanulTextDocumentSession;
-      const candidate = serializePlainTextHwpTextBoxCandidateWithRhwp(
-        textSession.paragraphs(),
-        session.pageDefinition(0),
-      );
-      expect(candidate.report).toMatchObject({ outputFormat: "hwp", count: 0 });
-      reopened = wrapHwpDocument(new HwpDocument(candidate.bytes));
+      const productExport = session.exportWithReport("hwp");
+      expect(productExport.report).toMatchObject({ outputFormat: "hwp", count: 0 });
+      reopened = wrapHwpDocument(new HwpDocument(productExport.bytes));
       expect(reopened.searchText("HWP5 글상자 구조 후보")).toHaveLength(1);
       const reopenedTextBox = reopened.listObjects(0).find((object) => object.kind === "textBox");
       expect(reopenedTextBox).toBeDefined();
-      const parsedCandidate = new HwpDocument(candidate.bytes);
+      const parsedCandidate = new HwpDocument(productExport.bytes);
       try {
         const properties = JSON.parse(
           parsedCandidate.getShapeProperties(0, 0, reopenedTextBox!.controlIndex),
@@ -1131,7 +1126,7 @@ describe("RHWP document session", () => {
       } finally {
         parsedCandidate.free();
       }
-      expect(() => session.exportWithReport("hwp")).toThrow(/글상자가 포함된 HWP는 한글 2024 호환성을 확인 중/u);
+      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
     } finally {
       reopened?.dispose();
       session.dispose();
@@ -1167,6 +1162,89 @@ describe("RHWP document session", () => {
         tbMarginBottom: 567,
       });
     } finally {
+      session.dispose();
+    }
+  });
+
+  it("exports and reopens the verified single-textbox structure through the product session path", async () => {
+    const bytes = new Uint8Array(
+      await readFile(new URL("../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp", import.meta.url)),
+    );
+    const session = await hanulDocumentEngine.open(bytes);
+    let reopened: DocumentSession | null = null;
+    try {
+      expect(session.engineId).toBe("hanul-text");
+      expect(session.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
+      const textbox = session.listObjects(0).find((object) => object.kind === "textBox");
+      expect(textbox).toBeDefined();
+      const caret = session.hitTest(0, textbox!.bounds.x + 4, textbox!.bounds.y + 4);
+      session.insertText(caret, " 제품 저장 경로 확인");
+      expect(session.searchText("제품 저장 경로 확인")).toHaveLength(1);
+
+      const productExport = session.exportWithReport("hwp");
+      expect(productExport.report).toMatchObject({ outputFormat: "hwp", count: 0 });
+      reopened = await hanulDocumentEngine.open(productExport.bytes);
+      expect(reopened.engineId).toBe("hanul-text");
+      expect(reopened.searchText("본문 앞의 일반 문단입니다.")).toHaveLength(1);
+      expect(reopened.searchText("제품 저장 경로 확인")).toHaveLength(1);
+      expect(reopened.hwpTextboxSaveEligibility()).toMatchObject({ supported: true });
+      const exportedTextbox = reopened.listObjects(0).find((object) => object.kind === "textBox");
+      expect(exportedTextbox).toBeDefined();
+      expect(exportedTextbox!.widthMm).toBeCloseTo(50, 0);
+      expect(exportedTextbox!.heightMm).toBeCloseTo(24, 0);
+      const exportedDocument = new HwpDocument(productExport.bytes);
+      try {
+        const properties = JSON.parse(
+          exportedDocument.getShapeProperties(0, exportedTextbox!.paragraphIndex, exportedTextbox!.controlIndex),
+        ) as Record<string, number>;
+        expect(properties).toMatchObject({
+          width: 14173,
+          height: 6803,
+          horzOffset: 21895,
+          vertOffset: 5669,
+          tbMarginLeft: 567,
+          tbMarginRight: 567,
+          tbMarginTop: 567,
+          tbMarginBottom: 567,
+        });
+      } finally {
+        exportedDocument.free();
+      }
+
+      const outputPath = import.meta.env.VITE_HANUL_PRODUCT_HWP_TEST_OUTPUT;
+      if (outputPath) await writeFile(outputPath, productExport.bytes);
+    } finally {
+      reopened?.dispose();
+      session.dispose();
+    }
+  });
+
+  it("exports a resized and moved single textbox through the product session path", async () => {
+    const bytes = new Uint8Array(
+      await readFile(new URL("../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp", import.meta.url)),
+    );
+    const session = await hanulDocumentEngine.open(bytes);
+    let reopened: DocumentSession | null = null;
+    try {
+      expect(session.engineId).toBe("hanul-text");
+      const textbox = session.listObjects(0).find((object) => object.kind === "textBox");
+      expect(textbox).toBeDefined();
+      session.updateObject(textbox!, { widthMm: 80, heightMm: 35, offsetXmm: 37, offsetYmm: 28 });
+
+      const productExport = session.exportWithReport("hwp");
+      expect(productExport.report).toMatchObject({ outputFormat: "hwp", count: 0 });
+      reopened = await hanulDocumentEngine.open(productExport.bytes);
+      expect(reopened.searchText("HWP5 글상자 재현")).toHaveLength(1);
+      const exportedTextBox = reopened.listObjects(0).find((object) => object.kind === "textBox");
+      expect(exportedTextBox).toBeDefined();
+      expect(exportedTextBox!.widthMm).toBeCloseTo(80, 0);
+      expect(exportedTextBox!.heightMm).toBeCloseTo(35, 0);
+      expect(exportedTextBox!.offsetXmm).toBeCloseTo(37, 0);
+      expect(exportedTextBox!.offsetYmm).toBeCloseTo(28, 0);
+      const outputPath = import.meta.env.VITE_HANUL_PRODUCT_HWP_RESIZED_TEST_OUTPUT;
+      if (outputPath) await writeFile(outputPath, productExport.bytes);
+    } finally {
+      reopened?.dispose();
       session.dispose();
     }
   });

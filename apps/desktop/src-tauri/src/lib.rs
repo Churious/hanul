@@ -83,15 +83,72 @@ fn commit_document_save_blocking(
     }
 
     if format == "hwp" {
-        if count_hwp_textboxes(&parsed.document().sections) > 0 {
+        let sections = &parsed.document().sections;
+        if count_hwp_textboxes(sections) > 0 && !hwp_single_plain_textbox_is_supported(sections) {
             return Err(
-                "글상자 포함 HWP는 한글 2024 호환 검증이 끝날 때까지 저장을 차단했습니다. 문서 구조를 보존하려면 HWPX로 저장하세요.".to_owned(),
+                "검증된 단일 문단 글상자 외의 HWP 개체 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다. 문서 구조를 보존하려면 HWPX로 저장하세요.".to_owned(),
             );
         }
     }
 
     fs::rename(&temporary, &destination)
         .map_err(|error| format!("검증한 문서로 원본을 교체하지 못했습니다. ({error})"))
+}
+
+/// Product HWP saving is enabled only for the Hanword-verified basic shape:
+/// one section, one plain rectangle textbox, one paragraph inside it, and no
+/// other document controls. This is intentionally stricter than RHWP parsing.
+fn hwp_single_plain_textbox_is_supported(sections: &[rhwp::model::document::Section]) -> bool {
+    use rhwp::model::{control::Control, shape::ShapeObject};
+
+    if sections.len() != 1 {
+        return false;
+    }
+    let mut text_box_count = 0usize;
+    for paragraph in &sections[0].paragraphs {
+        if !paragraph.range_tags.is_empty()
+            || !paragraph.field_ranges.is_empty()
+            || !paragraph.orphan_field_ends.is_empty()
+        {
+            return false;
+        }
+        for control in &paragraph.controls {
+            match control {
+                Control::SectionDef(_) | Control::ColumnDef(_) => {}
+                Control::Shape(shape) => {
+                    let ShapeObject::Rectangle(rectangle) = shape.as_ref() else {
+                        return false;
+                    };
+                    if rectangle.round_rate != 0 || rectangle.drawing.caption.is_some() {
+                        return false;
+                    }
+                    let Some(text_box) = rectangle.drawing.text_box.as_ref() else {
+                        return false;
+                    };
+                    if text_box.paragraphs.len() != 1
+                        || text_box.vertical_all
+                        || !matches!(
+                            text_box.vertical_align,
+                            rhwp::model::table::VerticalAlign::Top
+                        )
+                    {
+                        return false;
+                    }
+                    let inner = &text_box.paragraphs[0];
+                    if !inner.controls.is_empty()
+                        || !inner.range_tags.is_empty()
+                        || !inner.field_ranges.is_empty()
+                        || !inner.orphan_field_ends.is_empty()
+                    {
+                        return false;
+                    }
+                    text_box_count += 1;
+                }
+                _ => return false,
+            }
+        }
+    }
+    text_box_count == 1
 }
 
 fn count_hwp_textboxes(sections: &[rhwp::model::document::Section]) -> usize {
@@ -317,6 +374,23 @@ mod tests {
                 &[],
             )
             .expect("create textbox");
+        source
+            .create_shape_control_native(
+                0,
+                0,
+                0,
+                3600,
+                1800,
+                0,
+                0,
+                false,
+                "InFrontOfText",
+                "second textbox",
+                false,
+                false,
+                &[],
+            )
+            .expect("create second textbox");
         let staged_bytes = source.export_hwp_native().expect("serialize staged HWP");
         std::fs::write(&temporary, &staged_bytes).expect("write staged HWP");
         std::fs::write(&destination, b"original HWP").expect("seed existing HWP");
@@ -328,12 +402,75 @@ mod tests {
         )
         .expect_err("unverified text-box HWP must stay blocked");
 
-        assert!(error.contains("글상자 포함 HWP"));
+        assert!(error.contains("호환성 검증이 끝나지 않아 저장을 차단"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"original HWP");
         assert!(DocumentCore::from_bytes(&staged_bytes).is_ok());
         assert!(temporary.exists());
         std::fs::remove_file(temporary).unwrap();
         std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn saves_the_hanword_verified_single_textbox_golden_through_atomic_product_commit() {
+        let sequence = super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed);
+        let temporary = std::env::temp_dir().join(format!(
+            "hanul-verified-textbox-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "hanul-verified-textbox-{}-{sequence}.hwp",
+            std::process::id()
+        ));
+        let bytes =
+            include_bytes!("../../test-fixtures/hanul-textbox-body-50x24-hanword-gui-verified.hwp");
+        assert!(DocumentCore::from_bytes(bytes).is_ok());
+        std::fs::write(&temporary, bytes).expect("write staged golden HWP");
+
+        commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+        )
+        .expect("the Hanword-verified simple textbox structure is supported");
+
+        let committed = std::fs::read(&destination).expect("read committed golden");
+        assert_eq!(committed, bytes);
+        assert!(DocumentCore::from_bytes(&committed).is_ok());
+        assert!(!temporary.exists());
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run with HANUL_PRODUCT_HWP_INPUT/OUTPUT to prepare a disposable Hanword GUI check"]
+    fn commits_product_serializer_textbox_output_for_hanword_gui_validation() {
+        let input = std::env::var("HANUL_PRODUCT_HWP_INPUT")
+            .expect("set HANUL_PRODUCT_HWP_INPUT to the frontend product-export bytes");
+        let output = std::env::var("HANUL_PRODUCT_HWP_OUTPUT")
+            .expect("set HANUL_PRODUCT_HWP_OUTPUT to a new disposable HWP path");
+        let destination = std::path::PathBuf::from(output);
+        assert!(
+            !destination.exists(),
+            "GUI validation output must be a new path"
+        );
+        let parent = destination.parent().expect("output parent");
+        let temporary = parent.join(format!(
+            ".hanul-product-save-{}-{}.tmp",
+            std::process::id(),
+            super::NEXT_TEMP_FILE.fetch_add(1, super::Ordering::Relaxed)
+        ));
+        let input_bytes = std::fs::read(input).expect("read frontend product export");
+        std::fs::write(&temporary, &input_bytes).expect("stage frontend product export");
+
+        commit_document_save_blocking(
+            temporary.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "hwp",
+        )
+        .expect("run the normal format, parse, textbox-policy and atomic-rename pipeline");
+
+        let committed = std::fs::read(&destination).expect("read committed HWP");
+        assert_eq!(committed, input_bytes);
+        assert!(DocumentCore::from_bytes(&committed).is_ok());
     }
 
     #[test]

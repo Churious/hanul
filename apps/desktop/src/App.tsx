@@ -1166,7 +1166,10 @@ function App() {
       }
 
       if (format === "hwp" && documentHasTextBox(session)) {
-        throw new Error("글상자 포함 HWP는 한글 2024 호환성을 확인 중이라 저장을 차단했습니다. HWPX로 저장하세요.");
+        const eligibility = session.hwpTextboxSaveEligibility();
+        if (!eligibility.supported) {
+          throw new Error(eligibility.reason ?? "이 글상자 HWP 구조는 아직 저장할 수 없습니다. HWPX로 저장하세요.");
+        }
       }
       const result = session.exportWithReport(format);
       if (result.report.count > 0) {

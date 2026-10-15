@@ -1,11 +1,59 @@
 import { describe, expect, it } from "vitest";
 import { ImeInputGate } from "./ime-input";
-import { createInMemoryTextSession } from "./text-document-engine";
+import { createInMemoryTextSession, plainTextHwpTextboxSaveEligibility } from "./text-document-engine";
 
 const LINES_PER_PAGE = 44;
 const syntheticParagraph = (index: number) => `한글 문서 편집 조판 성능과 문단별 증분 배치를 검증합니다. ${String(index).padStart(4, "0")}`;
 
 describe("Hanul paragraph text engine", () => {
+  it("limits product HWP textbox export to one plain one-paragraph textbox", () => {
+    const session = createInMemoryTextSession([{ text: "본문" }]);
+    try {
+      const anchor = session.hitTest(0, 100, 100);
+      session.insertShape(anchor, "textBox", 50, 24);
+      const singleTextbox = session.paragraphs();
+      expect(plainTextHwpTextboxSaveEligibility(singleTextbox)).toMatchObject({ supported: true });
+
+      const multipleParagraphs = structuredClone(singleTextbox);
+      multipleParagraphs[0]!.objects![0]!.textParagraphs = [
+        { text: "첫 문단", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] },
+        { text: "둘째 문단", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] },
+      ];
+      expect(plainTextHwpTextboxSaveEligibility(multipleParagraphs)).toMatchObject({ supported: false });
+
+      const tableAndTextbox = structuredClone(singleTextbox);
+      tableAndTextbox.push({
+        text: "",
+        pageBreakBefore: false,
+        paragraphFormat: {},
+        characterFormats: [],
+        table: {
+          rowCount: 1,
+          colCount: 1,
+          columnWidthsMm: [50],
+          properties: {},
+          cells: [{
+            row: 0,
+            col: 0,
+            rowSpan: 1,
+            colSpan: 1,
+            widthMm: 50,
+            heightMm: 10,
+            properties: {},
+            paragraphs: [{ text: "셀", pageBreakBefore: false, paragraphFormat: {}, characterFormats: [] }],
+          }],
+        },
+      });
+      expect(plainTextHwpTextboxSaveEligibility(tableAndTextbox)).toMatchObject({ supported: false });
+
+      const pictureAndTextbox = structuredClone(singleTextbox);
+      pictureAndTextbox[0]!.objects!.push({ ...pictureAndTextbox[0]!.objects![0]!, id: "picture", kind: "picture" });
+      expect(plainTextHwpTextboxSaveEligibility(pictureAndTextbox)).toMatchObject({ supported: false });
+    } finally {
+      session.dispose();
+    }
+  });
+
   it.each([1, 35, 98, 500])("edits a %i-page model at the beginning, middle and end", (pageCount) => {
     const started = performance.now();
     const rssBefore = readRssBytes();

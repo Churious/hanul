@@ -220,6 +220,8 @@ export interface DocumentSession {
   readonly engineId?: string;
   readonly pageCount: number;
   readonly sourceFormat: string;
+  /** Whether this session can safely export its current textbox structure to HWP. */
+  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string };
   /** Page-local render invalidation counter; absent on legacy engines. */
   renderRevision?(pageIndex: number): number;
   /** Latest synchronous stage timings where an engine can measure them. */

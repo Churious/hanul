@@ -28,7 +28,7 @@ import type {
   TableUpdates,
   TextPosition,
 } from "./document-engine";
-import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextObject, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
+import { HanulTextDocumentSession, plainTextHwpTextboxSaveEligibility, type ImportedPlainTextDocument, type PlainTextObject, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
 
 export type {
   CellPathSegment,
@@ -248,6 +248,19 @@ class RhwpDocumentSession implements DocumentSession {
 
   get pageCount() {
     return this.document.pageCount();
+  }
+
+  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string } {
+    const sectionIndexes = new Set<number>();
+    for (let pageIndex = 0; pageIndex < this.pageCount; pageIndex += 1) {
+      sectionIndexes.add(this.pageInfo(pageIndex).sectionIndex);
+    }
+    const hasTextBox = [...sectionIndexes].some((sectionIndex) =>
+      this.listObjects(sectionIndex).some((object) => object.kind === "textBox"),
+    );
+    return hasTextBox
+      ? { supported: false, reason: "RHWP 호환 세션의 글상자 HWP 저장은 아직 제품 경로에서 검증되지 않았습니다." }
+      : { supported: true };
   }
 
   documentInfo() {
@@ -2231,30 +2244,18 @@ export function serializePlainTextWithRhwp(
   format: "hwp" | "hwpx",
   pageDefinition: PageDefinition,
 ): ExportResult {
-  return serializePlainTextWithRhwpInternal(paragraphs, format, pageDefinition, false);
-}
-
-/**
- * Builds a diagnostic HWP textbox candidate for structural regression tests.
- * This bypass is not used by the desktop save path, which continues to block
- * textbox HWP until the supported scope is verified end to end in Hanword 2024.
- */
-export function serializePlainTextHwpTextBoxCandidateWithRhwp(
-  paragraphs: readonly PlainTextParagraph[],
-  pageDefinition: PageDefinition,
-): ExportResult {
-  return serializePlainTextWithRhwpInternal(paragraphs, "hwp", pageDefinition, true);
+  return serializePlainTextWithRhwpInternal(paragraphs, format, pageDefinition);
 }
 
 function serializePlainTextWithRhwpInternal(
   paragraphs: readonly PlainTextParagraph[],
   format: "hwp" | "hwpx",
   pageDefinition: PageDefinition,
-  allowTextboxHwpCandidate: boolean,
 ): ExportResult {
   const hasTextBox = paragraphs.some((paragraph) => paragraph.objects?.some((object) => object.kind === "textBox"));
-  if (format === "hwp" && hasTextBox && !allowTextboxHwpCandidate) {
-    throw new Error("글상자가 포함된 HWP는 한글 2024 호환성을 확인 중이라 저장을 차단했습니다. 글상자를 보존하려면 HWPX로 저장하세요.");
+  const textboxEligibility = format === "hwp" ? plainTextHwpTextboxSaveEligibility(paragraphs) : { supported: true };
+  if (format === "hwp" && hasTextBox && !textboxEligibility.supported) {
+    throw new Error(textboxEligibility.reason ?? "이 글상자 HWP 구조는 아직 저장할 수 없습니다. HWPX로 저장하세요.");
   }
   if (!initialization) throw new Error("RHWP WASM 엔진이 초기화되지 않았습니다.");
   const document = HwpDocument.createEmpty();
@@ -2418,10 +2419,9 @@ function serializePlainTextWithRhwpInternal(
 }
 
 /**
- * Produces a diagnostic HWP candidate for structural tests. An isolated Korean
- * textbox candidate with the current margin-preserving output opened and rendered
- * in Hanword 2024's GUI. Mixed-content/resized/moved/styled cases and the normal
- * application save workflow remain unverified, so user saves stay blocked.
+ * RHWP's HWPX-to-HWP bridge is the serializer used for the product's restricted
+ * plain-text textbox export. Callers must pass the shared textbox eligibility
+ * check before reaching this path; there is no unrestricted diagnostic bypass.
  */
 function exportHwpTextBoxViaHwpx(document: HwpDocument): DocumentExport {
   const intermediate = document.exportHwpxWithReport();

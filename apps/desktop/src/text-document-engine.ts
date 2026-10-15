@@ -75,6 +75,34 @@ export interface PlainTextSerializer {
   serialize(paragraphs: readonly PlainTextParagraph[], format: "hwp" | "hwpx", pageDefinition: PageDefinition): ExportResult;
 }
 
+/**
+ * HWP textbox export is intentionally limited to the one structure verified in
+ * Hanword 2024: one simple rectangle textbox with one plain text paragraph.
+ * Mixed objects, tables, and multi-paragraph textboxes remain on the guarded
+ * compatibility path until they have their own product-save validation.
+ */
+export function plainTextHwpTextboxSaveEligibility(
+  paragraphs: readonly PlainTextParagraph[],
+): { supported: boolean; reason?: string } {
+  const objects = paragraphs.flatMap((paragraph) => paragraph.objects ?? []);
+  const textBoxes = objects.filter((object) => object.kind === "textBox");
+  if (textBoxes.length === 0) return { supported: true };
+  if (objects.length !== 1 || textBoxes.length !== 1) {
+    return { supported: false, reason: "HWP 글상자 저장은 검증된 단일 글상자 문서에서만 지원합니다." };
+  }
+  if (paragraphs.some((paragraph) => paragraph.table)) {
+    return { supported: false, reason: "표와 글상자가 함께 있는 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
+  }
+  const [textBox] = textBoxes;
+  if (textBox!.textParagraphs?.length !== 1) {
+    return { supported: false, reason: "여러 문단 또는 비어 있는 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
+  }
+  if (textBox!.shapeType !== undefined && textBox!.shapeType !== "rectangle") {
+    return { supported: false, reason: "사각형이 아닌 글상자 HWP는 호환성 검증이 끝나지 않아 저장을 차단했습니다." };
+  }
+  return { supported: true };
+}
+
 export interface ImportedPlainTextDocument {
   paragraphs: readonly Partial<PlainTextParagraph>[];
   pageDefinition: PageDefinition;
@@ -406,6 +434,9 @@ export class HanulTextDocumentSession implements DocumentSession {
   renderRevision(pageIndex: number): number { return this.pageRevisions.get(pageIndex) ?? 0; }
   get canUndo(): boolean { return this.undoStack.length > 0; }
   get canRedo(): boolean { return this.redoStack.length > 0; }
+  hwpTextboxSaveEligibility(): { supported: boolean; reason?: string } {
+    return plainTextHwpTextboxSaveEligibility(this.paragraphs());
+  }
   get metrics(): Readonly<TextEngineMetrics> { return this._metrics; }
   performanceMetrics(): Readonly<TextEngineMetrics> { return { ...this._metrics }; }
   documentInfo(): DocumentInfo { return { version: "Hanul Text Model 1", sectionCount: 1, pageCount: this.pageCount, fontsUsed: ["Noto Sans CJK KR"] }; }
