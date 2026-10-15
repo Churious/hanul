@@ -200,6 +200,15 @@ function reportAppPerformance(phase: string, details: Record<string, number | st
   if (import.meta.env.DEV) console.info(`[Hanul performance] ${phase}`, details);
 }
 
+function reportE2eLifecycleEvent(event: string, details: Record<string, string | number | boolean | null> = {}) {
+  if (!__HANUL_E2E__) return;
+  const target = window as Window & {
+    __hanulE2eLifecycleEvents?: Array<{ event: string; details: Record<string, string | number | boolean | null> }>;
+  };
+  target.__hanulE2eLifecycleEvents ??= [];
+  target.__hanulE2eLifecycleEvents.push({ event, details });
+}
+
 const measuredInitialPages = new WeakMap<DocumentSession, Set<number>>();
 
 function shouldMeasureInitialPage(session: DocumentSession, pageIndex: number) {
@@ -647,7 +656,6 @@ function App() {
   const documentSaveLock = useRef(new DocumentSaveLock());
   const documentLoadInProgress = useRef(false);
   const documentEditRevision = useRef(0);
-  const allowWindowClose = useRef(false);
   const originalPrintTitle = useRef<string | null>(null);
   const imeInputGate = useRef(new ImeInputGate());
   const pointerSelection = useRef<EditorSelection | null>(null);
@@ -860,14 +868,21 @@ function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested((event) => {
-      if (!active || allowWindowClose.current) return;
+      reportE2eLifecycleEvent("window-close-requested", {
+        active,
+        saving: documentSaveLock.current.isLocked,
+        dirty,
+      });
+      if (!active) return;
       if (documentSaveLock.current.isLocked) {
         event.preventDefault();
+        reportE2eLifecycleEvent("window-close-blocked", { reason: "saving" });
         setMessage("저장이 끝날 때까지 창을 닫을 수 없습니다.");
         return;
       }
       if (!dirty) return;
       event.preventDefault();
+      reportE2eLifecycleEvent("window-close-blocked", { reason: "dirty" });
       setPendingAction({ kind: "exit" });
       setDialogState("unsaved");
     }).then((stopListening) => {
@@ -948,6 +963,7 @@ function App() {
         // documents into Hanul's incremental model. Complex content remains in
         // the RHWP compatibility session without UI-specific engine branching.
         nextSession = await hanulDocumentEngine.open(bytes);
+        if (__HANUL_E2E__) await invoke("e2e_open_parse_checkpoint");
       }
       if (!nextSession) throw new Error("문서 엔진이 편집 세션을 만들지 않았습니다.");
       const loadedSession = nextSession;
@@ -1055,11 +1071,13 @@ function App() {
       return;
     }
     try {
+      reportE2eLifecycleEvent("open-dialog-requested");
       const selected = await openDialog({
         title: "한글 문서 열기",
         multiple: false,
         filters: [{ name: "한글 문서", extensions: ["hwp", "hwpx"] }],
       });
+      reportE2eLifecycleEvent("open-dialog-returned", { selected: typeof selected === "string" });
       if (typeof selected !== "string") return;
       const info = await stat(selected);
       await openDocument({ name: getBaseName(selected), size: info.size, path: selected });
@@ -1104,20 +1122,25 @@ function App() {
   }, []);
 
   const exitApp = useCallback(async () => {
+    reportE2eLifecycleEvent("exit-app-requested");
     if (!isTauri()) {
       setMessage("앱 종료는 데스크톱 앱에서 사용할 수 있습니다.");
       return;
     }
     try {
-      allowWindowClose.current = true;
-      await getCurrentWindow().close();
+      // This path is reached only after the user chose Save/Discard, or when
+      // the document is already clean. A close request would re-enter the
+      // dirty-close guard; destroy performs the confirmed exit directly.
+      await getCurrentWindow().destroy();
+      reportE2eLifecycleEvent("exit-app-destroy-resolved");
     } catch (cause) {
-      allowWindowClose.current = false;
+      reportE2eLifecycleEvent("exit-app-close-rejected", { message: errorDetail(cause, "unknown") });
       setMessage(cause instanceof Error ? `앱을 종료하지 못했습니다. (${cause.message})` : "앱을 종료하지 못했습니다.");
     }
   }, []);
 
   const continuePendingAction = useCallback(async () => {
+    reportE2eLifecycleEvent("continue-pending-action", { kind: pendingAction?.kind ?? null });
     if (!pendingAction) return;
     const action = pendingAction;
     setPendingAction(null);
@@ -1246,6 +1269,7 @@ function App() {
       return;
     }
     if (!beginSaveTransaction()) return;
+    let continueActionAfterUnlock = false;
     try {
       const sourceFormat = fileFormat || session.sourceFormat;
       if (sourceFormat !== "hwp" && sourceFormat !== "hwpx") throw new Error("현재 저장할 수 없는 문서 형식입니다.");
@@ -1253,6 +1277,7 @@ function App() {
       let destinationPath: string | null = filePath || null;
 
       if (isTauri() && (saveAs || !destinationPath)) {
+        reportE2eLifecycleEvent("save-dialog-requested", { saveAs });
         const selected = await saveDialog({
           title: saveAs ? "다른 이름으로 저장" : "한글 문서 저장",
           defaultPath: filePath || fileName || `문서.${format}`,
@@ -1261,6 +1286,7 @@ function App() {
             { name: "한글 XML 문서 (*.hwpx)", extensions: ["hwpx"] },
           ],
         });
+        reportE2eLifecycleEvent("save-dialog-returned", { selected: typeof selected === "string" && selected.length > 0 });
         if (!selected) return;
         const extension = /\.([^.\\/]+)$/i.exec(selected)?.[1]?.toLowerCase();
         if (extension && extension !== "hwp" && extension !== "hwpx") {
@@ -1273,6 +1299,11 @@ function App() {
         destinationPath = null;
       }
 
+      reportE2eLifecycleEvent("save-export-requested", {
+        destinationSelected: Boolean(destinationPath),
+        format,
+        snapshotRevision: documentEditRevision.current,
+      });
       const compatibility = session.compatibilityReport(format);
       if (!canSaveWithCompatibility(compatibility, false)) {
         throw new Error(compatibilityIssueMessage(compatibility, "이 " + format.toUpperCase() + " 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다."));
@@ -1289,8 +1320,14 @@ function App() {
       }
       const editRevision = documentEditRevision.current;
       const saved = await saveExport(result, destinationPath, sourceEngine, false, editRevision);
+      reportE2eLifecycleEvent("save-finished-for-pending-action", {
+        saved,
+        kind: pendingAction?.kind ?? null,
+        snapshotRevision: editRevision,
+        currentRevision: documentEditRevision.current,
+      });
       if (saved && pendingAction) {
-        if (canContinueAfterSave(editRevision, documentEditRevision.current)) await continuePendingAction();
+        if (canContinueAfterSave(editRevision, documentEditRevision.current)) continueActionAfterUnlock = true;
         else {
           setDialogState("unsaved");
           setMessage("저장하는 동안 새 변경 사항이 생겨 문서를 유지했습니다. 계속하려면 다시 저장하거나 취소하세요.");
@@ -1301,6 +1338,7 @@ function App() {
     } finally {
       endSaveTransaction();
     }
+    if (continueActionAfterUnlock) await continuePendingAction();
   }, [beginSaveTransaction, continuePendingAction, endSaveTransaction, fileFormat, fileName, filePath, pendingAction, saveExport, session]);
 
   const confirmLossSave = useCallback(async () => {
@@ -1310,10 +1348,11 @@ function App() {
       return;
     }
     if (!beginSaveTransaction()) return;
+    let continueActionAfterUnlock = false;
     try {
       const saved = await saveExport(saveCandidate.result, saveDestination, saveCandidate.sourceEngine, true, saveCandidate.editRevision);
       if (saved && pendingAction) {
-        if (canContinueAfterSave(saveCandidate.editRevision, documentEditRevision.current)) await continuePendingAction();
+        if (canContinueAfterSave(saveCandidate.editRevision, documentEditRevision.current)) continueActionAfterUnlock = true;
         else {
           setDialogState("unsaved");
           setMessage("저장하는 동안 새 변경 사항이 생겨 문서를 유지했습니다. 계속하려면 다시 저장하거나 취소하세요.");
@@ -1322,6 +1361,7 @@ function App() {
     } finally {
       endSaveTransaction();
     }
+    if (continueActionAfterUnlock) await continuePendingAction();
   }, [beginSaveTransaction, continuePendingAction, endSaveTransaction, pendingAction, saveCandidate, saveDestination, saveExport]);
 
   const writePdfExport = useCallback(async ({ result, outputPath }: PdfExportCandidate) => {
@@ -1392,6 +1432,10 @@ function App() {
 
   const resolvePendingFileAction = useCallback((choice: "save" | "discard" | "cancel") => {
     const resolution = resolveUnsavedChoice(pendingAction, choice);
+    reportE2eLifecycleEvent("resolve-pending-file-action", {
+      choice,
+      kind: resolution.kind === "cancel" ? null : resolution.action.kind,
+    });
     if (resolution.kind === "cancel") {
       cancelDialog();
     } else if (resolution.kind === "continue-without-saving") {

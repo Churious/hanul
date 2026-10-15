@@ -4,12 +4,87 @@ compile_error!("webdriver-e2e is only available in debug builds; never ship the 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "webdriver-e2e")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rhwp::DocumentCore;
 use serde::Serialize;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+// Lifecycle fault injection exists only in the isolated webdriver-e2e build.
+// It pauses the same product commands used by Save As and document opening.
+#[cfg(feature = "webdriver-e2e")]
+static E2E_SAVE_COMMIT_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "webdriver-e2e")]
+static E2E_SAVE_COMMIT_DELAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "webdriver-e2e")]
+static E2E_OPEN_GATE_NEXT: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "webdriver-e2e")]
+static E2E_OPEN_GATE_RELEASED: AtomicBool = AtomicBool::new(true);
+#[cfg(feature = "webdriver-e2e")]
+static E2E_OPEN_RESULT_PAUSED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "webdriver-e2e")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct E2eLifecycleStatus {
+    save_commit_paused: bool,
+    open_result_paused: bool,
+}
+
+#[cfg(feature = "webdriver-e2e")]
+#[tauri::command]
+fn e2e_set_save_commit_delay(delay_ms: u64) -> Result<(), String> {
+    if delay_ms > 10_000 {
+        return Err("E2E 저장 지연은 최대 10초로 제한됩니다.".to_owned());
+    }
+    E2E_SAVE_COMMIT_DELAY_MS.store(delay_ms, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(feature = "webdriver-e2e")]
+#[tauri::command]
+fn e2e_set_open_gate(paused: bool) {
+    E2E_OPEN_RESULT_PAUSED.store(false, Ordering::SeqCst);
+    E2E_OPEN_GATE_RELEASED.store(!paused, Ordering::SeqCst);
+    E2E_OPEN_GATE_NEXT.store(paused, Ordering::SeqCst);
+}
+
+#[cfg(feature = "webdriver-e2e")]
+#[tauri::command]
+async fn e2e_open_parse_checkpoint() -> Result<(), String> {
+    if !E2E_OPEN_GATE_NEXT.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    E2E_OPEN_RESULT_PAUSED.store(true, Ordering::SeqCst);
+    let wait = tauri::async_runtime::spawn_blocking(|| {
+        while !E2E_OPEN_GATE_RELEASED.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    wait.await
+        .map_err(|error| format!("E2E 문서 열기 지연을 완료하지 못했습니다. ({error})"))?;
+    E2E_OPEN_RESULT_PAUSED.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(feature = "webdriver-e2e")]
+#[tauri::command]
+fn e2e_get_lifecycle_status() -> E2eLifecycleStatus {
+    E2eLifecycleStatus {
+        save_commit_paused: E2E_SAVE_COMMIT_DELAY_ACTIVE.load(Ordering::SeqCst),
+        open_result_paused: E2E_OPEN_RESULT_PAUSED.load(Ordering::SeqCst),
+    }
+}
+
+#[cfg(feature = "webdriver-e2e")]
+#[tauri::command]
+fn e2e_release_open_gate() {
+    E2E_OPEN_GATE_NEXT.store(false, Ordering::SeqCst);
+    E2E_OPEN_GATE_RELEASED.store(true, Ordering::SeqCst);
+}
 
 #[tauri::command]
 async fn export_pdf(document_bytes: Vec<u8>, output_path: String) -> Result<u32, String> {
@@ -199,6 +274,16 @@ fn commit_document_save_with_policy_blocking(
             .unwrap_or_else(|| {
                 "이 문서 구조는 호환성 검증이 끝나지 않아 저장을 차단했습니다.".to_owned()
             }));
+    }
+
+    #[cfg(feature = "webdriver-e2e")]
+    {
+        let delay_ms = E2E_SAVE_COMMIT_DELAY_MS.swap(0, Ordering::SeqCst);
+        if delay_ms > 0 {
+            E2E_SAVE_COMMIT_DELAY_ACTIVE.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            E2E_SAVE_COMMIT_DELAY_ACTIVE.store(false, Ordering::SeqCst);
+        }
     }
 
     fs::rename(&temporary, &destination)
@@ -828,12 +913,26 @@ pub fn run() {
     #[cfg(feature = "webdriver-e2e")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
 
+    #[cfg(feature = "webdriver-e2e")]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        export_pdf,
+        commit_document_save,
+        inspect_document_compatibility,
+        e2e_set_save_commit_delay,
+        e2e_set_open_gate,
+        e2e_open_parse_checkpoint,
+        e2e_get_lifecycle_status,
+        e2e_release_open_gate
+    ]);
+
+    #[cfg(not(feature = "webdriver-e2e"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        export_pdf,
+        commit_document_save,
+        inspect_document_compatibility
+    ]);
+
     builder
-        .invoke_handler(tauri::generate_handler![
-            export_pdf,
-            commit_document_save,
-            inspect_document_compatibility
-        ])
         .setup(|_app| {
             #[cfg(target_os = "linux")]
             {

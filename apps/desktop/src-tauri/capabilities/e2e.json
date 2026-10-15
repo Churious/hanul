@@ -15,7 +15,7 @@
     "fs:allow-write-file",
     {
       "identifier": "fs:scope",
-      "allow": [{ "path": "$TEMP/hanul-v102c-e2e-*/*" }]
+      "allow": [{ "path": "$TEMP/hanul-v102c-e2e-*/**" }]
     }
   ]
 }

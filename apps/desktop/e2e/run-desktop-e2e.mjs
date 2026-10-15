@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { access, copyFile, mkdir, mkdtemp, readFile, rename, stat } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { access, copyFile, mkdir, mkdtemp, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -27,20 +27,25 @@ const env = {
   TAURI_WEBDRIVER_PORT: String(port),
 };
 const tauriCli = path.join(desktopDir, "node_modules", "@tauri-apps", "cli", "tauri.js");
-const appProcess = spawn(process.execPath, [tauriCli, "dev", "--config", "src-tauri/tauri.e2e.conf.json", "--features", "webdriver-e2e", "--no-watch"], {
-  cwd: desktopDir,
-  env,
-  stdio: ["ignore", "pipe", "pipe"],
-  detached: false,
-});
-
+let appProcess;
 let appOutput = "";
-const appendOutput = (chunk) => {
-  appOutput = `${appOutput}${chunk.toString()}`.slice(-16000);
-  process.stdout.write(chunk);
-};
-appProcess.stdout.on("data", appendOutput);
-appProcess.stderr.on("data", appendOutput);
+let nativeAppPid;
+
+function launchTauriApp() {
+  appOutput = "";
+  appProcess = spawn(process.execPath, [tauriCli, "dev", "--config", "src-tauri/tauri.e2e.conf.json", "--features", "webdriver-e2e", "--no-watch"], {
+    cwd: desktopDir,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
+  const appendOutput = (chunk) => {
+    appOutput = `${appOutput}${chunk.toString()}`.slice(-16000);
+    process.stdout.write(chunk);
+  };
+  appProcess.stdout.on("data", appendOutput);
+  appProcess.stderr.on("data", appendOutput);
+}
 
 let sessionId;
 let assertions = 0;
@@ -102,6 +107,35 @@ async function script(script, args = []) {
   return request("POST", `/session/${sessionId}/execute/sync`, { script, args });
 }
 
+async function asyncScript(script, args = []) {
+  return request("POST", `/session/${sessionId}/execute/async`, { script, args });
+}
+
+async function e2eCommand(command, args = {}) {
+  const result = await asyncScript(
+    "const done = arguments[arguments.length - 1]; window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1]).then(value => done({ok: true, value}), error => done({ok: false, error: String(error)}));",
+    [command, args],
+  );
+  if (!result?.ok) throw new Error(`E2E command ${command} failed: ${result?.error ?? JSON.stringify(result)}`);
+  return result.value;
+}
+
+async function waitForLifecycleStatus(predicate, message, timeoutMs = 15000) {
+  return waitFor(async () => predicate(await e2eCommand("e2e_get_lifecycle_status")), message, timeoutMs);
+}
+
+async function dispatchShortcut(key, modifiers = {}) {
+  await script("window.dispatchEvent(new KeyboardEvent('keydown', {key: arguments[0], bubbles: true, ctrlKey: Boolean(arguments[1].ctrlKey), shiftKey: Boolean(arguments[1].shiftKey)}));", [key, modifiers]);
+}
+
+function runAclHelper(mode, directory) {
+  const helperPath = path.join(scriptDir, "windows", "file-system-acl.ps1");
+  return spawnSync("powershell.exe", [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+    "-Mode", mode, "-Directory", directory,
+  ], { cwd: repoDir, encoding: "utf8", timeout: 15000 });
+}
+
 async function clickFileCommand(label) {
   await click(".file-menu-trigger");
   const xpath = `//button[@role='menuitem' and contains(normalize-space(.), '${label}')]`;
@@ -111,15 +145,10 @@ async function clickFileCommand(label) {
 
 async function typeMarker(marker) {
   await waitFor(async () => await script("return Boolean(document.querySelector('.ime-input'))"), "Editor input was not ready");
-  // Tauri's Linux WebDriver implementation calls HTMLElement.click() directly;
-  // SVGTextElement in WebKitGTK does not expose that method. The editor's hidden
-  // IME input is the actual text entry surface, so focus it directly on Linux.
-  const target = await hasElement(".page-svg text") ? ".page-svg text" : ".page-svg";
-  if (await hasElement(target)) {
-    await click(target);
-    await delay(80);
-  }
-  await script("const input = document.querySelector('.ime-input'); input.focus(); input.value = ''; return document.activeElement === input");
+  const focused = await script("const input = document.querySelector('.ime-input'); input.focus(); return document.activeElement === input");
+  assert.equal(focused, true, "Editor input could not receive keyboard focus");
+  await script("const input = document.querySelector('.ime-input'); input.value = ''");
+  await script("document.querySelector('.ime-input').dispatchEvent(new KeyboardEvent('keydown', {key:'End', bubbles:true, cancelable:true}))");
   await sendKeys(".ime-input", marker);
   await waitFor(async () => (await script("return document.querySelector('.document-page')?.textContent ?? ''")).includes(marker), `Document model/render did not show input: ${marker}`);
 }
@@ -151,6 +180,7 @@ async function nativeDialog(mode, filePath, options = {}) {
   const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Mode", mode, "-OwnerTitle", "Hanul V1-02c E2E", "-TimeoutSeconds", "15"];
   if (filePath) args.push("-Path", filePath);
   if (options.closeAppBeforeSelection) args.push("-CloseAppBeforeSelection");
+  if (options.expectedPid) args.push("-ExpectedPid", String(options.expectedPid));
   const helper = spawn("powershell.exe", args, { cwd: repoDir, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   helper.stdout.on("data", (chunk) => { output += chunk.toString(); });
@@ -160,7 +190,7 @@ async function nativeDialog(mode, filePath, options = {}) {
     helper.once("close", resolve);
   });
   if (exitCode !== 0) {
-    const appState = await script("return {title: document.title, alert: document.querySelector('[role=alert]')?.innerText ?? '', body: document.body?.innerText?.slice(-500) ?? ''}").catch(() => null);
+    const appState = await script("return {title: document.title, alert: document.querySelector('[role=alert]')?.innerText ?? '', body: document.body?.innerText?.slice(-500) ?? '', lifecycleEvents: window.__hanulE2eLifecycleEvents ?? []}").catch(() => null);
     throw new Error(`Windows UI Automation ${mode} failed: ${output.trim()}${appState ? `; app state=${JSON.stringify(appState)}` : ""}`);
   }
   return output.trim();
@@ -197,6 +227,7 @@ async function openPath(filePath) {
   await clickFileCommand("불러오기");
   process.stdout.write(`${await nativeDialog("Open", filePath)}\n`);
   await waitForDocumentPage(`Document did not open: ${filePath}`);
+  await waitFor(async () => (await script("return document.querySelector('.header-document-title')?.textContent?.trim() ?? ''")) === path.basename(filePath), `Document title did not update after opening: ${filePath}`);
 }
 
 async function saveAs(filePath) {
@@ -242,11 +273,15 @@ async function startWebDriver() {
   const pageErrors = await script("return window.__hanulE2eErrors ?? []");
   process.stdout.write(`[WebDriver] title=${JSON.stringify(pageTitle)} url=${JSON.stringify(pageLocation)} ready=${JSON.stringify(pageReadyState)} appShell=${JSON.stringify(pageShell)} globals=${JSON.stringify(globals)} errors=${JSON.stringify(pageErrors)}\n`);
   await waitFor(async () => await script("return Boolean(document.querySelector('.app-shell'))"), "Isolated E2E Tauri window did not load");
+  const pidOutput = await nativeDialog("GetPid");
+  nativeAppPid = Number(/PID:\s*(\d+)/i.exec(pidOutput)?.[1]);
+  if (!Number.isInteger(nativeAppPid) || nativeAppPid <= 0) throw new Error(`Could not identify the native Hanul app process: ${pidOutput}`);
 }
 
 function e2ePath(...parts) { return path.join(dataDir, ...parts); }
 
 try {
+  launchTauriApp();
   await startWebDriver();
 
   const newHwpx = e2ePath("new-document-roundtrip.hwpx");
@@ -298,6 +333,108 @@ try {
     await click("//button[normalize-space(.)='닫기']", "xpath");
     await waitFor(async () => !(await script("return document.querySelector('[role=alert]')?.textContent ?? ''")).includes("최근 문서를 열 수 없습니다"), "Stale recent alert did not dismiss");
     assertions += 1;
+  });
+
+  await runCase("late HWP parse cannot replace a newer normal or Recent open; close invalidates pending parse", async () => {
+    const beginGatedOpen = async (filePath) => {
+      await clickFileCommand("불러오기");
+      await nativeDialog("Open", filePath);
+      await waitForLifecycleStatus((status) => status.openResultPaused, `HWP parse did not reach its E2E checkpoint: ${filePath}`);
+    };
+
+    await e2eCommand("e2e_set_open_gate", { paused: true });
+    await beginGatedOpen(sourceHwp);
+    await openPath(newHwpx);
+    await waitFor(async () => (await pageText()).includes(newMarker), "Newer normal open did not replace the paused HWP parse");
+    await e2eCommand("e2e_release_open_gate");
+    await delay(300);
+    assert.ok((await pageText()).includes(newMarker), "Late normal-open parse replaced the newer document");
+    assertions += 1;
+
+    await e2eCommand("e2e_set_open_gate", { paused: true });
+    await click(".file-menu-trigger");
+    await click("//button[@role='menuitem' and @data-submenu-id='recent-documents']", "xpath");
+    await waitFor(() => hasElement(`//button[@role='menuitem' and contains(normalize-space(.), '${path.basename(sourceHwp)}')]`, "xpath"), "Recent HWP child did not appear for the parse-race case");
+    await click(`//button[@role='menuitem' and contains(normalize-space(.), '${path.basename(sourceHwp)}')]`, "xpath");
+    await waitForLifecycleStatus((status) => status.openResultPaused, "Recent HWP parse did not reach its E2E checkpoint");
+    await openPath(newHwpx);
+    await waitFor(async () => (await pageText()).includes(newMarker), "Newer open did not replace the paused Recent parse");
+    await e2eCommand("e2e_release_open_gate");
+    await delay(300);
+    assert.ok((await pageText()).includes(newMarker), "Late Recent parse replaced the newer document");
+    assertions += 1;
+
+    await e2eCommand("e2e_set_open_gate", { paused: true });
+    await beginGatedOpen(sourceHwp);
+    await clickFileCommand("문서 닫기");
+    await waitFor(async () => !(await script("return Boolean(document.querySelector('.document-page'))")), "Close did not invalidate the in-flight parse");
+    await e2eCommand("e2e_release_open_gate");
+    await delay(300);
+    assert.equal(await script("return Boolean(document.querySelector('.document-page'))"), false, "Late parse restored a document after close");
+    assertions += 1;
+    await openPath(newHwpx);
+    await waitFor(async () => (await pageText()).includes(newMarker), "Could not restore the saved test document after the close-race case");
+  });
+
+  const delayedSavePath = e2ePath("save-commit-snapshot.hwpx");
+  const delayedSnapshotPath = e2ePath("save-commit-snapshot-copy.hwpx");
+  const saveSnapshotMarker = "V102D_SAVE_SNAPSHOT_BEFORE_EDIT";
+  const saveDuringCommitMarker = "V102D_EDIT_DURING_ATOMIC_COMMIT";
+  await runCase("delayed product commit preserves edits and blocks open, close, duplicate save, and exit", async () => {
+    await clickFileCommand("새 문서");
+    await waitForDocumentPage("Could not create a blank document for the delayed-commit case");
+    await typeMarker(saveSnapshotMarker);
+    await e2eCommand("e2e_set_save_commit_delay", { delayMs: 4000 });
+    await clickFileCommand("다른 이름으로 저장하기");
+    await nativeDialog("Save", delayedSavePath);
+    await waitForLifecycleStatus((status) => status.saveCommitPaused, "Product atomic-save commit did not pause after staged-file validation");
+
+    assert.equal(await stat(delayedSavePath).then(() => true, () => false), false, "Destination appeared before atomic replacement was released");
+    await typeMarker(saveDuringCommitMarker);
+    assert.ok((await pageText()).includes(saveSnapshotMarker) && (await pageText()).includes(saveDuringCommitMarker));
+    assert.equal(await script("return document.querySelector('.dirty-status')?.textContent ?? ''"), "저장되지 않은 변경 사항");
+    assertions += 3;
+
+    await dispatchShortcut("s", { ctrlKey: true });
+    await waitFor(async () => (await script("return document.querySelector('.message-toast')?.textContent ?? ''")).includes("이미 저장 작업이 진행 중"), "Duplicate Save shortcut did not hit the shared save lock");
+    await dispatchShortcut("o", { ctrlKey: true });
+    await waitFor(async () => (await script("return document.querySelector('.message-toast')?.textContent ?? ''")).includes("저장이 끝난 뒤 문서를 열거나 바꿀 수"), "Open shortcut was not rejected during commit");
+
+    await click(".file-menu-trigger");
+    const lockedCommands = await script("return [...document.querySelectorAll('[role=menuitem]')].filter(x => ['새 문서','불러오기','저장하기','다른 이름으로 저장하기','문서 닫기','끝'].some(label => x.innerText.includes(label))).map(x => ({label:x.innerText.trim(),disabled:x.disabled || x.getAttribute('aria-disabled') === 'true'}))");
+    assert.ok(lockedCommands.length >= 6 && lockedCommands.every((item) => item.disabled), `Document transitions remained enabled during save: ${JSON.stringify(lockedCommands)}`);
+    assertions += 1;
+    await click(".file-menu-trigger");
+
+    await nativeDialog("Close");
+    await waitFor(async () => (await script("return document.querySelector('.message-toast')?.textContent ?? ''")).includes("저장이 끝날 때까지 창을 닫을 수 없습니다"), "Native close was not blocked while the product commit was pending");
+    assert.ok(await stat(delayedSavePath).then(() => false, () => true), "Delayed destination unexpectedly exists before replace");
+    assertions += 1;
+
+    await waitFor(async () => (await script("return document.querySelector('.message-toast')?.textContent ?? ''")).includes("문서를 저장했습니다"), "Delayed atomic commit did not finish", 15000);
+    assert.equal(await script("return document.querySelector('.dirty-status')?.textContent ?? ''"), "저장되지 않은 변경 사항", "Post-snapshot edit was incorrectly marked clean");
+    await copyFile(delayedSavePath, delayedSnapshotPath);
+    assertions += 1;
+
+    await clickFileCommand("불러오기");
+    await nativeDialog("Open", delayedSnapshotPath);
+    await waitFor(unsavedDialogVisible, "Opening the saved snapshot did not ask about the later unsaved edit");
+    await clickUnsavedChoice("저장 안 함");
+    await waitFor(async () => (await script("return document.querySelector('.header-document-title')?.textContent?.trim() ?? ''")) === path.basename(delayedSnapshotPath), "Discard did not continue into opening the captured snapshot");
+    const snapshotText = await pageText();
+    assert.ok(snapshotText.includes(saveSnapshotMarker), "The product commit did not save the captured edit snapshot");
+    assert.ok(!snapshotText.includes(saveDuringCommitMarker), "An edit after snapshot capture leaked into the earlier save");
+    assertions += 2;
+
+    await typeMarker(saveDuringCommitMarker);
+    await dispatchShortcut("s", { ctrlKey: true });
+    await waitFor(async () => (await script("return document.querySelector('.message-toast')?.textContent ?? ''")).includes("문서를 저장했습니다"), "Follow-up save did not persist the edit made during the prior transaction");
+    assert.equal(await script("return document.querySelector('.dirty-status')?.textContent ?? ''"), "");
+    await clearDocument();
+    await openPath(delayedSnapshotPath);
+    const reopenedText = await pageText();
+    assert.ok(reopenedText.includes(saveSnapshotMarker) && reopenedText.includes(saveDuringCommitMarker), "Reopened document did not contain the later edit saved in the follow-up transaction");
+    assertions += 2;
   });
 
   const cancelMarker = "V102C_CANCEL_PRESERVES_DOCUMENT";
@@ -361,6 +498,33 @@ try {
     assertions += 1;
   });
 
+  const aclDeniedDir = e2ePath("acl-denied-write");
+  const aclDestination = path.join(aclDeniedDir, "existing-document.hwpx");
+  await mkdir(aclDeniedDir, { recursive: true });
+  await saveAs(aclDestination);
+  const aclOriginalBytes = await readFile(aclDestination);
+  const denyAcl = runAclHelper("DenyCreate", aclDeniedDir);
+  if (denyAcl.error || denyAcl.status !== 0) {
+    process.stdout.write(`\n[GUI E2E] SKIP NTFS ACL write denial: ${denyAcl.error?.message ?? denyAcl.stderr ?? denyAcl.stdout ?? `exit ${denyAcl.status}`}\n`);
+  } else {
+    try {
+      await runCase("actual NTFS create-file denial preserves the opened source and dirty editor", async () => {
+        await typeMarker("V102D_NTFS_ACL_WRITE_FAILURE");
+        await click(".save-action");
+        await waitFor(async () => (await script("return document.querySelector('[role=alert]')?.textContent ?? ''")).includes("저장하지 못했습니다"), "NTFS-denied stage-file creation did not report a save error", 30000);
+        assert.equal(await script("return document.querySelector('.dirty-status')?.textContent ?? ''"), "저장되지 않은 변경 사항");
+        assertions += 2;
+      });
+    } finally {
+      const restoreAcl = runAclHelper("Restore", aclDeniedDir);
+      if (restoreAcl.error || restoreAcl.status !== 0) {
+        throw new Error(`Failed to restore the isolated E2E directory ACL: ${restoreAcl.error?.message ?? restoreAcl.stderr ?? restoreAcl.stdout ?? `exit ${restoreAcl.status}`}`);
+      }
+      assert.deepEqual(await readFile(aclDestination), aclOriginalBytes, "Permission-denied save changed the original document bytes");
+      assertions += 1;
+    }
+  }
+
   await runCase("invalid save path reports failure without clearing dirty state", async () => {
     await typeMarker("V102C_SAVE_FAILURE");
     await clickFileCommand("다른 이름으로 저장하기");
@@ -408,13 +572,7 @@ try {
     assert.ok((await pageText()).includes("V102C_EXIT_CONFIRM"));
     await clickFileCommand("끝");
     await clickUnsavedChoice("저장 안 함");
-    if (windows) {
-      await nativeDialog("WaitClosed");
-    } else {
-      await waitFor(async () => {
-        try { await request("GET", `/session/${sessionId}/window/handles`); return false; } catch { return true; }
-      }, "Exit after discard did not close the application", 10000);
-    }
+    await nativeDialog("WaitClosed", undefined, { expectedPid: nativeAppPid });
     assertions += 1;
   });
 
@@ -424,7 +582,57 @@ try {
     await request("DELETE", `/session/${sessionId}`).catch(() => {});
     sessionId = undefined;
   }
-  if (windows) {
+
+  // Run exit-Save in a fresh app process because the preceding Discard choice
+  // intentionally terminates the first WebDriver host and native window.
+  if (appProcess.exitCode === null && appProcess.pid) {
+    await new Promise((resolve) => {
+      const killer = spawn("taskkill.exe", ["/PID", String(appProcess.pid), "/T", "/F"], { stdio: "ignore" });
+      killer.once("close", resolve);
+    });
+  }
+  launchTauriApp();
+  await startWebDriver();
+  const exitSavePath = e2ePath("exit-save-choice.hwpx");
+  const exitSaveMarker = "V102D_EXIT_SAVE_AND_TERMINATE";
+  await runCase("application exit Save commits data and terminates the native process", async () => {
+    await clickFileCommand("새 문서");
+    await waitForDocumentPage("Could not create a blank document for the exit-Save case");
+    await typeMarker(exitSaveMarker);
+    await clickFileCommand("끝");
+    await waitFor(unsavedDialogVisible, "Exit did not show the unsaved prompt before choosing Save");
+    await clickUnsavedChoice("저장");
+    await nativeDialog("Save", exitSavePath);
+    await nativeDialog("WaitClosed", undefined, { expectedPid: nativeAppPid });
+    const bytes = await readFile(exitSavePath);
+    assert.ok(bytes.byteLength > 100, "Exit-Save did not write a document");
+    assertions += 1;
+  });
+
+  if (sessionId) {
+    await request("DELETE", `/session/${sessionId}`).catch(() => {});
+    sessionId = undefined;
+  }
+  if (appProcess.exitCode === null && appProcess.pid) {
+    await new Promise((resolve) => {
+      const killer = spawn("taskkill.exe", ["/PID", String(appProcess.pid), "/T", "/F"], { stdio: "ignore" });
+      killer.once("close", resolve);
+    });
+  }
+
+  launchTauriApp();
+  await startWebDriver();
+  await runCase("exit-Save output reopens with its saved content", async () => {
+    await openPath(exitSavePath);
+    assert.ok((await pageText()).includes(exitSaveMarker), "Exit-Save output did not preserve its marker on reopen");
+    assertions += 1;
+    await clearDocument();
+    await clickFileCommand("끝");
+    await nativeDialog("WaitClosed", undefined, { expectedPid: nativeAppPid });
+  });
+  if (sessionId) {
+    await request("DELETE", `/session/${sessionId}`).catch(() => {});
+    sessionId = undefined;
   }
 } catch (error) {
   if (!failures.length) failures.push({ name: "harness startup/teardown", error });
@@ -433,7 +641,7 @@ try {
   if (sessionId) {
     await request("DELETE", `/session/${sessionId}`).catch(() => {});
   }
-  if (appProcess.exitCode === null) {
+  if (appProcess?.exitCode === null) {
     if (windows && appProcess.pid) {
       await new Promise((resolve) => {
         const killer = spawn("taskkill.exe", ["/PID", String(appProcess.pid), "/T", "/F"], { stdio: "ignore" });

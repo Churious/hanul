@@ -1,9 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Open", "Save", "Cancel", "Close", "WaitClosed")]
+    [ValidateSet("Open", "Save", "Cancel", "Close", "WaitClosed", "GetPid")]
     [string] $Mode,
     [string] $OwnerTitle = "Hanul V1-02c E2E",
     [string] $Path,
+    [int] $ExpectedPid,
     [switch] $CloseAppBeforeSelection,
     [int] $TimeoutSeconds = 35
 )
@@ -19,6 +20,8 @@ namespace HanulE2E {
         public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
         [DllImport("user32.dll")]
         private static extern bool EnumChildWindows(IntPtr hWnd, EnumChildProc callback, IntPtr lParam);
         [DllImport("user32.dll")]
@@ -60,6 +63,15 @@ if ($Mode -eq "WaitClosed") {
     do {
         $appWindow = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $ownerCondition)
         if (-not $appWindow) {
+            if ($ExpectedPid -gt 0) {
+                $process = Get-Process -Id $ExpectedPid -ErrorAction SilentlyContinue
+                if ($process) {
+                    Start-Sleep -Milliseconds 150
+                    continue
+                }
+                Write-Output "Hanul window and process $ExpectedPid are closed"
+                exit 0
+            }
             Write-Output "Hanul window is closed"
             exit 0
         }
@@ -70,6 +82,14 @@ if ($Mode -eq "WaitClosed") {
 
 if ($Mode -ne "WaitClosed" -and -not $ownerWindow) {
     throw "대상 Hanul 창 '$OwnerTitle'을 찾지 못했습니다. 다른 응용 프로그램은 탐색하지 않습니다."
+}
+
+if ($Mode -eq "GetPid") {
+    $processId = [uint32] 0
+    [void] [HanulE2E.NativeWindows]::GetWindowThreadProcessId([IntPtr] $ownerWindow.Current.NativeWindowHandle, [ref] $processId)
+    if ($processId -eq 0) { throw "Could not identify the target Hanul window process." }
+    Write-Output "Hanul window PID: $processId"
+    exit 0
 }
 
 if ($Mode -eq "Close") {

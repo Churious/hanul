@@ -18,6 +18,11 @@ const e2eDiagnostics = e2ePort > 0
 // https://vite.dev/config/
 export default defineConfig(() => ({
   plugins: [react(), ...(e2eDiagnostics ? [e2eDiagnostics] : [])],
+  define: {
+    // The runner sets HANUL_E2E_PORT only for the isolated desktop E2E app.
+    // This keeps its lifecycle checkpoint calls out of normal dev/release builds.
+    __HANUL_E2E__: JSON.stringify(e2ePort > 0),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
