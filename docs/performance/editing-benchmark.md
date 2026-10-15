@@ -44,6 +44,32 @@ The current synthetic model-command measurements remain slow:
 
 The 35-page timings are a synthetic RHWP/WASM fixture, not actual physical key-to-paint input. The 98-page case is also synthetic (4,000 repeated lines; generated page count was 98), not a real customer file. They show that pagination alone is not the dominant 98-page cost: skipping pagination during the edit still leaves 9.2–10.0 seconds of synchronous work, while the final batch pagination takes under 0.21 seconds. Exact subphase timing inside RHWP is not exposed by the WASM API, so this does not identify which of text insertion, paragraph reflow, vertical-position recalculation, or recomposition dominates.
 
+### Independent Hanul table model probe (2026-10-15)
+
+`npm run benchmark:editor-engine` now inserts a 2×2 table at the last page, types one character into a cell, generates that page's SVG, and inserts a row. Each run uses `pages × 44` synthetic paragraphs in the Hanul in-memory engine, Node 24.16 on Windows 11 x64. It does not parse an HWP/HWPX file and does not include React commit or physical monitor presentation.
+
+| Synthetic pages | Model RSS delta | Cell edit model + layout | Model mutation | Incremental layout | Cell page SVG | Cell edit to generated SVG | Invalidated paragraphs/pages | Row insert to generated SVG |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.1 MiB | 0.46 ms | 0.21 ms | 0.17 ms | 0.27 ms | 0.74 ms | 1 / 1 | 1.42 ms |
+| 35 | 11.9 MiB | 0.93 ms | 0.29 ms | 0.27 ms | 0.32 ms | 1.25 ms | 1 / 1 | 1.37 ms |
+| 98 | 22.0 MiB | 1.16 ms | 0.32 ms | 0.19 ms | 0.41 ms | 1.58 ms | 1 / 1 | 1.85 ms |
+| 500 | 94.5 MiB | 1.74 ms | 0.30 ms | 0.21 ms | 0.37 ms | 2.11 ms | 1 / 1 | 1.84 ms |
+
+The independent model edits only the table paragraph for cell text. Row insertion currently invalidates the table and following flow, measured as 45 paragraphs and two pages in these fixtures. The observed engine-to-SVG timings are below 16 ms, but this does not establish a 16 ms keyboard-to-screen guarantee or 60 FPS drag performance. RSS is process-wide and GC-sensitive; it increased by 94.5 MiB for the 500-page fixture. A Hanul GUI smoke test confirmed insert, cell typing, Tab, row/column insertion, column deletion, merge/split, column Undo/Redo, and a 150 mm table-width change. The saved HWP reopened in Hanword 2024 and visibly retained both cell strings and the merged grid. HWPX reopen in Hanword 2024 and Linux table GUI interaction remain unverified; automated HWP and HWPX round-trip tests pass for the supported simple-table subset.
+
+The Vitest table probe also ran in both environments after the width-preserving column change. It measures one cell edit and one row insertion in newly constructed synthetic documents:
+
+| Pages / runtime | Cell model | Cell incremental layout | Cell SVG | Cell edit to SVG | Row edit to SVG |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 35 / Windows 11, Node 24.16 | 0.17 ms | 0.11 ms | 0.14 ms | 0.75 ms | 1.25 ms |
+| 35 / Ubuntu 26.04 WSL2, Node 22.22.1 | 0.34 ms | 0.16 ms | 0.15 ms | 1.45 ms | 1.56 ms |
+| 98 / Windows 11, Node 24.16 | 0.12 ms | 0.08 ms | 0.14 ms | 0.73 ms | 0.83 ms |
+| 98 / Ubuntu 26.04 WSL2, Node 22.22.1 | 0.17 ms | 0.08 ms | 0.10 ms | 0.51 ms | 1.58 ms |
+| 500 / Windows 11, Node 24.16 | 0.22 ms | 0.07 ms | 0.11 ms | 1.07 ms | 1.09 ms |
+| 500 / Ubuntu 26.04 WSL2, Node 22.22.1 | 0.21 ms | 0.08 ms | 0.15 ms | 1.48 ms | 2.76 ms |
+
+The single-cell edit invalidated one paragraph/page on both platforms. Row insertion invalidated 45 paragraphs and two pages. These are model/layout/SVG-generation measurements in the Vitest Node process; they do not measure React commit, WebView paint, user key-to-screen latency, or Linux GUI/IME behavior. Linux RSS was read in a shared test process and is not a comparable per-document memory figure.
+
 Upstream RHWP source at commit [`1a76570e`](https://github.com/edwardkim/rhwp/tree/1a76570e833917d15817415a53c09ad61ab3203f) confirms the path: `insert_text_native` reflows the edited paragraph, recalculates section vertical positions, recomposes that paragraph, and invokes pagination; it may repeat the sequence up to twice if the paragraph changes columns. `recompose_paragraph` composes one paragraph and marks paragraph/section dirty, while `paginate_if_needed` skips the page pass in batch mode. `recalculate_section_vpos` walks from the changed paragraph through the remaining paragraphs. The source has paragraph-level reuse, but no evidence that page composition is bounded to only the changed page. The measured batch experiment is consistent with significant work before the final page pass. Source references: [`insert_text_native`](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/document_core/commands/text_editing.rs#L1422), [`recompose_paragraph` and pagination](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/document_core/queries/rendering.rs#L4279), and [`recalculate_section_vpos`](https://github.com/edwardkim/rhwp/blob/1a76570e833917d15817415a53c09ad61ab3203f/src/renderer/composer/line_breaking.rs#L4833).
 
 The page SVG cache remained cheap in the changed-page probe: Windows late-page model edit 1,258.16 ms, unchanged page lookup 0.21 ms, changed-page SVG render 3.16 ms; WSL2 edit/reflow 1,208.98 ms, unchanged lookup 0.45 ms, changed SVG 1.59 ms. SVG generation and React SVG replacement were not the one-second model-command bottleneck. Windows GUI smoke testing on a disposable document verified table row add/Undo/Redo, shape move/resize, drag Undo/Redo, and HWP save/reopen with object coordinates retained. Final WSLg release testing verified table row insertion, shape drag, Undo/Redo, GTK save to `/tmp/hanul-linux-perf-final-20261015.hwp`, and reopen with the three-row table and X/Y coordinates retained. These GUI checks are functional smoke tests, not frame-time measurements; standalone X11/Wayland were not verified. Development builds emit per-gesture raw move count, processed frame count, maximum frame gap, duration, and final model-commit time; no 60 FPS result is claimed until those traces are collected on representative hardware.

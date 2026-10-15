@@ -37,6 +37,8 @@ import type {
   SearchMatch,
   SearchOptions,
   SelectionRectangle,
+  TableLayoutInfo,
+  TableUpdates,
   TableCommand,
   TextPosition,
 } from "./document-engine";
@@ -648,6 +650,8 @@ function App() {
   const [paragraphFormatDraft, setParagraphFormatDraft] = useState<ParagraphFormatDraft | null>(null);
   const [tableRows, setTableRows] = useState(2);
   const [tableColumns, setTableColumns] = useState(2);
+  const [tableDraft, setTableDraft] = useState<TableLayoutInfo | null>(null);
+  const [tableDraftUpdates, setTableDraftUpdates] = useState<Partial<TableUpdates>>({});
   const [selectedObjectId, setSelectedObjectId] = useState("");
   const [objectEditDraft, setObjectEditDraft] = useState<ObjectEditDraft | null>(null);
   const [tableContextMenu, setTableContextMenu] = useState<TableContextMenuPosition | null>(null);
@@ -1930,6 +1934,16 @@ function App() {
     }
   };
 
+  const applyTableLayout = (updates: TableUpdates) => {
+    if (!session || !caret?.cellPath) return;
+    try {
+      updateAfterEdit(session.updateTable(caret, updates));
+      editInput.current?.focus();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "표 속성을 적용하지 못했습니다.");
+    }
+  };
+
   const showSearchMatch = (matches: SearchMatch[], index: number) => {
     if (!matches.length) {
       setSearchMatchIndex(-1);
@@ -2179,6 +2193,25 @@ function App() {
       return {} as Record<string, unknown>;
     }
   }, [session, caret, renderVersion]);
+
+  const selectedTableLayout = useMemo(() => {
+    if (!session || !caret?.cellPath) return null;
+    try {
+      return session.tableLayout(caret);
+    } catch {
+      return null;
+    }
+  }, [session, caret, renderVersion]);
+
+  useEffect(() => {
+    setTableDraft(selectedTableLayout);
+    setTableDraftUpdates({});
+  }, [selectedTableLayout]);
+
+  const updateTableDraftValue = <K extends keyof TableUpdates>(key: K, value: TableUpdates[K]) => {
+    setTableDraft((current) => current && ({ ...current, [key]: value }));
+    setTableDraftUpdates((current) => ({ ...current, [key]: value }));
+  };
 
   const openFormatDialog = (tab: FormatDialogTab) => {
     if (!session || !caret) return;
@@ -2542,7 +2575,7 @@ function App() {
               <span className="ribbon-group-title">표</span>
               <label>행 <input aria-label="표 행 수" type="number" min={1} max={30} value={tableRows} onChange={(event) => setTableRows(Math.max(1, Math.min(30, Number(event.currentTarget.value))))} /></label>
               <label>열 <input aria-label="표 열 수" type="number" min={1} max={20} value={tableColumns} onChange={(event) => setTableColumns(Math.max(1, Math.min(20, Number(event.currentTarget.value))))} /></label>
-              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 표 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={insertTable}>표 삽입</button>
+              <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection)} onMouseDown={(event) => event.preventDefault()} onClick={insertTable}>표 삽입</button>
               {caret?.cellPath && <>
                 <span className="ribbon-divider" />
                 <button className="ribbon-button" type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runTableCommand("insertRowAbove")}>위 행</button>
@@ -2557,6 +2590,23 @@ function App() {
               </>}
               <span className="ribbon-group-label">표 삽입 및 편집</span>
             </div>
+            {caret?.cellPath && tableDraft && <>
+              <span className="ribbon-divider" />
+              <div className="ribbon-group ribbon-table-group ribbon-table-properties">
+                <span className="ribbon-group-title">표 / 셀 모양</span>
+                <label>너비 <input aria-label="표 너비 mm" type="number" min={10} step={1} value={tableDraft.widthMm.toFixed(1)} onChange={(event) => updateTableDraftValue("widthMm", Number(event.currentTarget.value))} /></label>
+                <label>X <input aria-label="표 가로 위치 mm" type="number" step={1} value={tableDraft.offsetXmm.toFixed(1)} onChange={(event) => updateTableDraftValue("offsetXmm", Number(event.currentTarget.value))} /></label>
+                <label>Y <input aria-label="표 세로 위치 mm" type="number" step={1} value={tableDraft.offsetYmm.toFixed(1)} onChange={(event) => updateTableDraftValue("offsetYmm", Number(event.currentTarget.value))} /></label>
+                <label>정렬 <select aria-label="표 정렬" value={tableDraft.horizontalAlignment} onChange={(event) => updateTableDraftValue("horizontalAlignment", event.currentTarget.value as TableLayoutInfo["horizontalAlignment"])}><option value="Left">왼쪽</option><option value="Center">가운데</option><option value="Right">오른쪽</option></select></label>
+                <label>열 너비 <input aria-label="현재 열 너비 mm" type="number" min={5} step={1} value={tableDraft.columnWidthMm.toFixed(1)} onChange={(event) => updateTableDraftValue("columnWidthMm", Number(event.currentTarget.value))} /></label>
+                <label>행 높이 <input aria-label="현재 셀 높이 mm" type="number" min={2} step={1} value={tableDraft.rowHeightMm.toFixed(1)} onChange={(event) => updateTableDraftValue("rowHeightMm", Number(event.currentTarget.value))} /></label>
+                <label>셀 여백 <input aria-label="셀 여백 mm" type="number" min={0} max={30} step={0.5} value={tableDraft.cellPaddingMm.toFixed(1)} onChange={(event) => updateTableDraftValue("cellPaddingMm", Number(event.currentTarget.value))} /></label>
+                <label>배경 <input aria-label="셀 배경색" type="color" value={tableDraft.cellFillColor ?? "#ffffff"} onChange={(event) => updateTableDraftValue("cellFillColor", event.currentTarget.value)} /></label>
+                <label>테두리 <input aria-label="셀 테두리 색" type="color" value={tableDraft.cellBorderColor} onChange={(event) => updateTableDraftValue("borderColor", event.currentTarget.value)} /></label>
+                <button className="ribbon-button" type="button" disabled={!Object.keys(tableDraftUpdates).length} onMouseDown={(event) => event.preventDefault()} onClick={() => applyTableLayout(tableDraftUpdates)}>적용</button>
+                <span className="ribbon-group-label">표 위치와 선택 셀 속성</span>
+              </div>
+            </>}
             <span className="ribbon-divider" />
             <div className="ribbon-group ribbon-inline-group">
               <button className="ribbon-insert-button" type="button" disabled={!session || !caret || isRangeSelection(selection) || Boolean(caret?.cellPath) || isHanulTextEngine} title={isHanulTextEngine ? "새 문서 엔진의 그림 편집은 아직 구현되지 않았습니다." : undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => imageInput.current?.click()}>그림 넣기</button>

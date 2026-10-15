@@ -176,6 +176,30 @@ export type TableCommand =
   | "mergeDown"
   | "splitCell";
 
+export interface TableLayoutInfo {
+  widthMm: number;
+  offsetXmm: number;
+  offsetYmm: number;
+  horizontalAlignment: "Left" | "Center" | "Right";
+  columnWidthMm: number;
+  rowHeightMm: number;
+  cellPaddingMm: number;
+  cellFillColor: string | null;
+  cellBorderColor: string;
+}
+
+export interface TableUpdates {
+  widthMm?: number;
+  offsetXmm?: number;
+  offsetYmm?: number;
+  horizontalAlignment?: "Left" | "Center" | "Right";
+  columnWidthMm?: number;
+  rowHeightMm?: number;
+  cellPaddingMm?: number;
+  cellFillColor?: string | null;
+  borderColor?: string;
+}
+
 export type HeaderFooterKind = "header" | "footer";
 
 /**
@@ -237,6 +261,8 @@ export interface DocumentSession {
   createTable(position: TextPosition, rows: number, columns: number): TextPosition;
   moveTableCell(position: TextPosition, delta: -1 | 1): TextPosition;
   editTable(position: TextPosition, command: TableCommand): TextPosition;
+  tableLayout(position: TextPosition): TableLayoutInfo;
+  updateTable(position: TextPosition, updates: TableUpdates): TextPosition;
   exportWithReport(format?: "hwp" | "hwpx"): ExportResult;
   dispose(): void;
 }

@@ -39,9 +39,58 @@ if (process.argv[2] === "--child") {
     if (session.selectedText(session.moveCaret(next, -1), next) !== "가") throw new Error(`${location}: inserted text mismatch`);
     session.undo(); session.redo();
   }
+  const tableAnchorLine = session.displayList(pages - 1).lines[0];
+  const tableAnchor = session.hitTest(pages - 1, tableAnchorLine.x + 1, tableAnchorLine.y);
+  const tableCreateStarted = performance.now();
+  let tableCaret = session.createTable(tableAnchor, 2, 2);
+  const tableCreateElapsed = performance.now() - tableCreateStarted;
+  const tableCreateMetrics = { ...session.metrics };
+  const cellEditStarted = performance.now();
+  tableCaret = session.insertText(tableCaret, "가");
+  const afterCellEdit = performance.now();
+  const typedCellSvg = session.renderPage(tableCaret.cursorRect.pageIndex);
+  const afterCellRender = performance.now();
+  const tableTypingMetrics = { ...session.metrics };
+  const rowEditStarted = performance.now();
+  session.editTable(tableCaret, "insertRowBelow");
+  const afterRowEdit = performance.now();
+  session.renderPage(tableCaret.cursorRect.pageIndex);
+  const afterRowRender = performance.now();
+  const tableRowMetrics = { ...session.metrics };
   const rssAfterEdits = process.memoryUsage().rss;
   session.dispose();
-  console.log(JSON.stringify({ pages, paragraphs: pages * 44, constructionMs, rssBeforeBytes: rssBefore, rssAfterCreateBytes: rssAfterCreate, modelRssDeltaBytes: rssAfterCreate - rssBefore, rssAfterEditsBytes: rssAfterEdits, edits }));
+  console.log(JSON.stringify({
+    pages,
+    paragraphs: pages * 44,
+    constructionMs,
+    rssBeforeBytes: rssBefore,
+    rssAfterCreateBytes: rssAfterCreate,
+    modelRssDeltaBytes: rssAfterCreate - rssBefore,
+    rssAfterEditsBytes: rssAfterEdits,
+    edits,
+    table: {
+      model: "Hanul independent in-memory engine; synthetic paragraphs, not an imported HWP corpus",
+      createTable: { elapsedMs: tableCreateElapsed, ...tableCreateMetrics },
+      typeIntoCell: {
+        modelAndLayoutMs: afterCellEdit - cellEditStarted,
+        modelMutationMs: tableTypingMetrics.modelMutationMs,
+        incrementalLayoutMs: tableTypingMetrics.incrementalLayoutMs,
+        svgMs: tableTypingMetrics.renderedPageMs,
+        editToSvgMs: afterCellRender - cellEditStarted,
+        invalidatedParagraphs: tableTypingMetrics.invalidatedParagraphs,
+        invalidatedPages: tableTypingMetrics.invalidatedPages,
+        svgBytes: typedCellSvg.length,
+      },
+      insertRow: {
+        modelAndLayoutMs: afterRowEdit - rowEditStarted,
+        incrementalLayoutMs: tableRowMetrics.incrementalLayoutMs,
+        svgMs: tableRowMetrics.renderedPageMs,
+        editToSvgMs: afterRowRender - rowEditStarted,
+        invalidatedParagraphs: tableRowMetrics.invalidatedParagraphs,
+        invalidatedPages: tableRowMetrics.invalidatedPages,
+      },
+    },
+  }));
   process.exit(0);
 }
 

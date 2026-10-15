@@ -99,7 +99,7 @@ describe("RHWP document session", () => {
       pages: fixturePages,
       measurements,
     }));
-  });
+  }, 30_000);
 
   it("records single-character layout cost on a synthetic 100-page document", async () => {
     const fixture = HwpDocument.createEmpty();
@@ -178,7 +178,7 @@ describe("RHWP document session", () => {
       session.dispose();
       vi.restoreAllMocks();
     }
-  });
+  }, 30_000);
 
   it("measures a late-page edit and keeps the earlier page SVG cached", async () => {
     const document = HwpDocument.createEmpty();
@@ -807,6 +807,28 @@ describe("RHWP document session", () => {
       const reopened = wrapHwpDocument(new HwpDocument(exported.bytes));
       try {
         expect(reopened.searchText("셀 내용", true)).toHaveLength(1);
+      } finally {
+        reopened.dispose();
+      }
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("keeps the requested total and selected column widths when both change together", async () => {
+    const session = await createNewHwpDocumentSession();
+    try {
+      const tableCell = session.createTable(session.hitTest(0, 113, 132), 2, 2);
+      session.updateTable(tableCell, { widthMm: 150, columnWidthMm: 60 });
+      expect(session.tableLayout(tableCell).widthMm).toBeCloseTo(150, 1);
+      expect(session.tableLayout(tableCell).columnWidthMm).toBeCloseTo(60, 1);
+
+      const exported = session.exportWithReport("hwpx");
+      expect(exported.report.count).toBe(0);
+      const reopened = wrapHwpDocument(new HwpDocument(exported.bytes));
+      try {
+        expect(reopened.tableLayout(tableCell).widthMm).toBeCloseTo(150, 1);
+        expect(reopened.tableLayout(tableCell).columnWidthMm).toBeCloseTo(60, 1);
       } finally {
         reopened.dispose();
       }

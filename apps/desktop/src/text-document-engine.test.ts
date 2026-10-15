@@ -38,6 +38,68 @@ describe("Hanul paragraph text engine", () => {
     session.dispose();
   }, 120_000);
 
+  it.each([1, 35, 98, 500])("measures cell editing and row insertion in a %i-page model", (pageCount) => {
+    const rssBeforeBytes = readRssBytes();
+    const constructionStarted = performance.now();
+    const session = createInMemoryTextSession(Array.from({ length: pageCount * LINES_PER_PAGE }, (_, index) => ({ text: syntheticParagraph(index) })));
+    const constructionMs = performance.now() - constructionStarted;
+    const rssAfterCreateBytes = readRssBytes();
+    const anchorLine = session.displayList(pageCount - 1).lines[0];
+    const anchor = session.hitTest(pageCount - 1, anchorLine.x + 1, anchorLine.y);
+    const createStarted = performance.now();
+    const tableCaret = session.createTable(anchor, 2, 2);
+    const createTableMs = performance.now() - createStarted;
+    const editStarted = performance.now();
+    const editedCaret = session.insertText(tableCaret, "가");
+    const afterEdit = performance.now();
+    const svg = session.renderPage(editedCaret.cursorRect.pageIndex);
+    const afterSvg = performance.now();
+    const cellMetrics = { ...session.metrics };
+    expect(session.searchText("가")).toHaveLength(1);
+    expect(svg).toContain("가");
+    expect(cellMetrics.invalidatedParagraphs).toBe(1);
+    expect(cellMetrics.invalidatedPages).toBe(1);
+
+    const rowStarted = performance.now();
+    session.editTable(editedCaret, "insertRowBelow");
+    const afterRowEdit = performance.now();
+    session.renderPage(editedCaret.cursorRect.pageIndex);
+    const afterRowSvg = performance.now();
+    const rowMetrics = { ...session.metrics };
+    const table = session.paragraphs().find((paragraph) => paragraph.table)?.table;
+    expect(table?.rowCount).toBe(3);
+    const runtime = globalThis as typeof globalThis & { process?: { platform?: string; version?: string } };
+
+    console.info("HANUL_TABLE_ENGINE_BENCH", JSON.stringify({
+      platform: runtime.process?.platform ?? "unknown",
+      node: runtime.process?.version ?? "unknown",
+      pages: pageCount,
+      paragraphs: pageCount * LINES_PER_PAGE,
+      constructionMs,
+      rssBeforeBytes,
+      rssAfterCreateBytes,
+      createTableMs,
+      cell: {
+        modelAndLayoutMs: afterEdit - editStarted,
+        modelMutationMs: cellMetrics.modelMutationMs,
+        incrementalLayoutMs: cellMetrics.incrementalLayoutMs,
+        svgMs: cellMetrics.renderedPageMs,
+        editToSvgMs: afterSvg - editStarted,
+        invalidatedParagraphs: cellMetrics.invalidatedParagraphs,
+        invalidatedPages: cellMetrics.invalidatedPages,
+      },
+      insertRow: {
+        modelAndLayoutMs: afterRowEdit - rowStarted,
+        incrementalLayoutMs: rowMetrics.incrementalLayoutMs,
+        svgMs: rowMetrics.renderedPageMs,
+        editToSvgMs: afterRowSvg - rowStarted,
+        invalidatedParagraphs: rowMetrics.invalidatedParagraphs,
+        invalidatedPages: rowMetrics.invalidatedPages,
+      },
+    }));
+    session.dispose();
+  }, 120_000);
+
   it("coalesces continuous typing and restores the exact text through undo/redo", () => {
     const session = createInMemoryTextSession([{ text: "start" }]);
     let caret = session.moveCaretToParagraphEdge(session.hitTest(0, 95, 110), "end");
@@ -156,6 +218,109 @@ describe("Hanul paragraph text engine", () => {
     session.dispose();
   });
 
+  it("edits table cells in the document model with cell-local incremental layout and undo", () => {
+    const session = createInMemoryTextSession([{ text: "표 앞 문단" }, { text: "표 뒤 문단" }]);
+    const anchor = session.moveCaretToParagraphEdge(session.hitTest(0, 95, 110), "end");
+    let caret = session.createTable(anchor, 2, 2);
+    expect(caret.cellPath?.[0].cellIndex).toBe(0);
+    caret = session.insertText(caret, "셀 1");
+    const secondCell = session.moveTableCell(caret, 1);
+    session.insertText(secondCell, "셀 2");
+    expect(session.searchText("셀 1")[0].start.cellPath?.[0].cellIndex).toBe(0);
+    expect(session.searchText("셀 2")[0].start.cellPath?.[0].cellIndex).toBe(1);
+    expect(session.metrics.invalidatedParagraphs).toBe(1);
+    expect(session.renderPage(0)).toContain("셀 1");
+
+    session.updateTable(session.searchText("셀 1")[0].start, {
+      widthMm: 130,
+      offsetXmm: 3,
+      offsetYmm: 2,
+      horizontalAlignment: "Center",
+      rowHeightMm: 11,
+      cellPaddingMm: 1.25,
+      cellFillColor: "#fff2cc",
+      borderColor: "#aa2200",
+    });
+    const tableLayout = session.tableLayout(session.searchText("셀 1")[0].start);
+    expect(tableLayout.widthMm).toBeCloseTo(130, 1);
+    expect(tableLayout.offsetXmm).toBeCloseTo(3, 1);
+    expect(tableLayout.offsetYmm).toBeCloseTo(2, 1);
+    expect(tableLayout).toMatchObject({ horizontalAlignment: "Center", rowHeightMm: 11, cellFillColor: "#fff2cc", cellBorderColor: "#aa2200" });
+    expect(session.renderPage(0)).toContain("#fff2cc");
+    session.undo();
+    expect(session.tableLayout(session.searchText("셀 1")[0].start).widthMm).not.toBe(130);
+    session.redo();
+    expect(session.tableLayout(session.searchText("셀 1")[0].start).widthMm).toBe(130);
+
+    const firstCell = session.searchText("셀 1")[0].start;
+    session.editTable(firstCell, "mergeRight");
+    expect(session.searchText("셀 2")[0].start.cellPath?.[0].cellIndex).toBe(0);
+    session.undo();
+    expect(session.searchText("셀 2")[0].start.cellPath?.[0].cellIndex).toBe(1);
+    session.redo();
+    expect(session.searchText("셀 2")[0].start.cellPath?.[0].cellIndex).toBe(0);
+    session.editTable(session.searchText("셀 1")[0].start, "splitCell");
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.cells.find((entry) => entry.row === 0 && entry.col === 0)?.colSpan).toBe(1);
+    session.undo();
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.cells.find((entry) => entry.row === 0 && entry.col === 0)?.colSpan).toBe(2);
+    session.redo();
+    session.editTable(session.searchText("셀 1")[0].start, "insertRowBelow");
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.rowCount).toBe(3);
+    session.undo();
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.rowCount).toBe(2);
+    session.redo();
+    const widthBeforeColumnInsert = session.tableLayout(session.searchText("셀 1")[0].start).widthMm;
+    session.editTable(session.searchText("셀 1")[0].start, "insertColumnRight");
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.colCount).toBe(3);
+    expect(session.tableLayout(session.searchText("셀 1")[0].start).widthMm).toBeCloseTo(widthBeforeColumnInsert, 1);
+    session.undo();
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.colCount).toBe(2);
+    expectLayoutMatchesFullReflow(session);
+    session.dispose();
+  });
+
+  it("keeps an explicitly selected column width inside the requested total table width", () => {
+    const session = createInMemoryTextSession();
+    const cell = session.createTable(session.hitTest(0, 95, 110), 2, 2);
+    session.updateTable(cell, { widthMm: 150, columnWidthMm: 60 });
+    expect(session.tableLayout(cell).widthMm).toBeCloseTo(150, 1);
+    expect(session.tableLayout(cell).columnWidthMm).toBeCloseTo(60, 1);
+    session.undo();
+    expect(session.tableLayout(cell).widthMm).toBeCloseTo(160, 1);
+    session.redo();
+    expect(session.tableLayout(cell).widthMm).toBeCloseTo(150, 1);
+    expect(session.tableLayout(cell).columnWidthMm).toBeCloseTo(60, 1);
+    session.dispose();
+  });
+
+  it("flows and edits a table row that spans multiple pages", () => {
+    const session = createInMemoryTextSession();
+    const anchor = session.hitTest(0, 95, 110);
+    const cell = session.createTable(anchor, 1, 1);
+    const originalText = "페이지 경계를 넘는 표 셀 문장입니다. ".repeat(300);
+    session.insertText(cell, originalText);
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.cells[0].paragraphs[0].text.length).toBe(originalText.length);
+    expect(session.pageCount).toBeGreaterThan(1);
+    const tablePages = Array.from({ length: session.pageCount }, (_, page) => page)
+      .filter((page) => session.displayList(page).tables.some((table) => table.cells.some((entry) => entry.cellIndex === 0)));
+    expect(tablePages.length).toBeGreaterThan(1);
+    for (const page of tablePages) expect(session.renderPage(page)).toContain("<rect");
+
+    const laterPage = tablePages[1];
+    const line = session.displayList(laterPage).lines.find((entry) => entry.cellIndex === 0);
+    expect(line).toBeDefined();
+    const laterCellPosition = session.hitTest(laterPage, line!.x + 1, line!.y);
+    expect(laterCellPosition.cellPath?.[0].cellIndex).toBe(0);
+    expect(laterCellPosition.cursorRect.pageIndex).toBe(laterPage);
+    session.insertText(laterCellPosition, "!");
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.cells[0].paragraphs[0].text.length).toBe(originalText.length + 1);
+    session.undo();
+    expect(session.paragraphs().find((paragraph) => paragraph.table)?.table?.cells[0].paragraphs[0].text.length).toBe(originalText.length);
+    session.redo();
+    expectLayoutMatchesFullReflow(session);
+    session.dispose();
+  });
+
   it("renders page-local display lists and retains unaffected page SVG caches", () => {
     const session = createInMemoryTextSession(Array.from({ length: LINES_PER_PAGE * 3 }, (_, index) => ({ text: `page line ${index}` })));
     const lastPageSvg = session.renderPage(2);
@@ -183,6 +348,7 @@ function expectLayoutMatchesFullReflow(session: ReturnType<typeof createInMemory
       const withoutParagraphIds = (page: ReturnType<typeof session.displayList>) => ({
         ...page,
         lines: page.lines.map(({ paragraphId: _paragraphId, ...line }) => line),
+        tables: page.tables.map(({ paragraphId: _paragraphId, ...table }) => table),
       });
       expect(withoutParagraphIds(session.displayList(pageIndex))).toEqual(withoutParagraphIds(reference.displayList(pageIndex)));
       expect(session.renderPage(pageIndex)).toBe(reference.renderPage(pageIndex));

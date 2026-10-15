@@ -24,9 +24,11 @@ import type {
   SearchOptions,
   SelectionRectangle,
   TableCommand,
+  TableLayoutInfo,
+  TableUpdates,
   TextPosition,
 } from "./document-engine";
-import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextParagraph, type PlainTextSerializer } from "./text-document-engine";
+import { HanulTextDocumentSession, type ImportedPlainTextDocument, type PlainTextParagraph, type PlainTextSerializer, type PlainTextTable, type PlainTextTableCell } from "./text-document-engine";
 
 export type {
   CellPathSegment,
@@ -1310,6 +1312,134 @@ class RhwpDocumentSession implements DocumentSession {
     }
   }
 
+  tableLayout(position: TextPosition): TableLayoutInfo {
+    if (!this.isCellPosition(position) || position.cellPath!.length !== 1) throw new Error("표 셀을 선택하세요.");
+    const segment = position.cellPath![0]; const para = position.parentParagraphIndex!;
+    const table = parseJson<Record<string, unknown>>(this.document.getTableProperties(position.sectionIndex, para, segment.controlIndex), "표 배치 속성");
+    const cellInfo = parseJson<{ col: number; rowSpan: number; colSpan: number }>(this.document.getCellInfo(position.sectionIndex, para, segment.controlIndex, segment.cellIndex), "셀 위치");
+    const cell = parseJson<Record<string, unknown>>(this.document.getCellOwnProperties(position.sectionIndex, para, segment.controlIndex, segment.cellIndex), "셀 크기");
+    return {
+      widthMm: rhwpUnitsToMillimeters(Number(table.tableWidth ?? cell.width ?? 0)),
+      offsetXmm: rhwpUnitsToMillimeters(Number(table.horzOffset ?? 0)),
+      offsetYmm: rhwpUnitsToMillimeters(Number(table.vertOffset ?? 0)),
+      horizontalAlignment: table.horzAlign === "Center" || table.horzAlign === "Right" ? table.horzAlign : "Left",
+      columnWidthMm: rhwpUnitsToMillimeters(Number(cell.width ?? 0)) / Math.max(1, cellInfo.colSpan),
+      rowHeightMm: rhwpUnitsToMillimeters(Number(cell.height ?? 0)) / Math.max(1, cellInfo.rowSpan),
+      cellPaddingMm: rhwpUnitsToMillimeters(Number(cell.paddingLeft ?? 0)),
+      cellFillColor: cell.fillType === "solid" && typeof cell.fillColor === "string" ? cell.fillColor : null,
+      cellBorderColor: typeof (cell.borderLeft as Record<string, unknown> | undefined)?.color === "string"
+        ? (cell.borderLeft as Record<string, unknown>).color as string : "#000000",
+    };
+  }
+
+  updateTable(position: TextPosition, updates: TableUpdates) {
+    if (!this.isCellPosition(position) || position.cellPath!.length !== 1) throw new Error("표 셀을 선택하세요.");
+    const segment = position.cellPath![0]; const para = position.parentParagraphIndex!; const control = segment.controlIndex;
+    const cellInfo = parseJson<{ row: number; col: number; rowSpan: number; colSpan: number }>(
+      this.document.getCellInfo(position.sectionIndex, para, control, segment.cellIndex), "셀 위치",
+    );
+    const dimensions = parseJson<{ rowCount: number; colCount: number; cellCount: number }>(
+      this.document.getTableDimensions(position.sectionIndex, para, control), "표 크기",
+    );
+    if (updates.columnWidthMm !== undefined && cellInfo.colSpan !== 1) throw new Error("병합 셀에서는 열 너비를 바꿀 수 없습니다.");
+    const numeric = [updates.widthMm, updates.offsetXmm, updates.offsetYmm, updates.columnWidthMm, updates.rowHeightMm, updates.cellPaddingMm]
+      .filter((value): value is number => value !== undefined);
+    if (numeric.some((value) => !Number.isFinite(value)) || (updates.widthMm !== undefined && updates.widthMm < 10)
+      || (updates.columnWidthMm !== undefined && updates.columnWidthMm < 5) || (updates.rowHeightMm !== undefined && updates.rowHeightMm < 2)
+      || (updates.cellPaddingMm !== undefined && (updates.cellPaddingMm < 0 || updates.cellPaddingMm > 30))) {
+      throw new Error("표 크기, 위치 및 셀 여백 값을 확인하세요.");
+    }
+    for (const color of [updates.cellFillColor, updates.borderColor]) {
+      if (color !== undefined && color !== null && !/^#[0-9a-f]{6}$/iu.test(color)) throw new Error("셀 색상은 6자리 HEX 색상으로 지정하세요.");
+    }
+    return this.mutateWithSnapshot(position, "표 크기 및 셀 서식", () => {
+      const tableProperties = parseJson<Record<string, unknown>>(this.document.getTableProperties(position.sectionIndex, para, control), "표 속성");
+      let oldWidth = Number(tableProperties.tableWidth ?? 0);
+      if (updates.columnWidthMm !== undefined) {
+        if (oldWidth <= 0) throw new Error("현재 표 너비를 확인하지 못했습니다.");
+        const widthEquations: Array<{ col: number; span: number; widthMm: number }> = [];
+        for (let cellIndex = 0; cellIndex < dimensions.cellCount; cellIndex += 1) {
+          const info = parseJson<{ col: number; colSpan: number }>(this.document.getCellInfo(position.sectionIndex, para, control, cellIndex), "셀 위치");
+          const properties = parseJson<Record<string, unknown>>(this.document.getCellOwnProperties(position.sectionIndex, para, control, cellIndex), "셀 너비");
+          if (typeof properties.width !== "number") throw new Error("표의 열 너비를 확인하지 못했습니다.");
+          widthEquations.push({ col: info.col, span: info.colSpan, widthMm: rhwpUnitsToMillimeters(properties.width) });
+        }
+        const currentColumns = solveTableColumnWidths(dimensions.colCount, widthEquations, rhwpUnitsToMillimeters(oldWidth));
+        const selectedColumn = cellInfo.col;
+        const nextColumn = Math.round(updates.columnWidthMm * RHWP_PAGE_UNITS_PER_MM);
+        const targetWidth = updates.widthMm === undefined
+          ? oldWidth + nextColumn - Math.round(currentColumns[selectedColumn] * RHWP_PAGE_UNITS_PER_MM)
+          : Math.round(updates.widthMm * RHWP_PAGE_UNITS_PER_MM);
+        const otherColumns = dimensions.colCount - 1;
+        const remainingWidth = targetWidth - nextColumn;
+        if (remainingWidth < otherColumns * 5 * RHWP_PAGE_UNITS_PER_MM
+          || (otherColumns === 0 && Math.abs(remainingWidth) > 0.75 * RHWP_PAGE_UNITS_PER_MM)) {
+          throw new Error("표 전체 너비와 선택한 열 너비가 맞지 않습니다.");
+        }
+
+        const currentOtherWidth = currentColumns.reduce((sum, width, index) => sum + (index === selectedColumn ? 0 : width), 0);
+        const nextColumns = Array(dimensions.colCount).fill(0) as number[];
+        nextColumns[selectedColumn] = nextColumn;
+        let assigned = nextColumn;
+        const remainingIndices = [...Array(dimensions.colCount).keys()].filter((index) => index !== selectedColumn);
+        remainingIndices.forEach((index, remainingIndex) => {
+          const units = remainingIndex === remainingIndices.length - 1
+            ? targetWidth - assigned
+            : Math.round(remainingWidth * (currentOtherWidth > 0 ? currentColumns[index] / currentOtherWidth : 1 / otherColumns));
+          nextColumns[index] = units;
+          assigned += units;
+        });
+
+        for (let cellIndex = 0; cellIndex < dimensions.cellCount; cellIndex += 1) {
+          const info = parseJson<{ col: number; colSpan: number }>(this.document.getCellInfo(position.sectionIndex, para, control, cellIndex), "셀 위치");
+          const properties = parseJson<Record<string, unknown>>(this.document.getCellOwnProperties(position.sectionIndex, para, control, cellIndex), "셀 크기");
+          properties.width = nextColumns.slice(info.col, info.col + info.colSpan).reduce((sum, width) => sum + width, 0);
+          if (!parseJson<{ ok: boolean }>(this.document.setCellProperties(position.sectionIndex, para, control, cellIndex, JSON.stringify(properties)), "열 너비").ok) {
+            throw new Error("열 너비를 바꾸지 못했습니다.");
+          }
+        }
+        tableProperties.tableWidth = targetWidth;
+        oldWidth = targetWidth;
+      } else if (updates.widthMm !== undefined) {
+        if (oldWidth <= 0) throw new Error("현재 표 너비를 확인하지 못했습니다.");
+        const newWidth = Math.round(updates.widthMm * RHWP_PAGE_UNITS_PER_MM);
+        const ratio = newWidth / oldWidth;
+        tableProperties.tableWidth = newWidth; oldWidth = newWidth;
+        for (let cellIndex = 0; cellIndex < dimensions.cellCount; cellIndex += 1) {
+          const cellProperties = parseJson<Record<string, unknown>>(this.document.getCellOwnProperties(position.sectionIndex, para, control, cellIndex), "셀 크기");
+          if (typeof cellProperties.width === "number") {
+            cellProperties.width = Math.round(cellProperties.width * ratio);
+            if (!parseJson<{ ok: boolean }>(this.document.setCellProperties(position.sectionIndex, para, control, cellIndex, JSON.stringify(cellProperties)), "열 너비").ok) throw new Error("열 너비를 바꾸지 못했습니다.");
+          }
+        }
+      }
+      if (updates.offsetXmm !== undefined) tableProperties.horzOffset = Math.round(updates.offsetXmm * RHWP_PAGE_UNITS_PER_MM);
+      if (updates.offsetYmm !== undefined) tableProperties.vertOffset = Math.round(updates.offsetYmm * RHWP_PAGE_UNITS_PER_MM);
+      if (updates.horizontalAlignment) tableProperties.horzAlign = updates.horizontalAlignment;
+      if (!parseJson<{ ok: boolean }>(this.document.setTableProperties(position.sectionIndex, para, control, JSON.stringify(tableProperties)), "표 배치").ok) throw new Error("표 배치를 바꾸지 못했습니다.");
+
+      const selectedProperties = parseJson<Record<string, unknown>>(this.document.getCellOwnProperties(position.sectionIndex, para, control, segment.cellIndex), "셀 속성");
+      if (updates.rowHeightMm !== undefined) selectedProperties.height = Math.round(updates.rowHeightMm * Math.max(1, cellInfo.rowSpan) * RHWP_PAGE_UNITS_PER_MM);
+      if (updates.cellPaddingMm !== undefined) {
+        const raw = Math.round(updates.cellPaddingMm * RHWP_PAGE_UNITS_PER_MM);
+        selectedProperties.paddingLeft = raw; selectedProperties.paddingRight = raw; selectedProperties.paddingTop = raw; selectedProperties.paddingBottom = raw;
+      }
+      if (updates.cellFillColor !== undefined) {
+        selectedProperties.fillType = updates.cellFillColor ? "solid" : "none";
+        selectedProperties.fillColor = updates.cellFillColor ?? "#ffffff";
+      }
+      if (updates.borderColor !== undefined) {
+        for (const side of ["borderLeft", "borderRight", "borderTop", "borderBottom"]) {
+          const border = selectedProperties[side];
+          selectedProperties[side] = { ...(typeof border === "object" && border !== null ? border as Record<string, unknown> : {}), color: updates.borderColor };
+        }
+      }
+      if (updates.rowHeightMm !== undefined || updates.cellPaddingMm !== undefined || updates.cellFillColor !== undefined || updates.borderColor !== undefined) {
+        if (!parseJson<{ ok: boolean }>(this.document.setCellProperties(position.sectionIndex, para, control, segment.cellIndex, JSON.stringify(selectedProperties)), "셀 속성").ok) throw new Error("셀 서식을 바꾸지 못했습니다.");
+      }
+    });
+  }
+
   exportWithReport(format?: "hwp" | "hwpx"): ExportResult {
     const outputFormat = format ?? this.sourceFormat;
     if (outputFormat !== "hwp" && outputFormat !== "hwpx") {
@@ -2057,6 +2187,14 @@ export function createInitializedBlankHwpDocumentSession(): DocumentSession {
 }
 
 /** Batch serializer used only for text-engine documents created by Hanul. */
+function findRhwpCellIndex(document: HwpDocument, tableParagraphIndex: number, controlIndex: number, cellCount: number, row: number, col: number): number {
+  for (let cellIndex = 0; cellIndex < cellCount; cellIndex += 1) {
+    const cell = parseJson<{ row: number; col: number }>(document.getCellInfo(0, tableParagraphIndex, controlIndex, cellIndex), "표 셀 위치");
+    if (cell.row === row && cell.col === col) return cellIndex;
+  }
+  throw new Error(`표의 ${row + 1}행 ${col + 1}열 셀을 다시 찾지 못했습니다.`);
+}
+
 export function serializePlainTextWithRhwp(
   paragraphs: readonly PlainTextParagraph[],
   format: "hwp" | "hwpx",
@@ -2101,6 +2239,74 @@ export function serializePlainTextWithRhwp(
         targetParagraphIndex = pageBreak.paraIdx;
       }
       targetParagraphs[index] = targetParagraphIndex;
+      if (paragraph.table) {
+        const table = paragraph.table;
+        const createdTable = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(
+          document.createTable(0, targetParagraphIndex, 0, table.rowCount, table.colCount),
+          "표 삽입",
+        );
+        if (!createdTable.ok) throw new Error(`${index + 1}번째 표를 저장하지 못했습니다.`);
+        targetParagraphs[index] = createdTable.paraIdx;
+        if (Object.keys(table.properties).length) {
+          const appliedTable = parseJson<{ ok: boolean }>(document.setTableProperties(0, createdTable.paraIdx, createdTable.controlIdx, JSON.stringify(table.properties)), "표 속성");
+          if (!appliedTable.ok) throw new Error(`${index + 1}번째 표 속성을 저장하지 못했습니다.`);
+        }
+        for (const cell of table.cells) {
+          if (cell.rowSpan <= 1 && cell.colSpan <= 1) continue;
+          const merged = parseJson<{ ok: boolean }>(document.mergeTableCells(
+            0, createdTable.paraIdx, createdTable.controlIdx,
+            cell.row, cell.col, cell.row + cell.rowSpan - 1, cell.col + cell.colSpan - 1,
+          ), "셀 병합");
+          if (!merged.ok) throw new Error(`${index + 1}번째 표의 병합 셀을 저장하지 못했습니다.`);
+        }
+        const cellCount = parseJson<{ cellCount: number }>(document.getTableDimensions(0, createdTable.paraIdx, createdTable.controlIdx), "표 셀 수").cellCount;
+        for (const cell of table.cells) {
+          const targetCellIndex = findRhwpCellIndex(document, createdTable.paraIdx, createdTable.controlIdx, cellCount, cell.row, cell.col);
+          if (Object.keys(cell.properties).length || cell.rowSpan > 1 || cell.colSpan > 1) {
+            const cellProperties = {
+              ...cell.properties,
+              width: Math.round(cell.widthMm * RHWP_PAGE_UNITS_PER_MM),
+              height: Math.round(cell.heightMm * RHWP_PAGE_UNITS_PER_MM),
+            };
+            const appliedCell = parseJson<{ ok: boolean }>(document.setCellProperties(0, createdTable.paraIdx, createdTable.controlIdx, targetCellIndex, JSON.stringify(cellProperties)), "셀 속성");
+            if (!appliedCell.ok) throw new Error(`${index + 1}번째 표의 셀 속성을 저장하지 못했습니다.`);
+          }
+          for (let cellParaIndex = 0; cellParaIndex < cell.paragraphs.length; cellParaIndex += 1) {
+            const cellParagraph = cell.paragraphs[cellParaIndex];
+            if (cellParaIndex > 0) {
+              const previousCellParagraph = cell.paragraphs[cellParaIndex - 1];
+              const split = parseJson<{ ok: boolean }>(document.splitParagraphInCell(
+                0, createdTable.paraIdx, createdTable.controlIdx, targetCellIndex, cellParaIndex - 1, previousCellParagraph.text.length,
+              ), "셀 문단 분리");
+              if (!split.ok) throw new Error(`${index + 1}번째 표 셀 문단을 저장하지 못했습니다.`);
+            }
+            if (cellParagraph.text) {
+              const inserted = parseJson<{ ok: boolean }>(document.insertTextInCell(
+                0, createdTable.paraIdx, createdTable.controlIdx, targetCellIndex, cellParaIndex, 0, cellParagraph.text,
+              ), "셀 텍스트");
+              if (!inserted.ok) throw new Error(`${index + 1}번째 표 셀 내용을 저장하지 못했습니다.`);
+            }
+            if (Object.keys(cellParagraph.paragraphFormat).length) {
+              const applied = parseJson<{ ok: boolean }>(document.applyParaFormatInCell(
+                0, createdTable.paraIdx, createdTable.controlIdx, targetCellIndex, cellParaIndex, JSON.stringify(cellParagraph.paragraphFormat),
+              ), "셀 문단 서식");
+              if (!applied.ok) throw new Error(`${index + 1}번째 표 셀 문단 서식을 저장하지 못했습니다.`);
+            }
+            for (const run of cellParagraph.characterFormats) {
+              if (run.end <= run.start) continue;
+              const formatValue: Record<string, unknown> = { ...run.format };
+              const family = typeof formatValue.fontFamily === "string" ? formatValue.fontFamily : "";
+              delete formatValue.fontFamily;
+              if (family) formatValue.fontIds = Array.from({ length: 7 }, (_, language) => document.findOrCreateFontIdForLang(language, family));
+              const applied = parseJson<{ ok: boolean }>(document.applyCharFormatInCell(
+                0, createdTable.paraIdx, createdTable.controlIdx, targetCellIndex, cellParaIndex, run.start, run.end, JSON.stringify(formatValue),
+              ), "셀 글자 서식");
+              if (!applied.ok) throw new Error(`${index + 1}번째 표 셀 글자 서식을 저장하지 못했습니다.`);
+            }
+          }
+        }
+        continue;
+      }
       if (paragraph.text) {
         const inserted = parseJson<{ ok: boolean }>(document.insertText(0, targetParagraphIndex, 0, paragraph.text), "문단 입력");
         if (!inserted.ok) throw new Error(`${index + 1}번째 문단 텍스트를 저장하지 못했습니다.`);
@@ -2157,6 +2363,14 @@ const SUPPORTED_TEXT_PAGE_PROPERTIES = new Set([
   "width", "height", "marginLeft", "marginRight", "marginTop", "marginBottom",
   "marginHeader", "marginFooter", "marginGutter", "landscape", "binding",
 ]);
+const SUPPORTED_TABLE_PROPERTIES = new Set([
+  "tableWidth", "tableHeight", "outerLeft", "outerRight", "outerTop", "outerBottom", "restrictInPage",
+  "horzAlign", "horzOffset", "vertOffset",
+]);
+const SUPPORTED_TABLE_CELL_PROPERTIES = new Set([
+  "width", "height", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom",
+  "borderFillId", "borderLeft", "borderRight", "borderTop", "borderBottom", "fillType", "fillColor", "diagonalLine",
+]);
 
 interface PlainTextImportDefaults {
   paragraph: Record<string, unknown>;
@@ -2166,6 +2380,11 @@ interface PlainTextImportDefaults {
   columns: Record<string, unknown>;
   styles: unknown;
   styleAt: Record<string, unknown>;
+  table: Record<string, unknown>;
+  tableCell: Record<string, unknown>;
+  tableParagraph: Record<string, unknown>;
+  tableCharacter: Record<string, unknown>;
+  tableStyleAt: Record<string, unknown>;
 }
 
 let plainTextImportDefaults: PlainTextImportDefaults | undefined;
@@ -2176,6 +2395,8 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
   try {
     const created = parseJson<{ version?: string }>(blank.createBlankDocument(), "새 문서 호환성 기준");
     if (!created.version) throw new Error("새 문서 호환성 기준을 만들지 못했습니다.");
+    const createdTable = parseJson<{ ok: boolean; paraIdx: number; controlIdx: number }>(blank.createTable(0, 0, 0, 1, 1), "기본 표 기준");
+    if (!createdTable.ok) throw new Error("기본 표 기준을 만들지 못했습니다.");
     plainTextImportDefaults = {
       paragraph: parseJson(blank.getParaPropertiesAt(0, 0), "기본 문단 서식"),
       character: parseJson(blank.getCharPropertiesAt(0, 0, 0), "기본 글자 서식"),
@@ -2184,6 +2405,11 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
       columns: parseJson(blank.getColumnDef(0), "기본 단 설정"),
       styles: parseJson(blank.getStyleList(), "기본 스타일 목록"),
       styleAt: parseJson(blank.getStyleAt(0, 0), "기본 문단 스타일"),
+      table: parseJson(blank.getTableProperties(0, createdTable.paraIdx, createdTable.controlIdx), "기본 표 속성"),
+      tableCell: parseJson(blank.getCellOwnProperties(0, createdTable.paraIdx, createdTable.controlIdx, 0), "기본 셀 속성"),
+      tableParagraph: parseJson(blank.getCellParaPropertiesAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0), "기본 셀 문단 서식"),
+      tableCharacter: parseJson(blank.getCellCharPropertiesAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0, 0), "기본 셀 글자 서식"),
+      tableStyleAt: parseJson(blank.getCellStyleAt(0, createdTable.paraIdx, createdTable.controlIdx, 0, 0), "기본 셀 스타일"),
     };
     return plainTextImportDefaults;
   } finally {
@@ -2191,8 +2417,259 @@ function getPlainTextImportDefaults(): PlainTextImportDefaults {
   }
 }
 
+type RhwpTableControl = { ctrlId?: string; para?: number; controlIndex?: number };
+
+function extractTableForHanul(
+  document: HwpDocument,
+  control: RhwpTableControl,
+  defaults: PlainTextImportDefaults,
+): { table: PlainTextTable; lastPage: number } {
+  const paragraphIndex = control.para;
+  const controlIndex = control.controlIndex;
+  if (!Number.isInteger(paragraphIndex) || !Number.isInteger(controlIndex)) throw new Error("표의 문단 위치가 확인되지 않습니다.");
+  const para = paragraphIndex!; const ctrl = controlIndex!;
+  const dimensions = parseJson<{ rowCount: number; colCount: number; cellCount: number }>(
+    document.getTableDimensions(0, para, ctrl), "표 크기",
+  );
+  if (!Number.isInteger(dimensions.rowCount) || dimensions.rowCount < 1 || dimensions.rowCount > 50
+    || !Number.isInteger(dimensions.colCount) || dimensions.colCount < 1 || dimensions.colCount > 20
+    || !Number.isInteger(dimensions.cellCount) || dimensions.cellCount < 1 || dimensions.cellCount > 1000) {
+    throw new Error("표 크기가 Hanul 독립 엔진의 지원 범위를 벗어났습니다.");
+  }
+  const tableProperties = parseJson<Record<string, unknown>>(document.getTableProperties(0, para, ctrl), "표 속성");
+  const unsupportedTableProperties = unsupportedDifferenceKeys(tableProperties, defaults.table, SUPPORTED_TABLE_PROPERTIES);
+  if (unsupportedTableProperties.length) {
+    throw new Error(`표에 아직 보존할 수 없는 표 속성이 있습니다: ${unsupportedTableProperties.map((key) => `${key}=${stableJson(tableProperties[key])} (기본 ${stableJson(defaults.table[key])})`).join(", ")}`);
+  }
+  // The independent block layout currently represents tables as standalone
+  // flow blocks. Inline/floating positioning and repeated header rows stay on
+  // RHWP until the layout engine can reproduce their placement.
+  for (const key of ["treatAsChar", "textWrap", "horzRelTo", "vertRelTo", "vertAlign", "restrictInPage", "allowOverlap", "keepWithAnchor"]) {
+    if (key !== "restrictInPage" && stableJson(tableProperties[key]) !== stableJson(defaults.table[key])) {
+      throw new Error(`표 배치 속성 ${key}는 아직 지원되지 않습니다.`);
+    }
+  }
+  if (tableProperties.horzAlign !== "Left" && tableProperties.horzAlign !== "Center" && tableProperties.horzAlign !== "Right") {
+    throw new Error("표의 가로 정렬 값이 올바르지 않습니다.");
+  }
+  if (![tableProperties.horzOffset, tableProperties.vertOffset].every((value) => typeof value === "number" && Number.isFinite(value))) {
+    throw new Error("표의 위치 값이 올바르지 않습니다.");
+  }
+  if (tableProperties.hasCaption === true || tableProperties.repeatHeader === true || Number(tableProperties.pageBreak ?? 0) !== 0) {
+    throw new Error("캡션, 반복 제목 행 또는 표 쪽 나눔이 있는 표는 아직 지원되지 않습니다.");
+  }
+
+  const cells: PlainTextTableCell[] = [];
+  const grid = Array.from({ length: dimensions.rowCount }, () => Array(dimensions.colCount).fill(false) as boolean[]);
+  const widthEquations: Array<{ col: number; span: number; widthMm: number }> = [];
+  let lastPage = 0;
+  for (let cellIndex = 0; cellIndex < dimensions.cellCount; cellIndex += 1) {
+    const info = parseJson<{ row: number; col: number; rowSpan: number; colSpan: number }>(
+      document.getCellInfo(0, para, ctrl, cellIndex), "셀 위치",
+    );
+    if (![info.row, info.col, info.rowSpan, info.colSpan].every(Number.isInteger)
+      || info.row < 0 || info.col < 0 || info.rowSpan < 1 || info.colSpan < 1
+      || info.row + info.rowSpan > dimensions.rowCount || info.col + info.colSpan > dimensions.colCount) {
+      throw new Error("표 병합 범위가 올바르지 않습니다.");
+    }
+    for (let row = info.row; row < info.row + info.rowSpan; row += 1) {
+      for (let col = info.col; col < info.col + info.colSpan; col += 1) {
+        if (grid[row][col]) throw new Error("표 셀 병합 영역이 서로 겹칩니다.");
+        grid[row][col] = true;
+      }
+    }
+
+    const properties = parseJson<Record<string, unknown>>(document.getCellOwnProperties(0, para, ctrl, cellIndex), "셀 속성");
+    if (properties.fillType !== "none" && properties.fillType !== "solid") {
+      throw new Error(`셀 ${cellIndex + 1}의 채우기 형식은 아직 지원되지 않습니다.`);
+    }
+    const checkableCellProperties = { ...properties };
+    if (properties.fillType === "none" || properties.fillType === "solid") {
+      checkableCellProperties.patternColor = defaults.tableCell.patternColor;
+      checkableCellProperties.patternType = defaults.tableCell.patternType;
+    }
+    const unsupportedCellProperties = unsupportedDifferenceKeys(checkableCellProperties, defaults.tableCell, SUPPORTED_TABLE_CELL_PROPERTIES);
+    if (unsupportedCellProperties.length) {
+      throw new Error(`셀 ${cellIndex + 1}에 아직 보존할 수 없는 셀 속성이 있습니다: ${unsupportedCellProperties.map((key) => `${key}=${stableJson(properties[key])} (기본 ${stableJson(defaults.tableCell[key])})`).join(", ")}`);
+    }
+    if (properties.diagonalLine !== undefined && properties.diagonalLine !== 0 && properties.diagonalLine !== defaults.tableCell.diagonalLine) {
+      throw new Error(`셀 ${cellIndex + 1}에 독립 엔진이 아직 그릴 수 없는 대각선 테두리가 있습니다.`);
+    }
+    const widthRaw = properties.width; const heightRaw = properties.height;
+    if (typeof widthRaw !== "number" || !Number.isFinite(widthRaw) || widthRaw <= 0
+      || typeof heightRaw !== "number" || !Number.isFinite(heightRaw) || heightRaw < 0) {
+      throw new Error(`셀 ${cellIndex + 1}의 크기를 확인하지 못했습니다.`);
+    }
+    const widthMm = rhwpUnitsToMillimeters(widthRaw);
+    widthEquations.push({ col: info.col, span: info.colSpan, widthMm });
+
+    const paragraphCount = document.getCellParagraphCount(0, para, ctrl, cellIndex);
+    if (!Number.isInteger(paragraphCount) || paragraphCount < 1 || paragraphCount > 1000) throw new Error("셀 문단 수가 올바르지 않습니다.");
+    const paragraphs: PlainTextTableCell["paragraphs"] = [];
+    for (let cellParaIndex = 0; cellParaIndex < paragraphCount; cellParaIndex += 1) {
+      const length = document.getCellParagraphLength(0, para, ctrl, cellIndex, cellParaIndex);
+      const text = document.getTextInCell(0, para, ctrl, cellIndex, cellParaIndex, 0, length);
+      if (text.length !== length || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(text)) {
+        throw new Error(`셀 ${cellIndex + 1}에 문자 외 개체나 제어 데이터가 있습니다.`);
+      }
+      const rawParagraph = parseJson<Record<string, unknown>>(
+        document.getCellParaPropertiesAt(0, para, ctrl, cellIndex, cellParaIndex), "셀 문단 서식",
+      );
+      const checkableCellParagraph = { ...rawParagraph };
+      if (rawParagraph.fillType === "none" || rawParagraph.fillType === "solid") {
+        checkableCellParagraph.patternColor = defaults.tableParagraph.patternColor;
+        checkableCellParagraph.patternType = defaults.tableParagraph.patternType;
+      }
+      const paragraphUnsupported = unsupportedDifferenceKeys(checkableCellParagraph, defaults.tableParagraph, SUPPORTED_TEXT_PARA_PROPERTIES);
+      if (paragraphUnsupported.length) throw new Error(`셀 ${cellIndex + 1}의 문단 서식은 아직 지원되지 않습니다: ${paragraphUnsupported.join(", ")}`);
+      if (rawParagraph.pageBreakBefore === true) throw new Error("셀 안의 쪽 나누기는 아직 지원되지 않습니다.");
+      const styleAt = parseJson<Record<string, unknown>>(
+        document.getCellStyleAt(0, para, ctrl, cellIndex, cellParaIndex), "셀 문단 스타일",
+      );
+      if (stableJson(styleAt) !== stableJson(defaults.tableStyleAt)) throw new Error("사용자 지정 셀 문단 스타일은 아직 지원되지 않습니다.");
+      const paragraphFormat: ParagraphFormat = {};
+      const alignment = rawParagraph.alignment;
+      if (alignment !== "left" && alignment !== "center" && alignment !== "right" && alignment !== "justify") {
+        throw new Error("셀 문단 정렬 값이 올바르지 않습니다.");
+      }
+      paragraphFormat.alignment = alignment;
+      for (const key of ["marginLeft", "marginRight", "indent"] as const) {
+        const value = rawParagraph[key];
+        if (value !== undefined && stableJson(value) !== stableJson(defaults.tableParagraph[key])) {
+          if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`셀 문단 ${key} 값이 올바르지 않습니다.`);
+          paragraphFormat[key] = value;
+        }
+      }
+
+      const characterFormats: PlainTextTableCell["paragraphs"][number]["characterFormats"] = [];
+      if (length > 0) {
+        const runs = parseJson<Array<{ startOffset: number; endOffset: number }>>(
+          document.getCharShapeRunsInCellByPath(0, para, JSON.stringify([{ controlIndex: ctrl, cellIndex, cellParaIndex }]), 0, length), "셀 글자 서식 구간",
+        );
+        let nextOffset = 0;
+        for (const run of runs) {
+          if (!Number.isInteger(run.startOffset) || !Number.isInteger(run.endOffset) || run.startOffset !== nextOffset
+            || run.endOffset <= run.startOffset || run.endOffset > length) throw new Error(`셀 ${cellIndex + 1}의 글자 서식 구간이 불완전합니다.`);
+          const charProperties = parseJson<Record<string, unknown>>(
+            document.getCellCharPropertiesAtByPath(0, para, JSON.stringify([{ controlIndex: ctrl, cellIndex, cellParaIndex }]), run.startOffset),
+            "셀 글자 서식",
+          );
+          const checkableCellCharacter = { ...charProperties };
+          if (charProperties.fillType === "none" || charProperties.fillType === "solid") {
+            checkableCellCharacter.patternColor = defaults.tableCharacter.patternColor;
+            checkableCellCharacter.patternType = defaults.tableCharacter.patternType;
+          }
+          const charUnsupported = unsupportedDifferenceKeys(checkableCellCharacter, defaults.tableCharacter, SUPPORTED_TEXT_CHAR_PROPERTIES);
+          if (charUnsupported.length) throw new Error(`셀 ${cellIndex + 1}의 글자 서식은 아직 지원되지 않습니다: ${charUnsupported.join(", ")}`);
+          const family = charProperties.fontFamily; const families = charProperties.fontFamilies;
+          if (typeof family !== "string" || !Array.isArray(families) || !families.every((item) => item === family)) {
+            throw new Error(`셀 ${cellIndex + 1}에서 언어별 글꼴을 사용합니다.`);
+          }
+          const format: CharacterFormat = {};
+          const modelDefaults: Record<keyof CharacterFormat, unknown> = {
+            fontFamily: "함초롬바탕", fontSize: 1200, bold: false, italic: false, underline: false, strikethrough: false,
+          };
+          for (const key of ["fontFamily", "fontSize", "bold", "italic", "underline", "strikethrough"] as const) {
+            const value = charProperties[key];
+            if (value === undefined || stableJson(value) === stableJson(modelDefaults[key])) continue;
+            if (key === "fontFamily" && typeof value === "string") format.fontFamily = value;
+            else if (key === "fontSize" && typeof value === "number" && Number.isFinite(value)) format.fontSize = value;
+            else if ((key === "bold" || key === "italic" || key === "underline" || key === "strikethrough") && typeof value === "boolean") format[key] = value;
+            else throw new Error(`셀 ${cellIndex + 1}의 글자 속성을 변환할 수 없습니다.`);
+          }
+          if (Object.keys(format).length) characterFormats.push({ start: run.startOffset, end: run.endOffset, format });
+          nextOffset = run.endOffset;
+        }
+        if (nextOffset !== length) throw new Error(`셀 ${cellIndex + 1}의 글자 서식 범위가 텍스트 길이와 다릅니다.`);
+      }
+      paragraphs.push({ text, pageBreakBefore: false, paragraphFormat, characterFormats });
+    }
+    const endParagraph = paragraphCount - 1;
+    const endLength = document.getCellParagraphLength(0, para, ctrl, cellIndex, endParagraph);
+    const cellRect = parseJson<CursorRectangle>(
+      document.getCursorRectInCell(0, para, ctrl, cellIndex, endParagraph, endLength), "셀 끝 위치",
+    );
+    lastPage = Math.max(lastPage, cellRect.pageIndex);
+    cells.push({
+      row: info.row, col: info.col, rowSpan: info.rowSpan, colSpan: info.colSpan,
+      widthMm, heightMm: rhwpUnitsToMillimeters(heightRaw), properties, paragraphs,
+    });
+  }
+  if (grid.some((row) => row.some((covered) => !covered))) throw new Error("표 셀의 병합 범위가 격자를 완전히 채우지 않습니다.");
+  const tableWidthRaw = tableProperties.tableWidth;
+  if (typeof tableWidthRaw !== "number" || !Number.isFinite(tableWidthRaw) || tableWidthRaw <= 0) {
+    throw new Error("표 전체 너비를 확인하지 못했습니다.");
+  }
+  const columnWidthsMm = solveTableColumnWidths(
+    dimensions.colCount,
+    widthEquations,
+    rhwpUnitsToMillimeters(tableWidthRaw),
+  );
+  if (columnWidthsMm.some((width) => !Number.isFinite(width) || width <= 0)) throw new Error("표의 각 열 너비를 확인하지 못했습니다.");
+  return {
+    table: { rowCount: dimensions.rowCount, colCount: dimensions.colCount, columnWidthsMm, properties: tableProperties, cells },
+    lastPage,
+  };
+}
+
 /**
- * Copy only a positively identified simple-text subset out of RHWP. Any control,
+ * RHWP reports a merged cell's total width, not the widths of its constituent
+ * columns. Solve the row/cell width constraints rather than assuming every
+ * merged cell is evenly split; reject underdetermined or inconsistent grids.
+ */
+function solveTableColumnWidths(
+  columnCount: number,
+  cells: Array<{ col: number; span: number; widthMm: number }>,
+  tableWidthMm: number,
+): number[] {
+  const equations = [
+    ...cells.map((cell) => {
+      const row = Array(columnCount).fill(0) as number[];
+      for (let col = cell.col; col < cell.col + cell.span; col += 1) row[col] = 1;
+      return [...row, cell.widthMm];
+    }),
+    [...Array(columnCount).fill(1), tableWidthMm],
+  ];
+  const pivotColumns: number[] = [];
+  let pivotRow = 0;
+  for (let col = 0; col < columnCount && pivotRow < equations.length; col += 1) {
+    let candidate = pivotRow;
+    for (let row = pivotRow + 1; row < equations.length; row += 1) {
+      if (Math.abs(equations[row][col]) > Math.abs(equations[candidate][col])) candidate = row;
+    }
+    if (Math.abs(equations[candidate][col]) < 1e-9) continue;
+    [equations[pivotRow], equations[candidate]] = [equations[candidate], equations[pivotRow]];
+    const pivot = equations[pivotRow][col];
+    for (let item = col; item <= columnCount; item += 1) equations[pivotRow][item] /= pivot;
+    for (let row = 0; row < equations.length; row += 1) {
+      if (row === pivotRow) continue;
+      const factor = equations[row][col];
+      if (Math.abs(factor) < 1e-9) continue;
+      for (let item = col; item <= columnCount; item += 1) equations[row][item] -= factor * equations[pivotRow][item];
+    }
+    pivotColumns.push(col);
+    pivotRow += 1;
+  }
+  for (const equation of equations) {
+    if (equation.slice(0, columnCount).every((value) => Math.abs(value) < 1e-7) && Math.abs(equation[columnCount]) > 0.75) {
+      throw new Error("셀 너비와 표 전체 너비가 서로 일치하지 않습니다.");
+    }
+  }
+  if (pivotColumns.length !== columnCount) throw new Error("병합 셀 정보만으로 각 열 너비를 안전하게 계산할 수 없습니다.");
+  const widths = Array(columnCount).fill(0) as number[];
+  for (let row = 0; row < pivotColumns.length; row += 1) widths[pivotColumns[row]] = equations[row][columnCount];
+  for (const cell of cells) {
+    const width = widths.slice(cell.col, cell.col + cell.span).reduce((sum, value) => sum + value, 0);
+    if (Math.abs(width - cell.widthMm) > 0.75) throw new Error("셀 너비가 표의 열 너비와 일치하지 않습니다.");
+  }
+  if (Math.abs(widths.reduce((sum, value) => sum + value, 0) - tableWidthMm) > 0.75) {
+    throw new Error("표 전체 너비가 열 너비 합계와 일치하지 않습니다.");
+  }
+  return widths;
+}
+
+/**
+ * Copy only a positively identified text-and-table subset out of RHWP. Any control,
  * style, field, section, or format we cannot represent keeps the document on the
  * RHWP session so opening it never silently flattens unsupported content.
  */
@@ -2216,9 +2693,22 @@ function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocumen
     const styles = parseJson<unknown>(document.getStyleList(), "스타일 목록");
     if (stableJson(styles) !== stableJson(defaults.styles)) return reject("custom document styles");
 
-    const controls = parseJson<Array<{ ctrlId?: string }>>(document.getControls(), "문서 컨트롤");
-    if (controls.length !== 2 || controls.filter((item) => item.ctrlId === "secd").length !== 1
+    const controls = parseJson<RhwpTableControl[]>(document.getControls(), "문서 컨트롤");
+    const tableControls = controls.filter((item) => item.ctrlId === "tbl");
+    if (controls.some((item) => item.ctrlId !== "secd" && item.ctrlId !== "cold" && item.ctrlId !== "tbl")
+      || controls.filter((item) => item.ctrlId === "secd").length !== 1
       || controls.filter((item) => item.ctrlId === "cold").length !== 1) return reject("unsupported document controls");
+    const tableByParagraph = new Map<number, RhwpTableControl>();
+    for (const control of tableControls) {
+      if (!Number.isInteger(control.para) || !Number.isInteger(control.controlIndex) || tableByParagraph.has(control.para!)) {
+        return reject("multiple or unaddressable table controls in a paragraph");
+      }
+      tableByParagraph.set(control.para!, control);
+    }
+    // Pictures, shapes, and text boxes still require RHWP's lossless object
+    // model. Do not admit a mixed document to the independent serializer.
+    const documentObjects = parseJson<Array<{ kind?: string }>>(document.getObjects(), "문서 개체 목록");
+    if (documentObjects.some((object) => object.kind === "picture" || object.kind === "shape")) return reject("document contains pictures or shapes");
     if (parseJson<unknown[]>(document.getFieldList(), "필드 목록").length !== 0
       || parseJson<unknown[]>(document.getBookmarks(), "책갈피 목록").length !== 0) return reject("fields or bookmarks");
     for (const isHeader of [true, false]) {
@@ -2251,6 +2741,31 @@ function extractPlainTextImport(document: HwpDocument): ImportedPlainTextDocumen
       const length = document.getParagraphLength(0, paragraphIndex);
       const text = document.getTextRange(0, paragraphIndex, 0, length);
       if (text.length !== length || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(text)) return reject("paragraph contains unsupported control characters");
+
+      const tableControl = tableByParagraph.get(paragraphIndex);
+      if (tableControl) {
+        // A table anchored in the middle of a body paragraph cannot yet be
+        // represented as an ordered block without changing its position.
+        if (text.length) return reject(`table at paragraph ${paragraphIndex + 1} shares an anchor with body text`);
+        const paraProperties = parseJson<Record<string, unknown>>(document.getParaPropertiesAt(0, paragraphIndex), "표 앵커 문단 서식");
+        const checkableAnchorProperties = { ...paraProperties };
+        if (paraProperties.fillType === "none") {
+          checkableAnchorProperties.patternColor = defaults.paragraph.patternColor;
+          checkableAnchorProperties.patternType = defaults.paragraph.patternType;
+        }
+        const unsupportedAnchorProperties = unsupportedDifferenceKeys(checkableAnchorProperties, defaults.paragraph, new Set(["pageBreakBefore", "paraShapeId"]));
+        if (unsupportedAnchorProperties.length) {
+          return reject(`table anchor paragraph ${paragraphIndex + 1} has unsupported formatting: ${unsupportedAnchorProperties.map((key) => `${key}=${stableJson(paraProperties[key])} (기본 ${stableJson(defaults.paragraph[key])})`).join(", ")}`);
+        }
+        const tableStart = parseJson<CursorRectangle>(document.getCursorRect(0, paragraphIndex, 0), "표 시작 위치");
+        const pageBreakBefore = paraProperties.pageBreakBefore === true || (paragraphIndex > 0 && tableStart.pageIndex > previousLastPage);
+        const extracted = extractTableForHanul(document, tableControl, defaults);
+        paragraphs.push({
+          text: "", pageBreakBefore, paragraphFormat: {}, characterFormats: [], table: extracted.table,
+        });
+        previousLastPage = Math.max(tableStart.pageIndex, extracted.lastPage);
+        continue;
+      }
 
       const paraProperties = parseJson<Record<string, unknown>>(document.getParaPropertiesAt(0, paragraphIndex), "문단 서식");
       const checkableParaProperties = { ...paraProperties };
