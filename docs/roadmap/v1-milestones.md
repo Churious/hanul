@@ -38,7 +38,7 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 | FIL-01 | PARTIAL | 빈 문서 생성 명령과 문서 모델 경로가 있음 | [ ] 지원 문서 종류와 새 문서 초기 상태를 명확히 하고, 미저장 변경 확인 및 GUI 회귀를 완료 |
 | FIL-04 | PARTIAL | Tauri 파일 선택/읽기 후 엔진 어댑터가 HWP/HWPX를 여는 경로가 있음 | [ ] 형식·문서 구조별 열기 성공/차단 메시지, 오류 경로, 대표 파일 GUI 검증 보강 |
 | FIL-07 | PARTIAL | 현재 경로 저장, 다른 이름 저장, compatibility report, 내보내기, 임시 저장 및 원자 교체가 있음 | [ ] 지원 프로파일별 제품 경로 왕복 테스트를 늘리고, 실패 시 경로·dirty 상태·원본 보호를 확인 |
-| FIL-09 | PARTIAL | 문서 정보 UI와 일부 메타데이터/페이지 정보 접근이 있음 | [ ] 1.0에 필요한 제목·작성 정보의 표시/수정·저장 범위를 정의하고 실제 재열기 검증 |
+| FIL-09 | PARTIAL | 파일·형식·크기와 페이지/구역·버전·암호화·글꼴을 읽기 전용으로 표시하며 HWP/HWPX GUI에서 확인됨 | [ ] 문서 제목·작성자·문서 내부 생성/수정 시각의 표시·편집 및 포맷별 저장·재열기는 여전히 기능 격차다. V1-02의 기본 문서 정보 범위에는 포함하지 않는다. 현재 로드맵에서 이 넓은 메타데이터 작업을 별도 마일스톤에 배정하지 않았으며, 현재 모델/API에 없는 값을 생성하지 않음 |
 | FIL-13 | PARTIAL | 용지 크기·방향·여백 UI와 단일 구역 모델 적용이 있음 | [ ] 단위/경계값, 미리보기·페이지 재배치, HWP/HWPX 저장·재열기 확인 |
 | FIL-14 | PARTIAL | 앱 내 인쇄 미리보기, PDF 내보내기 API, 시스템 인쇄 호출이 있음 | [ ] PDF 및 실제 인쇄 결과에서 쪽 크기·쪽 수·글꼴 대체·표/그림 잘림을 검증하고 출력 경로별 차이 기록 |
 | FIL-15 | PARTIAL | 최근 경로 저장·중복 제거·끊어진 경로 정리 테스트가 있음 | [ ] 최근 파일 재열기, 닫기/종료의 저장·저장 안 함·취소 흐름을 GUI에서 검증 |
@@ -93,7 +93,7 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 | 작업 | 범위 / 크기 | ID 연결 | 선행 조건 | 독립 완료 증거 |
 | --- | --- | --- | --- | --- |
 | V1-01 저장 호환성 기준선 — **COMPLETE** | M. 대표 HWP/HWPX 구조별 판정, 엔진별 게이트와 저장 실패 보호 | FIL-04, FIL-07, XPL-04 | 기존 어댑터·Compatibility Validator | [완료 기록](#v1-01-완료-기록): UI/저장 계층 정책 일치, 재파싱 또는 명시적 차단, 실패 시 원본 바이트 보존 |
-| V1-02 파일 수명주기 — **IN PROGRESS** | M. 새 문서, 열기 오류, 최근 문서, dirty close/exit, 문서 정보 기본 범위 | FIL-01, FIL-04, FIL-09, FIL-15 | V1-01 | [V1-02a](#v1-02-진행-기록), [V1-02b](#v1-02b--저장-트랜잭션-강화), [V1-02c](#v1-02c--데스크톱-파일-수명주기-e2e), [V1-02d](#v1-02d--파일-수명주기-안정화), [V1-02e](#v1-02e--linux-파일-열기와-정보-검증) 참조. Windows Tauri E2E에서 실제 저장 commit 지연, 파싱 완료 역전, NTFS 쓰기 거부, 종료 Save/Discard 및 재열기를 통과했다. WSLg에서는 AT-SPI로 native Open에서 HWP/HWPX를 직접 선택하고, 최근 문서/dirty 보호, 취소·읽기 권한 오류, 실제 파싱 경합 및 기존 문서 보존을 확인했다. Linux OS 저장 권한 오류·저장 commit 경쟁·종료 Save는 미완료이며 FIL-09 메타데이터 지원 범위와 재열기 정책도 확정되지 않았다. 일반 Linux X11/Wayland와 IME는 V1-15/V1-04 조건으로 추적하며 V1-02 완료 조건에 포함하지 않는다 |
+| V1-02 파일 수명주기 — **COMPLETE** | M. 새 문서, 열기 오류, 최근 문서, dirty close/exit, 기본 문서 정보 | FIL-01, FIL-04, FIL-09(기본 정보 범위), FIL-15 | V1-01 | [완료 기록](#v1-02e--linux-파일-열기와-잔여-조건-검증): Windows Tauri E2E 16개 시나리오/38개 단언(기존 V1-02d 기록), WSLg 실제 GTK/portal Open과 HWP/HWPX 재열기, POSIX/NTFS OS 쓰기 거부와 원본·dirty 보호, 제품 저장 commit gate 경합, 종료 Save 후 프로세스 종료 및 새 프로세스 재열기. FIL-09 전체 메타데이터 편집을 완료했다는 의미는 아니다. 일반 Linux X11/Wayland와 IME는 V1-15/V1-04에서 별도 추적 |
 | V1-03 편집 명령 통합 | L. 선택·캐럿, 클립보드, Undo/Redo와 단축키를 같은 명령 경로로 통합 | EDT-01, EDT-02, EDT-05, EDT-09, XPL-01, XPL-03, XPL-06 | V1-01, V1-02 | 본문·여러 문단·표 셀 테스트; GUI 키보드/마우스 동작과 Undo 결과 확인 |
 | V1-04 실제 OS IME | L. composition 생명주기와 모델 반영을 통합 검증 | XPL-02, EDT-01, XPL-01 | V1-03 | Windows Microsoft IME와 실제 Linux 데스크톱 IBus; Fcitx5 별도 결과. 확정 문자 모델/저장 파일에 한 번만 반영 |
 | V1-05 보기·좌표 | S/M. 배율, 쪽 보기, 눈금자 표시와 편집 좌표 일치 | VW-01, VW-02, VW-05, XPL-01 | V1-03 | 확대/축소와 보기 변경 뒤 caret/selection 및 페이지 경계가 맞는 GUI 회귀 |
@@ -145,7 +145,7 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 
 ## V1-02 진행 기록
 
-**상태: IN PROGRESS.** V1-02는 V1-01 다음 순서를 유지한다. 첫 하위 작업 V1-02a는 파일 열기 경쟁 조건과 미저장 변경 선택을 안전하게 처리한다. 마일스톤 완료를 뜻하지 않는다.
+**상태: COMPLETE (2026-10-16).** V1-02의 범위는 새 문서, 파일 열기/저장/재열기, 최근 문서, dirty close/exit 보호, 기본 문서 정보 표시다. 상세한 플랫폼별 증거와 테스트 층은 아래 하위 기록과 [데스크톱 파일 수명주기 테스트](../testing/desktop-file-lifecycle-e2e.md)를 참조한다. COMPLETE는 FIL-01/04/15 전체나 FIL-09의 모든 메타데이터 작업, 모든 Linux 데스크톱 환경의 완료를 뜻하지 않는다.
 
 ### V1-02a — 비동기 열기와 미저장 선택 보호
 
@@ -190,15 +190,18 @@ Hanul 1.0은 보통의 학교 과제·보고서·공문서 및 표 중심 문서
 - **자동 빌드/테스트:** Windows 프런트엔드 111/111, `npm run build`, `npm run tauri build -- --no-bundle`, `cargo fmt --check`, Rust workspace 16 passed / 1 ignored 통과. Ubuntu 26.04 WSL2 격리 사본도 최신 프런트엔드 111/111, `npm run build`, Rust workspace 16 passed / 1 ignored, E2E 기능을 포함한 WSLg Tauri 빌드/실행에 성공했다. Linux Node 22.22.1은 일부 패키지가 22.22.2를 요구하는 engine 경고를 냈고, WSL에 `cargo-fmt`가 없어 Linux `cargo fmt --check`는 미실행이다. `/tmp` 여유가 약 131 MiB(99%)여서 Cargo/TMP 출력은 Windows temp 마운트에 두었으며 기존 `.linux-validation-objects-20261015`는 수정하지 않았다.
 - **당시 남은 조건:** E2E runner의 재현 가능한 native-dialog 전체 GUI 자동화는 Windows 전용이다. Linux에서는 WSLg 스모크만 했고 native Open 선택, 실제 Linux 파일 권한 거부, 저장 중 비동기 경합, 종료 Save, 일반 X11/Wayland 데스크톱은 검증되지 않았다. Microsoft/Linux IME는 이 하위 작업 범위에서 검증하지 않았다. FIL-09 문서 메타데이터의 저장·재열기 범위도 미완료다. 후속 결과는 V1-02e에 기록한다.
 
-### V1-02e — Linux 파일 열기와 정보 검증
+### V1-02e — Linux 파일 열기와 잔여 조건 검증
 
-**상태: PARTIAL (2026-10-16).** WSLg의 실제 native Open 및 문서 정보 동작을 확인했다. 이것은 일반 Linux 데스크톱이나 V1-02의 모든 필수 조건을 완료했다는 뜻이 아니다.
+**상태: COMPLETE (2026-10-16).** 아래의 WSLg 실제 GUI 검증과 자동 회귀 검증으로 V1-02의 남은 필수 파일 수명주기 조건을 충족했다. WSLg 결과는 일반 Linux X11/Wayland 또는 Linux IME 검증을 대체하지 않는다.
 
 - **실제 파일 열기:** Ubuntu 26.04 WSLg에서 테스트용 Hanul Tauri 창과 별도 GTK/portal 대화상자를 실행했다. AT-SPI로 portal의 `Files` 표에서 격리된 `open-source.hwp`와 `open-source.hwpx`를 각각 골라 `Select`를 실행했다. HWP에서는 본문 및 글상자 재현 텍스트가 페이지에 보였고 형식 상태는 `hwp · Hanul 엔진`; HWPX에서는 저장 마커가 렌더링되고 `hwpx · Hanul 엔진`으로 표시됐다. 두 파일은 테스트 디렉터리 복사본이며 원본 fixture를 수정하지 않았다.
-- **열기 취소/오류:** dirty HWPX 상태에서 native Open을 취소했을 때 현재 파일·본문·dirty 표시를 유지했다. `chmod 000`한 별도 HWPX를 portal에서 선택한 뒤 실제 읽기 `Permission denied`가 발생하는 것을 확인했고, 기존 문서와 편집 내용을 유지했다. 파일 모드는 테스트 뒤 `600`으로 복원했다. 이는 OS 파일 읽기 권한 오류다. 별도로 시도한 Linux 저장 오류는 Tauri E2E filesystem capability의 `forbidden path`에서 중단되어 OS 수준 write `EACCES` 검증으로 계산하지 않는다.
+- **열기 취소/오류:** dirty HWPX 상태에서 native Open을 취소했을 때 현재 파일·본문·dirty 표시를 유지했다. `chmod 000`한 별도 HWPX에서 OS 읽기 `Permission denied`가 발생했고 기존 문서와 편집 내용은 유지됐다. 파일 모드는 테스트 뒤 `600`으로 복원했다. 저장 실패는 아래의 별도 OS 쓰기 권한 테스트로 확인했다.
 - **최근 문서와 dirty 보호:** 최근 문서에서 HWP/HWPX를 다시 열었다. dirty 상태에서 최근 문서 열기를 취소하면 현재 내용과 dirty 상태가 남고, `저장 안 함`을 선택하면 선택한 파일이 열린다. Save As native portal 취소는 파일 경로·내용·dirty 상태를 바꾸지 않았다. 이 흐름은 앱의 실제 product command 경로를 사용했다.
 - **비동기 열기 경합:** debug E2E 빌드에서 실제 HWP 파싱 뒤 결과 commit 전 일회성 gate를 걸었다. 그동안 최근 메뉴에서 다른 HWPX를 열어 새 문서가 표시된 것을 확인하고 오래된 HWP gate를 해제했다. 이후에도 최신 HWPX와 본문이 유지됐다. 이는 WSLg/AT-SPI GUI에서 한 번 확인한 경합 스모크이며 재현 가능한 Linux 전용 suite는 아니다.
-- **기본문서 정보(FIL-09):** HWP와 HWPX 정보 대화상자는 파일명, 경로, 형식, 바이트 크기(화면은 KB), 쪽 수, 구역 수, 엔진 문서 버전, 암호화 정보, 사용 글꼴을 표시했다. 모델/UI에서 제목, 작성자, 생성·수정 시각 필드를 확인하지 못했고 이 값을 임의 생성하지 않았다. 이번 milestone의 “기본 문서 정보”는 현재 지원되는 읽기 전용 필드 표시로 한정하여 범위를 명시한다. 제목/작성자 메타데이터의 편집 및 포맷별 저장·재열기는 여전히 FIL-09 미완료이며 별도 기능 작업 없이는 지원한다고 표시하지 않는다.
+- **기본문서 정보(FIL-09 기본 범위):** HWP와 HWPX 정보 대화상자는 파일명, 경로, 형식, 바이트 크기(화면은 KB), 쪽 수, 구역 수, 엔진 문서 버전, 암호화 정보, 사용 글꼴을 표시했다. 모델/UI에서 제목, 작성자, 문서 내부 생성·수정 시각 필드를 확인하지 못했다. 제품 HWPX 패키지 조사에서 title/created/modified 값은 비어 있고 creator는 직렬화 도구명 `rhwp`였으며 이를 사용자 작성자로 간주하지 않았다. 임의 값을 만들거나 메타데이터 저장 기능을 주장하지 않는다. 이는 V1-02의 “기본 문서 정보” 표시 조건을 충족한다. FIL-09의 제목·작성자·내부 시각 메타데이터 표시/편집/포맷별 round-trip은 여전히 PARTIAL인 별도 기능 격차다.
 - **범위 구분:** Microsoft IME와 Linux IBus/Fcitx5 검증은 V1-04, 일반 Linux X11/Wayland 검증과 출시 지원 판단은 V1-15의 조건이다. 이번 WSLg GUI 결과를 해당 조건의 증거로 사용하지 않으며, 이 항목들은 V1-02의 완료 조건으로 계산하지 않는다.
-- **남은 V1-02 조건:** Linux의 실제 OS 저장 권한 거부/저장 실패, 저장 중 디스크 commit gate GUI, dirty 종료 Save와 새 프로세스 재열기, FIL-09 메타데이터 지원 범위와 실제 round-trip 검증이 남아 있다. 반복 가능한 Linux native-dialog suite는 향후 검증 인프라 개선으로 기록하지만, 이미 직접 수행한 WSLg 시나리오를 대체하는 새 제품 기능 요건으로 추가하지 않는다. V1-02는 PARTIAL/IN PROGRESS를 유지한다.
-- **자동 검증:** Windows 프런트엔드 111/111, `npm run build`, `npm run tauri build -- --no-bundle`, Rust workspace 16 passed / 1 ignored, `cargo fmt --check`가 통과했다. Ubuntu 26.04 WSL2 격리 사본에서도 프런트엔드 111/111, `npm run build`, Linux Rust workspace 16 passed / 1 ignored가 통과했다. Linux Cargo target은 C: 마운트 링크가 느려져 `/home/competitor/hanul-v102e-cargo-target`로 옮겨 네이티브 링크를 완료했다. WSLg Tauri E2E debug 앱의 빌드·기동은 GUI 스모크에 사용했다. 기존 Windows Tauri E2E 16개 시나리오/38개 단언 결과는 V1-02d에서 재사용했으며 같은 GUI 동작을 불필요하게 반복하지 않았다. Linux에는 `cargo-fmt`가 없어 `cargo fmt --check`는 미검증이다.
+- **실제 OS 저장 실패:** 먼저 테스트 앱의 Tauri capability `forbidden path`를 확인해 이를 OS 권한 거부와 구분했다. 이후 E2E 허용 디렉터리 안의 별도 Linux 경로에서 저장 대상 디렉터리 모드를 `700`에서 `500`으로 바꾸고 실제 제품 Save를 실행했다. 임시 파일 생성에서 OS `Permission denied (os error 13)`가 발생했으며 기존 파일 SHA-256은 전후 동일하고 편집 내용과 dirty 상태가 유지됐다. 테스트 후 디렉터리 모드 `700`, 파일 모드 `600`, 소유자 `competitor:competitor`가 복구/유지됐음을 확인했다. Windows NTFS ACL 생성 거부도 V1-02d에서 같은 원본·dirty 보호 결과를 통과했다.
+- **Linux 제품 저장 경합:** 실제 stage write·호환성 검사·재파싱 뒤 atomic replace 직전의 E2E 전용 gate를 이용했다. 저장 스냅샷 A 뒤 편집 B가 추가된 실행에서 디스크에는 A만, live 문서는 dirty로 남았다. 두 번째 gate에서는 A+B 저장 중 C 편집을 추가했고 저장 중 Save/새 문서/열기/닫기/끝 명령이 비활성화됨을 확인했다. 커밋된 스냅샷에는 A+B만 있었고 dirty 상태가 유지됐으며 후속 Save 이후 재파싱한 HWPX에는 A+B+C가 모두 있었다.
+- **Linux 종료 Save:** dirty HWPX에서 앱 끝내기 → Save를 선택했다. 제품 저장이 끝난 뒤 앱 프로세스가 종료 코드 0으로 끝났고, 새 프로세스에서 native Open으로 같은 HWPX를 열어 고유 본문 marker를 확인했다.
+- **완료 판단과 제한:** V1-02에 원래 정의된 Linux 저장 실패, 저장 commit 경쟁, 종료 Save, 새 프로세스 재열기 조건은 충족했다. 반복 가능한 Linux native-dialog 전체 suite는 구축하지 않았고 이번 수동 WSLg/AT-SPI 실행으로 대체하지 않는다. 일반 Linux X11/Wayland 및 IME는 V1-15/V1-04 범위다. 한글 2024 직접 호환성도 이번 파일 수명주기 완료 근거가 아니다. Windows 네이티브 E2E는 이전 V1-02d의 16개 시나리오/38개 단언 결과를 재사용했다.
+- **자동 검증:** 이번 회귀 실행에서 Windows와 Ubuntu 26.04 WSL2 격리 복사본 모두 프런트엔드 111/111, `npm run build`, Rust workspace 16 passed / 1 ignored를 통과했다. Windows `npm run tauri build -- --no-bundle` 및 `cargo fmt --check` 결과는 V1-02d에서 재사용했다. Linux E2E Tauri debug 앱은 기존 산출물을 사용해 WSLg에서 실행했다. Linux에는 `cargo-fmt`가 없어 `cargo fmt --check`는 미검증이다. Node 22.22.1에서 패키지의 Node 22.22.2 요구 경고가 있었지만 테스트와 빌드는 성공했다.
